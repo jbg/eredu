@@ -218,8 +218,4 @@ impl Executable {
     ) -> Result<Array, Error> {
         self.erased_mut().prefill(input, stream)
     }
-
-    pub(crate) fn decode(&mut self, tokens: &Array, stream: &Stream) -> Result<Array, Error> {
-        self.erased_mut().decode(tokens, stream)
-    }
 }

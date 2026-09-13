@@ -116,7 +116,9 @@ fn write_tensor_plan(
     ) {
         let start = data.len();
         for index in 0..tensor.shape.iter().product::<usize>() {
-            let value = if tensor.key.contains("norm") {
+            let value = if tensor.key.ends_with(".layer_scalar") {
+                1.15f32
+            } else if tensor.key.contains("norm") {
                 1.0f32
             } else {
                 (((index * 17 + tensor.key.len() * 7) % 101) as f32 - 50.0) * 0.003
@@ -637,3 +639,28 @@ fn k2_controlled_capture_restore_and_modified_branch_use_shared_drivers() {
 
 #[path = "native_execution_control/candidate_domain.rs"]
 mod candidate_domain;
+
+#[path = "native_execution_control/components.rs"]
+mod components;
+#[path = "native_execution_control/v3_components.rs"]
+mod v3_components;
+
+#[path = "native_execution_control/parameters.rs"]
+mod parameters;
+
+#[path = "native_execution_control/routed_components.rs"]
+mod routed_components;
+
+#[path = "native_execution_control/gguf_parameters.rs"]
+mod gguf_parameters;
+#[path = "native_execution_control/quantized_parameters.rs"]
+mod quantized_parameters;
+
+#[path = "native_execution_control/streamed_parameters.rs"]
+mod streamed_parameters;
+
+#[path = "native_execution_control/fp8_parameters.rs"]
+mod fp8_parameters;
+
+#[path = "native_execution_control/capture_failures.rs"]
+mod capture_failures;

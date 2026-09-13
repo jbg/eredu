@@ -30,9 +30,13 @@ where
     F: ReplicatedExecutableFinalizer<A, S>,
 {
     let (identity, capability, model_type, residency) = facts.into_parts();
-    finalizer.finish(CompletedReplicatedText::from_session(
-        session, identity, capability, model_type, residency, None, None, None, true, stream,
-    ))
+    let banks = session.execution_strategy().parameter_banks();
+    finalizer.finish(
+        CompletedReplicatedText::from_session(
+            session, identity, capability, model_type, residency, None, None, None, true, stream,
+        )
+        .with_parameter_banks(banks)?,
+    )
 }
 
 pub(super) fn selected_addressable_bank(
@@ -315,12 +319,15 @@ where
             MlxEmbeddedPredictionMaterializer,
         > + 'static,
 {
-    let mechanisms =
+    let mut mechanisms =
         MlxReplicatedTextMechanisms::<A, S>::new(Arc::clone(&store), stream, weights_stream);
-    let prediction = SelectedPrediction {
+    let mut prediction = SelectedPrediction {
         extension,
         selected,
     };
+    mechanisms.set_prediction_residency(super::super::prediction::parameters::residency::<A, P>(
+        &mut prediction.extension,
+    )?);
     #[cfg(test)]
     crate::tests::support::path_instrumentation::constructor();
     eredu_architectures::prepared_execution::construct_selected_routed_session(

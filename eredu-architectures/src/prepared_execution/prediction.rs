@@ -103,9 +103,16 @@ where
         source_context,
         context,
     )
-    .map_err(|error| PreparedExecutionError::Architecture(error.to_string()))?;
+    .map_err(|error| PreparedExecutionError::Architecture(error.to_string()))?
+    .with_residency(prediction.residency);
+    let placement = prepared.retained_placement(prediction.topology);
     let extension =
         mechanism(prepared, prediction.source).map_err(PreparedExecutionError::Backend)?;
+    prediction.placement.set(placement).map_err(|_| {
+        PreparedExecutionError::Architecture(
+            "prediction placement was already bound for these prepared sources".into(),
+        )
+    })?;
     Ok((
         extension,
         PredictionBinding {
@@ -159,7 +166,7 @@ impl<B, M, S, PS, MF, VF, V, C, E, F>
 where
     B: eredu_nn::BlockwiseAttentionBackend
         + eredu_nn::DistributedNeuralBackend
-        + eredu_nn::GroupedNeuralBackend
+        + eredu_nn::TensorParallelGroupedNeuralBackend
         + eredu_nn::HyperNeuralBackend,
     M: PredictionExtensionMaterializer<B>,
     S: LayerRuntimeState<B>,

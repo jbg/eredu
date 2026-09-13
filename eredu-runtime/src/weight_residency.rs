@@ -12,6 +12,87 @@ use crate::WeightBinding;
 /// Current plus next unit retained by dense streamed execution.
 pub const DENSE_TRANSFER_WINDOW: usize = 2;
 
+/// Residency ownership for a parameter in a separately invoked auxiliary phase.
+/// Parallel storage ownership remains on the parameter's ordinary owner record.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct AuxiliaryModuleResidency {
+    module: OffloadUnitId,
+    shared: bool,
+}
+
+impl AuxiliaryModuleResidency {
+    /// Declares a physical owner. Shared owners remain live while one sequential
+    /// owner executes; distinct physical replicas need distinct identities.
+    pub fn new(module: impl Into<String>, shared: bool) -> Result<Self, OffloadError> {
+        Ok(Self {
+            module: OffloadUnitId::new(module.into())?,
+            shared,
+        })
+    }
+
+    /// Returns the physical module identity within the auxiliary phase.
+    pub fn module(&self) -> &OffloadUnitId {
+        &self.module
+    }
+
+    /// Whether this owner overlaps every sequential auxiliary invocation.
+    pub const fn shared(&self) -> bool {
+        self.shared
+    }
+}
+
+/// Physical storage for an auxiliary phase that retains shared modules while
+/// invoking at most one sequential module. Its phase does not overlap the
+/// ordinary execution-unit window; pinned target parameters remain live.
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
+pub struct AuxiliaryWeightRequirements {
+    total_device: u64,
+    total_host: u64,
+    shared_device: u64,
+    shared_host: u64,
+    largest_device: u64,
+    largest_host: u64,
+}
+
+impl AuxiliaryWeightRequirements {
+    /// Includes one physical owner, counting replicas separately. `shared`
+    /// denotes an owner retained across sequential module invocations.
+    pub fn checked_add_module(mut self, device: u64, host: u64, shared: bool) -> Option<Self> {
+        self.total_device = self.total_device.checked_add(device)?;
+        self.total_host = self.total_host.checked_add(host)?;
+        if shared {
+            self.shared_device = self.shared_device.checked_add(device)?;
+            self.shared_host = self.shared_host.checked_add(host)?;
+        } else {
+            self.largest_device = self.largest_device.max(device);
+            self.largest_host = self.largest_host.max(host);
+        }
+        Some(self)
+    }
+
+    /// Simultaneously retained device bytes under the selected placement.
+    pub fn device_bytes(self, residency: LayerWeightResidency) -> Option<u64> {
+        if residency.is_fully_resident() {
+            Some(self.total_device)
+        } else {
+            self.shared_device.checked_add(self.largest_device)
+        }
+    }
+
+    /// Additional host capacity for the auxiliary phase. Host-resident modules
+    /// coexist with the ordinary host store; disk phases reuse the same cache.
+    pub fn host_bytes(self, residency: LayerWeightResidency) -> Option<u64> {
+        match residency {
+            LayerWeightResidency::FullyResident => Some(0),
+            LayerWeightResidency::LayerwiseHost(_) => Some(self.total_host),
+            LayerWeightResidency::DenseDiskStream(options) if options.host_budget_bytes() > 0 => {
+                self.shared_host.checked_add(self.largest_host)
+            }
+            LayerWeightResidency::DenseDiskStream(_) => Some(0),
+        }
+    }
+}
+
 /// One pinned static module and its checkpoint bindings.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct StaticUnitBindings {
@@ -899,6 +980,34 @@ pub enum WeightResidencyPolicyError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn auxiliary_phase_counts_shared_owners_replicas_and_sequential_peak() {
+        let requirements = AuxiliaryWeightRequirements::default()
+            .checked_add_module(8, 12, true)
+            .unwrap()
+            .checked_add_module(8, 12, true)
+            .unwrap()
+            .checked_add_module(20, 24, false)
+            .unwrap()
+            .checked_add_module(32, 40, false)
+            .unwrap();
+        let resident = LayerWeightResidency::FullyResident;
+        let host = LayerWeightResidency::LayerwiseHost(LayerwiseLoadOptions::default());
+        let disk = LayerWeightResidency::DenseDiskStream(
+            DenseDiskStreamLoadOptions::new(128, 256, 1, 1).unwrap(),
+        );
+        assert_eq!(requirements.device_bytes(resident), Some(68));
+        assert_eq!(requirements.host_bytes(resident), Some(0));
+        assert_eq!(requirements.device_bytes(host), Some(48));
+        assert_eq!(requirements.host_bytes(host), Some(88));
+        assert_eq!(requirements.device_bytes(disk), Some(48));
+        assert_eq!(requirements.host_bytes(disk), Some(64));
+        assert!(requirements
+            .checked_add_module(u64::MAX, 0, false)
+            .is_none());
+        assert!(requirements.checked_add_module(0, u64::MAX, true).is_none());
+    }
 
     #[test]
     fn static_unit_bindings_are_runtime_owned_and_decomposable() {

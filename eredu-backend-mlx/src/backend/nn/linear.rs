@@ -86,6 +86,17 @@ impl Module<&Array> for PhysicalEmbedding {
     }
 }
 
+/// Native projection-input evidence; factories run only under the observer's reservation.
+pub(crate) trait NativeProjectionInputObserver {
+    fn observe(&mut self, input: &Array) -> Result<(), Exception>;
+    fn observe_generated(
+        &mut self,
+        prototype: &Array,
+        source: &eredu_nn::GeneratedTensorSource,
+        generate: &mut dyn FnMut() -> Result<Array, Exception>,
+    ) -> Result<(), Exception>;
+}
+
 /// Backend-owned linear materialization for every neutral physical format.
 #[derive(Debug, Clone, PhysicalParameters)]
 #[module(root = crate)]
@@ -264,7 +275,37 @@ impl PhysicalLinear {
     /// Applies the selected dense or packed projection without materializing
     /// weights on the host.
     pub fn forward(&mut self, input: &Array, stream: &Stream) -> Result<Array, Exception> {
-        let mut output = if let Some(quantization) = self.gguf {
+        self.forward_with_input_observer(input, stream, None)
+    }
+
+    pub(crate) fn forward_with_input_observer(
+        &mut self,
+        input: &Array,
+        stream: &Stream,
+        mut observer: Option<&mut dyn NativeProjectionInputObserver>,
+    ) -> Result<Array, Exception> {
+        let floating = self.weight.as_ref().dtype().is_float();
+        let transforms_input = !floating
+            && self.gguf.is_none()
+            && self.scales.as_ref().is_none()
+            && self.weight_scale_inv.as_ref().is_some();
+        if !transforms_input {
+            if let Some(observer) = observer.as_mut() {
+                observer.observe(input)?;
+            }
+        }
+        let mut output = if matches!(
+            self.weight.as_ref().dtype(),
+            Dtype::Float32 | Dtype::Float16 | Dtype::Bfloat16
+        ) {
+            // Admitted packed edits publish only the affected parameter as F32.
+            // Ordinary dense parameters and restored packed parameters take their
+            // original paths; companions are retained unchanged for restoration.
+            match super::matrix::bf16_row_projection(input, self.weight.as_ref(), None, stream)? {
+                Some(output) => output,
+                None => matmul(input, self.weight.as_ref().transpose(stream)?, stream)?,
+            }
+        } else if let Some(quantization) = self.gguf {
             let (ggml_type, endian) = quantization.gguf_iquant().expect("GGUF format");
             NativeQuantizedTensor::from_iq_array(
                 self.weight.value.clone(),
@@ -286,7 +327,13 @@ impl PhysicalLinear {
                 stream,
             )?
         } else if let Some(scale) = self.weight_scale_inv.as_ref() {
-            super::fp8::linear(input, self.weight.as_ref(), scale, stream)?
+            super::fp8::linear_with_input_observer(
+                input,
+                self.weight.as_ref(),
+                scale,
+                stream,
+                observer,
+            )?
         } else {
             match super::matrix::bf16_row_projection(input, self.weight.as_ref(), None, stream)? {
                 Some(output) => output,
@@ -307,8 +354,18 @@ impl PhysicalLinear {
         group: &crate::backend::runtime::distributed::Group,
         stream: &Stream,
     ) -> Result<Array, Exception> {
+        self.forward_row_parallel_with_input_observer(input, group, stream, None)
+    }
+
+    pub(crate) fn forward_row_parallel_with_input_observer(
+        &mut self,
+        input: &Array,
+        group: &crate::backend::runtime::distributed::Group,
+        stream: &Stream,
+        observer: Option<&mut dyn NativeProjectionInputObserver>,
+    ) -> Result<Array, Exception> {
         let bias = self.bias.value.take();
-        let partial = self.forward(input, stream);
+        let partial = self.forward_with_input_observer(input, stream, observer);
         self.bias.value = bias;
         let output = crate::backend::runtime::distributed::all_sum(&partial?, group, stream)?;
         match self.bias.as_ref() {

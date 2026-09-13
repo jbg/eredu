@@ -375,6 +375,7 @@ fn record_discovery(
             selected: selected.is_some(),
             activation_inspection: selected
                 .is_some_and(|s| s.session_capabilities().activation_inspection()),
+            prediction_inspection: false,
             partitioned: selected.is_some_and(|s| s.execution().parallel_topology().is_some()),
             mechanisms: mechanisms.observation_mechanisms(),
         },

@@ -70,19 +70,41 @@ impl GroupedNeuralBackend for MlxNeuralBackend {
         output_per_group: i32,
         context: &Stream,
     ) -> Result<MlxTensor, ComputeError> {
-        let input = input.as_array();
-        if input.ndim() != 4 || input.dim(1) != groups || groups <= 0 || output_per_group <= 0 {
+        Self::grouped_linear_with_input_observer(
+            linear,
+            input,
+            groups,
+            output_per_group,
+            context,
+            None,
+        )
+    }
+
+    fn grouped_linear_with_input_observer(
+        linear: &mut MlxLinear,
+        input: &MlxTensor,
+        groups: i32,
+        output_per_group: i32,
+        context: &Stream,
+        observer: Option<&mut dyn eredu_nn::ProjectionInputObserver<MlxTensor>>,
+    ) -> Result<MlxTensor, ComputeError> {
+        let shape = input.as_array();
+        if shape.ndim() != 4 || shape.dim(1) != groups || groups <= 0 || output_per_group <= 0 {
             return Err(ComputeError::backend(format!(
                 "grouped linear expects [batch, {groups}, tokens, input] and positive output width, got {:?}",
-                input.shape()
+                shape.shape()
             )));
         }
-        let projected = compute(linear.module.forward(input, context))?;
-        if projected.dim(-1) != groups * output_per_group {
+        let width = groups
+            .checked_mul(output_per_group)
+            .ok_or_else(|| ComputeError::backend("grouped projection width overflow"))?;
+        let projected = linear.forward_with_input_observer(input, context, observer)?;
+        let projected = projected.as_array();
+        if projected.dim(-1) != width {
             return Err(ComputeError::backend(format!(
                 "grouped linear produced width {}, expected {}",
                 projected.dim(-1),
-                groups * output_per_group
+                width
             )));
         }
         let mut pieces = Vec::with_capacity(groups as usize);
@@ -254,7 +276,8 @@ impl GroupedNeuralBackend for MlxNeuralBackend {
         module = compute(module.with_policy(policy))?;
         module.reduction = spec.reduction();
         if let Some(format) = native_fp8 {
-            module = compute(module.with_native_fp8(format, context))?;
+            module =
+                compute(module.with_native_fp8(format, gate_up.format().row_layout(), context))?;
         }
         let mut topology = vec![
             ("gate_up_proj", gate_up.weight().clone()),
@@ -376,6 +399,19 @@ macro_rules! impl_attention_cache {
                     context,
                 ))
                 .map(|(keys, values)| (MlxTensor::from_array(keys), MlxTensor::from_array(values)))
+            }
+            fn relative_attention<N: NeuralBackend<Tensor = MlxTensor>>(
+                &mut self,
+                request: eredu_nn::RelativeAttentionInput<'_, MlxTensor>,
+                context: &Stream,
+            ) -> Result<MlxTensor, ComputeError> {
+                request.validate()?;
+                if let Some(output) = compute(KeyValueCache::paged_relative_attention(
+                    self, &request, context,
+                ))? {
+                    return Ok(MlxTensor::from_array(output));
+                }
+                N::relative_attention(request, context)
             }
             fn attention(
                 &mut self,

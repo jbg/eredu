@@ -56,6 +56,25 @@ static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
 static NEXT_HOST_WRITE_RESERVATION_ID: AtomicU64 = AtomicU64::new(1);
 static NEXT_HOST_DEMOTION_ID: AtomicU64 = AtomicU64::new(1);
 
+/// Keeps immutable sliding-history catalog entries available to a transient
+/// checkpoint. It does not lease device arrays or prevent ordinary tier movement.
+#[derive(Debug)]
+pub(crate) struct CacheHistoryRetention {
+    global_layer: usize,
+    representation: CacheRepresentation,
+    start: i64,
+    end: i64,
+}
+
+impl CacheHistoryRetention {
+    fn contains(&self, id: &CacheBlockId) -> bool {
+        id.global_layer == self.global_layer
+            && id.representation == self.representation
+            && id.start < self.end
+            && id.end > self.start
+    }
+}
+
 #[derive(Debug, Clone)]
 /// Device arrays held by one resident attention-cache block.
 pub enum CacheBlockArrays {

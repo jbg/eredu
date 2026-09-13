@@ -52,6 +52,73 @@ enum MlxUnitTransfer {
 mod submission;
 pub use submission::MlxUnitLease;
 
+/// Inspects one retained source transfer under the ordinary completion owner.
+/// The callback evaluates exported copies; failures retain the original loan
+/// through native terminal evidence just like execution-unit inspection.
+pub(crate) fn with_parameter_transfer<T>(
+    transfer: ResidentTransfer,
+    stream: &Stream,
+    operation: impl FnOnce(&ResidentUnitLease) -> Result<T, Error>,
+) -> Result<T, Error> {
+    transfer.order_after(stream)?;
+    let mut loan = MlxUnitLease::new(
+        MlxModule::new(()),
+        MlxUnitTransfer::Ordinary {
+            _transfer: transfer,
+        },
+    )?;
+    let output = operation(loan.population_parts().1)?;
+    let marker = safemlx::ops::zeros_dtype(&[1], safemlx::Dtype::Float32, stream)?;
+    loan.submitted(async_eval_with_event([&marker])?)?;
+    loan.finish()?;
+    crate::backend::ordinary_retirement::reclaim_all();
+    Ok(output)
+}
+
+/// Executes one fallible module operation under its immutable-weight transfer.
+/// Changed-state and output roots are returned even after an equation failure;
+/// the transfer and those roots remain in the ordinary recovery owner until
+/// completion or terminal teardown. A callback error never releases the loan.
+pub(crate) fn with_module_transfer<T>(
+    transfer: ResidentTransfer,
+    stream: &Stream,
+    operation: impl FnOnce(&ResidentUnitLease) -> (Result<T, Error>, Vec<MlxTensor>),
+) -> Result<T, Error> {
+    transfer.order_after(stream)?;
+    let mut loan = MlxUnitLease::new(
+        MlxModule::new(Vec::<MlxTensor>::new()),
+        MlxUnitTransfer::Ordinary {
+            _transfer: transfer,
+        },
+    )?;
+    let (outcome, dependencies) = operation(loan.population_parts().1);
+    loan.population_parts().0.inner = dependencies;
+    let validations = crate::backend::nn::tensor::active_token_validation_arrays();
+    let marker = safemlx::ops::zeros_dtype(&[1], safemlx::Dtype::Float32, stream)?;
+    let event = async_eval_with_event(
+        loan.iter()
+            .map(MlxTensor::as_array)
+            .chain(validations.iter())
+            .chain([&marker]),
+    )?;
+    loan.submitted(event)?;
+    loan.finish()?;
+    crate::backend::nn::tensor::validate_active_token_validations()?;
+    crate::backend::ordinary_retirement::reclaim_all();
+    outcome
+}
+
+/// Additional physical owner executed outside the ordinary unit window.
+/// The source is exact for this owner, including retained load-time transforms.
+pub struct SupplementaryResidencyUnit {
+    /// Exact immutable bindings and the stable physical owner identity.
+    pub definition: OffloadUnit,
+    /// Already prepared source used only for this physical owner.
+    pub source: SharedCheckpointSource,
+    /// Whether this owner overlaps each sequential auxiliary invocation.
+    pub shared: bool,
+}
+
 /// Exact-completion MLX policy over generic parameterized execution units.
 pub struct MlxLayerwisePolicy<U: 'static, P = ()> {
     residency: ResidencyManager,
@@ -81,6 +148,15 @@ pub use resident::{MlxResidentPolicy, MlxResidentUnit};
 
 /// Statically dispatched parameter population used by the MLX policy.
 pub trait MlxUnitPopulator<U> {
+    /// Replaces the complete immutable override set used after ordinary population.
+    fn publish_parameter_replacements(
+        &mut self,
+        _values: &std::collections::BTreeMap<String, MlxTensor>,
+        _active: bool,
+    ) -> bool {
+        false
+    }
+
     /// Populates the parameters owned by the execution-unit residency policy.
     ///
     /// Most units own every materialized parameter. Architectures with an
@@ -103,6 +179,7 @@ impl<U> MlxUnitPopulator<U> for () {}
 #[derive(Clone)]
 pub struct MlxSelectiveUnitPopulator {
     excluded: Arc<BTreeSet<String>>,
+    replacements: Arc<std::collections::BTreeMap<String, MlxTensor>>,
 }
 
 impl MlxSelectiveUnitPopulator {
@@ -110,16 +187,43 @@ impl MlxSelectiveUnitPopulator {
     pub fn new(excluded: BTreeSet<String>) -> Self {
         Self {
             excluded: Arc::new(excluded),
+            replacements: Arc::new(std::collections::BTreeMap::new()),
+        }
+    }
+}
+
+pub(super) struct ParameterPublisher<'a>(
+    pub(super) &'a std::collections::BTreeMap<String, MlxTensor>,
+);
+impl<'a> eredu_nn::ParameterVisitorMut<'a, MlxTensor> for ParameterPublisher<'_> {
+    fn visit_mut(&mut self, metadata: eredu_nn::ParameterMetadata, value: &'a mut MlxTensor) {
+        if let Some(replacement) = self.0.get(metadata.id.as_str()) {
+            *value = replacement.clone();
         }
     }
 }
 
 impl<U> MlxUnitPopulator<U> for MlxSelectiveUnitPopulator {
+    fn publish_parameter_replacements(
+        &mut self,
+        values: &std::collections::BTreeMap<String, MlxTensor>,
+        active: bool,
+    ) -> bool {
+        self.replacements = Arc::new(if active {
+            values.clone()
+        } else {
+            Default::default()
+        });
+        true
+    }
+
     fn populate(&mut self, unit: &mut MlxModule<U>, lease: &ResidentUnitLease) -> Result<(), Error>
     where
         U: Parameterized<MlxTensor>,
     {
         populate_module_from_lease_excluding(unit, lease, |name| self.excluded.contains(name))?;
+        unit.inner
+            .visit_parameters_mut(&mut ParameterPublisher(&self.replacements));
         Ok(())
     }
 }
@@ -145,10 +249,14 @@ where
     })?;
     architecture
         .build_unit(address.group(), address.index(), stream)
-        .map_err(|error| Error::ArchitectureModel(error.to_string()))
+        .map_err(|error| Error::Other(Box::new(error)))
 }
 
 impl<U: 'static, P> MlxLayerwisePolicy<U, P> {
+    /// Shares the existing ledger with separately invoked prepared modules.
+    pub(crate) fn residency_manager(&self) -> &ResidencyManager {
+        &self.residency
+    }
     /// Creates a bounded policy over validated ordered residency units.
     pub fn new(
         residency: ResidencyManager,
@@ -330,7 +438,7 @@ impl<U: 'static, P> MlxLayerwisePolicy<U, P> {
             let mut unit = MlxModule::new(
                 architecture
                     .build_unit(address.group(), address.index(), stream)
-                    .map_err(|error| Error::ArchitectureModel(error.to_string()))?,
+                    .map_err(|error| Error::Other(Box::new(error)))?,
             );
             self.populator.populate(&mut unit, lease)?;
             units.push(Some(unit));
@@ -428,23 +536,23 @@ where
 {
     let graph = architecture
         .execution_graph()
-        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+        .map_err(|error| Error::Other(Box::new(error)))?;
     let counts = (0..graph.groups().len())
         .map(|group| {
             architecture
                 .group_unit_count(group)
-                .map_err(|error| Error::ArchitectureModel(error.to_string()))
+                .map_err(|error| Error::Other(Box::new(error)))
         })
         .collect::<Result<Vec<_>, _>>()?;
     ExecutionUnitLayout::new(&graph, counts)
-        .map_err(|error| Error::ArchitectureModel(error.to_string()))
+        .map_err(|error| Error::Other(Box::new(error)))
 }
 
 /// Cold preparation for bounded and resident policies.
 mod preparation;
 pub use preparation::{
     prepare_layerwise_policy, prepare_layerwise_policy_from_bindings,
-    prepare_layerwise_policy_with_bindings,
+    prepare_layerwise_policy_with_bindings, prepare_layerwise_policy_with_supplementary_bindings,
 };
 
 mod bounded;

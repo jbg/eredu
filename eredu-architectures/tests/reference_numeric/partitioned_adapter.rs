@@ -55,11 +55,31 @@ pub(super) fn prepare_plan_with_banks(
     completion_timeout: std::time::Duration,
     bank_options: Option<ParameterBankLoadOptions>,
 ) -> Result<PreparedModelSources, String> {
+    prepare_plan_with_banks_and_sequence_maximum(
+        inspection,
+        plan,
+        rank,
+        completion_timeout,
+        bank_options,
+        8,
+    )
+}
+
+pub(super) fn prepare_plan_with_banks_and_sequence_maximum(
+    inspection: &eredu_core::ArtifactInspection<
+        eredu_architectures::processor_plan::ArtifactArchitecturePlan,
+    >,
+    plan: &eredu_core::ExecutionPlan,
+    rank: usize,
+    completion_timeout: std::time::Duration,
+    bank_options: Option<ParameterBankLoadOptions>,
+    maximum_sequence: i32,
+) -> Result<PreparedModelSources, String> {
     let parallel = eredu_runtime::ParallelLoadRequest::new(
         ParallelRankTopology::new(*plan.topology(), rank).map_err(|error| error.to_string())?,
         eredu_runtime::PipelineWireContract::new(eredu_runtime::PipelineActivationDtype::Float32),
         1,
-        8,
+        maximum_sequence,
         CommunicationCompletionPolicy::new(
             completion_timeout,
             CompletionCancellationMode::QuarantineUntilComplete,

@@ -112,8 +112,12 @@ mod prediction_adapter;
 pub(crate) fn run_reference_conformance_embedded_prediction() {
     prediction_adapter::assert_real_embedded_prediction();
 }
+#[path = "reference_numeric/components.rs"]
+mod components;
 #[path = "reference_numeric/discovery.rs"]
 mod discovery;
+#[path = "reference_numeric/parameter_access.rs"]
+mod parameter_access;
 #[path = "reference_numeric/payload.rs"]
 mod payload;
 #[path = "reference_numeric/prepared_adapter.rs"]
@@ -676,8 +680,8 @@ impl PoolingAttentionCache<NumericTensor> for NumericPoolingCache {
         Ok(Some(mask))
     }
 
-    fn checkpoint(&self) -> Self::Checkpoint {
-        self.clone()
+    fn checkpoint(&self) -> Result<Self::Checkpoint, Error> {
+        Ok(self.clone())
     }
 
     fn restore(&mut self, checkpoint: &Self::Checkpoint, _: &NumericContext) -> Result<(), Error> {
@@ -1510,10 +1514,25 @@ impl Tensor for NumericTensor {
 
     fn gelu(input: &Self, _: &NumericContext) -> Result<Self, Error> {
         Ok(input.map(|value| {
-            0.5 * value
-                * (1.0
-                    + (std::f32::consts::FRAC_2_SQRT_PI * (value + 0.044_715 * value.powi(3)))
-                        .tanh())
+            // Evaluate the erf definition in F64. This positive-term series
+            // avoids cancellation inside erf; the discarded Gaussian tail
+            // outside |x| < 10 is below the fixture's F32 precision.
+            let x = f64::from(value);
+            if x.abs() >= 10.0 {
+                return value.max(0.0);
+            }
+            let z = x.abs() * std::f64::consts::FRAC_1_SQRT_2;
+            let mut term = z;
+            let mut sum = term;
+            for n in 1..256 {
+                term *= 2.0 * z * z / f64::from(2 * n + 1);
+                sum += term;
+                if term <= f64::EPSILON * sum {
+                    break;
+                }
+            }
+            let erf = (std::f64::consts::FRAC_2_SQRT_PI * (-z * z).exp() * sum).copysign(x);
+            (0.5 * x * (1.0 + erf)) as f32
         }))
     }
 
@@ -1720,6 +1739,27 @@ fn numeric_local_layout(
             .map(|units| balanced_rank_range(units, size, rank));
         for member in group.members() {
             let mut local_shape = member.global_shape().to_vec();
+            let chunk_range =
+                |extent: usize, chunk: usize| -> Result<std::ops::Range<usize>, Error> {
+                    let units = group.partition_units().ok_or_else(|| {
+                        Error::backend("test chunked member has no logical units")
+                    })?;
+                    let logical = logical_range.as_ref().unwrap();
+                    if chunk == 0 || extent.div_ceil(chunk) != units || logical.end > units {
+                        return Err(Error::backend(
+                            "test chunked member has incompatible geometry",
+                        ));
+                    }
+                    let boundary = |unit: usize| {
+                        if unit == units {
+                            Ok(extent)
+                        } else {
+                            unit.checked_mul(chunk)
+                                .ok_or_else(|| Error::backend("test chunk boundary overflows"))
+                        }
+                    };
+                    Ok(boundary(logical.start)?..boundary(logical.end)?)
+                };
             let (placement, member_logical_range) = match member.sharding() {
                 MemberSharding::Replicated => (TensorPlacement::Replicated, None),
                 MemberSharding::Equal { axis } => {
@@ -1775,6 +1815,37 @@ fn numeric_local_layout(
                             end,
                         },
                         Some(range.clone()),
+                    )
+                }
+                MemberSharding::PartitionedChunks { axis, chunk_size } => {
+                    let range = chunk_range(member.global_shape()[*axis], *chunk_size)?;
+                    local_shape[*axis] = range.len();
+                    (
+                        TensorPlacement::Range {
+                            axis: *axis,
+                            start: range.start,
+                            end: range.end,
+                        },
+                        logical_range.clone(),
+                    )
+                }
+                MemberSharding::PartitionedChunkSegments {
+                    axis,
+                    segments,
+                    chunk_size,
+                } => {
+                    let mut indices = Vec::new();
+                    for segment in segments {
+                        let range = chunk_range(segment.len(), *chunk_size)?;
+                        indices.extend(segment.start + range.start..segment.start + range.end);
+                    }
+                    local_shape[*axis] = indices.len();
+                    (
+                        TensorPlacement::Indices {
+                            axis: *axis,
+                            indices,
+                        },
+                        logical_range.clone(),
                     )
                 }
                 MemberSharding::PartitionedSegments { axis, segments } => {
@@ -1837,7 +1908,14 @@ fn numeric_local_layout(
                     group.partition_units(),
                     member_logical_range,
                     false,
-                ),
+                )
+                .with_partition_chunk_size(match member.sharding() {
+                    MemberSharding::PartitionedChunks { chunk_size, .. }
+                    | MemberSharding::PartitionedChunkSegments { chunk_size, .. } => {
+                        Some(*chunk_size)
+                    }
+                    _ => None,
+                }),
             );
         }
     }
@@ -2529,7 +2607,16 @@ impl HyperHeadOperator<NumericTensor> for NumericHyperHead {
     fn forward(
         &mut self,
         residual: &NumericTensor,
+        context: &NumericContext,
+    ) -> Result<NumericTensor, Error> {
+        self.forward_with_coefficients_observer(residual, context, None)
+    }
+
+    fn forward_with_coefficients_observer(
+        &mut self,
+        residual: &NumericTensor,
         _: &NumericContext,
+        observer: Option<&mut dyn eredu_nn::TensorValueObserver<NumericTensor>>,
     ) -> Result<NumericTensor, Error> {
         if residual.shape.len() != 4
             || residual.shape[2] as usize != self.streams
@@ -2542,6 +2629,11 @@ impl HyperHeadOperator<NumericTensor> for NumericHyperHead {
             residual.shape[0],
             residual.shape[1],
             self.hidden_size as i32,
+        ]);
+        let mut coefficients = NumericTensor::zeros(vec![
+            residual.shape[0],
+            residual.shape[1],
+            self.streams as i32,
         ]);
         for row in 0..rows {
             let flat = &residual.data[row * self.streams * self.hidden_size
@@ -2561,8 +2653,17 @@ impl HyperHeadOperator<NumericTensor> for NumericHyperHead {
                 let coefficient =
                     sigmoid_scalar(logit * self.scale.0.data[0] + self.base.0.data[stream])
                         + self.epsilon;
+                coefficients.data[row * self.streams + stream] = coefficient;
+            }
+        }
+        if let Some(observer) = observer {
+            observer.observe(&coefficients)?;
+        }
+        for row in 0..rows {
+            for stream in 0..self.streams {
                 for dimension in 0..self.hidden_size {
-                    output.data[row * self.hidden_size + dimension] += coefficient
+                    output.data[row * self.hidden_size + dimension] += coefficients.data
+                        [row * self.streams + stream]
                         * residual.data
                             [(row * self.streams + stream) * self.hidden_size + dimension];
                 }
@@ -2575,6 +2676,7 @@ impl HyperHeadOperator<NumericTensor> for NumericHyperHead {
 #[derive(Default, Clone)]
 struct NumericContext {
     bind_checkpoint_values: bool,
+    cache_owned_attention: bool,
     sliding_attention_calls: Cell<usize>,
     local_layout: Option<Arc<LocalModelLayout>>,
     // Affine numerical execution stores expanded weights while admission and
@@ -2588,6 +2690,7 @@ impl NumericContext {
     fn with_local_layout(layout: LocalModelLayout) -> Self {
         Self {
             bind_checkpoint_values: false,
+            cache_owned_attention: false,
             sliding_attention_calls: Cell::new(0),
             local_layout: Some(Arc::new(layout)),
             expanded_weight_layout: None,
@@ -2603,6 +2706,7 @@ impl NumericContext {
     ) -> Self {
         Self {
             bind_checkpoint_values: false,
+            cache_owned_attention: false,
             sliding_attention_calls: Cell::new(0),
             local_layout: Some(Arc::new(layout)),
             expanded_weight_layout: None,
@@ -4302,6 +4406,21 @@ impl NeuralBackend for NumericBackend {
         let logical_weight =
             local_parameter(&spec.weight, vec![spec.output, spec.input], false, context)?;
         let (weight, execution_weight, format_companions) = match spec.format.encoding() {
+            eredu_checkpoint::LinearFormat::MxFp4 => {
+                let mut companions = Vec::new();
+                if let Some(parameter) = spec.format.scale() {
+                    companions.push((
+                        local_parameter(
+                            parameter,
+                            vec![spec.output, spec.input / 32],
+                            false,
+                            context,
+                        )?,
+                        numeric_companion_metadata(parameter, &spec.weight),
+                    ));
+                }
+                (logical_weight, None, companions)
+            }
             eredu_checkpoint::LinearFormat::Affine(format) => {
                 let groups = spec
                     .input
@@ -4689,7 +4808,8 @@ impl NeuralBackend for NumericBackend {
         let mut output = NumericTensor::zeros(input.queries.shape.clone());
         for b in 0..*batch as usize {
             for head in 0..*heads as usize {
-                let key_head = head % key_heads as usize;
+                // GQA repeats each KV head for a contiguous group of query heads.
+                let key_head = head / (*heads / key_heads) as usize;
                 for query in 0..*queries as usize {
                     let query_position = input.query_offset + query as i32;
                     let tau = if input.window.is_none() {
@@ -6082,6 +6202,18 @@ impl GroupedRelu2Operator<NumericTensor> for NumericRelu2Groups {
         }
         Ok(output)
     }
+    fn forward_grouped_with_unit_observer(
+        &mut self,
+        input: &NumericTensor,
+        routes: &GroupSelection<NumericTensor>,
+        context: &NumericContext,
+        observer: Option<&mut dyn eredu_nn::GroupedUnitObserver<NumericTensor>>,
+    ) -> Result<NumericTensor, Error> {
+        match observer {
+            Some(observer) => routed_units::relu(self, input, routes, observer),
+            None => self.forward_grouped(input, routes, context),
+        }
+    }
 }
 
 impl TensorParallelGroupedRelu2Operator<NumericTensor> for NumericRelu2Groups {
@@ -6096,6 +6228,20 @@ impl TensorParallelGroupedRelu2Operator<NumericTensor> for NumericRelu2Groups {
             self.forward_grouped(input, routes, context)?,
             None,
         ))
+    }
+    fn forward_grouped_tensor_parallel_with_unit_observer(
+        &mut self,
+        input: &NumericTensor,
+        routes: &GroupSelection<NumericTensor>,
+        partitions: usize,
+        context: &NumericContext,
+        observer: Option<&mut dyn eredu_nn::GroupedUnitObserver<NumericTensor>>,
+    ) -> Result<TensorParallelGroupedOutput<NumericTensor>, Error> {
+        match observer {
+            Some(observer) => routed_units::relu(self, input, routes, observer)
+                .map(|output| TensorParallelGroupedOutput::new(output, None)),
+            None => self.forward_grouped_tensor_parallel(input, routes, partitions, context),
+        }
     }
 }
 
@@ -6273,6 +6419,19 @@ impl GroupedGatedProductOperator<NumericTensor> for NumericExpertBank {
         }
         self.forward_bound(input, routes)
     }
+    fn forward_grouped_with_unit_observer(
+        &mut self,
+        input: &NumericTensor,
+        routes: &GroupSelection<NumericTensor>,
+        context: &NumericContext,
+        observer: Option<&mut dyn eredu_nn::GroupedUnitObserver<NumericTensor>>,
+    ) -> Result<NumericTensor, Error> {
+        match observer {
+            Some(observer) => routed_units::gated(self, input, routes, context, observer, false)
+                .map(|output| output.into_parts().0),
+            None => self.forward_grouped(input, routes, context),
+        }
+    }
 }
 
 impl TensorParallelGroupedGatedProductOperator<NumericTensor> for NumericExpertBank {
@@ -6320,6 +6479,19 @@ impl TensorParallelGroupedGatedProductOperator<NumericTensor> for NumericExpertB
             None
         };
         Ok(TensorParallelGroupedOutput::new(reducible, post_reduce))
+    }
+    fn forward_grouped_tensor_parallel_with_unit_observer(
+        &mut self,
+        input: &NumericTensor,
+        routes: &GroupSelection<NumericTensor>,
+        partitions: usize,
+        context: &NumericContext,
+        observer: Option<&mut dyn eredu_nn::GroupedUnitObserver<NumericTensor>>,
+    ) -> Result<TensorParallelGroupedOutput<NumericTensor>, Error> {
+        match observer {
+            Some(observer) => routed_units::gated(self, input, routes, context, observer, true),
+            None => self.forward_grouped_tensor_parallel(input, routes, partitions, context),
+        }
     }
 }
 
@@ -6976,6 +7148,9 @@ struct NumericCache {
     window: Option<i32>,
     keys: Option<NumericTensor>,
     values: Option<NumericTensor>,
+    // In this mode updates expose only the current submission, like a paged
+    // cache. The attention operation must read its retained history itself.
+    attention_history: Option<(NumericTensor, NumericTensor)>,
 }
 
 impl NumericCache {
@@ -6985,6 +7160,7 @@ impl NumericCache {
             window,
             keys: None,
             values: None,
+            attention_history: None,
         }
     }
 
@@ -6994,6 +7170,10 @@ impl NumericCache {
 }
 
 impl AttentionCache<NumericTensor> for NumericCache {
+    fn uses_blockwise_attention(&self) -> bool {
+        self.attention_history.is_some()
+    }
+
     fn offset(&self) -> i32 {
         self.offset
     }
@@ -7009,6 +7189,9 @@ impl AttentionCache<NumericTensor> for NumericCache {
         context: &NumericContext,
     ) -> Result<(NumericTensor, NumericTensor), Error> {
         let added = keys.shape[2];
+        let submitted = context
+            .cache_owned_attention
+            .then(|| (keys.clone(), values.clone()));
         let attention_keys = if let Some(previous) = &self.keys {
             NumericTensor::concatenate(&[previous.clone(), keys], 2, context)?
         } else {
@@ -7030,7 +7213,12 @@ impl AttentionCache<NumericTensor> for NumericCache {
             retained_start,
             attention_values.shape[2] as usize,
         ));
-        Ok((attention_keys, attention_values))
+        if let Some(submitted) = submitted {
+            self.attention_history = Some((attention_keys, attention_values));
+            Ok(submitted)
+        } else {
+            Ok((attention_keys, attention_values))
+        }
     }
 
     fn attention(
@@ -7038,6 +7226,19 @@ impl AttentionCache<NumericTensor> for NumericCache {
         request: AttentionRequest<'_, NumericTensor>,
         _: &NumericContext,
     ) -> Result<NumericTensor, Error> {
+        let request = if let Some((keys, values)) = &self.attention_history {
+            assert_eq!(
+                request.keys.shape[2], request.queries.shape[2],
+                "only submitted keys escape a cache-owned history"
+            );
+            AttentionRequest {
+                keys: keys.clone(),
+                values: values.clone(),
+                ..request
+            }
+        } else {
+            request
+        };
         request.validate()?;
         let query_offset = self.offset - request.queries.shape[2];
         if let Some(cap) = request.softcap {
@@ -7414,11 +7615,11 @@ impl PoolingAttentionCache<NumericTensor> for NumericHybridLayerState {
             .pooling_mask(stream, query_tokens, offset, context)
     }
 
-    fn checkpoint(&self) -> Self::Checkpoint {
+    fn checkpoint(&self) -> Result<Self::Checkpoint, Error> {
         self.pooling
             .as_ref()
-            .expect("pooling checkpoint requested for pooling layer")
-            .clone()
+            .ok_or_else(|| Error::backend("pooling checkpoint requested for non-pooling layer"))
+            .cloned()
     }
 
     fn restore(
@@ -7448,6 +7649,12 @@ impl PoolingAttentionCache<NumericTensor> for NumericHybridLayerState {
 }
 
 impl AttentionCache<NumericTensor> for NumericHybridLayerState {
+    fn uses_blockwise_attention(&self) -> bool {
+        self.attention
+            .as_ref()
+            .is_some_and(AttentionCache::uses_blockwise_attention)
+    }
+
     fn offset(&self) -> i32 {
         self.position()
     }
@@ -7528,7 +7735,7 @@ impl RebuildingUnitPolicy {
 
 impl<U> LayerwisePolicy<NumericBackend, U> for RebuildingUnitPolicy {
     type Lease = RebuiltUnitLease<U>;
-    type Error = &'static str;
+    type Error = Error;
 
     fn begin(&mut self, _: &NumericTensor, _: &NumericContext) -> Result<(), Self::Error> {
         self.events.push(StreamPolicyEvent::Begin);
@@ -7552,7 +7759,7 @@ impl<U> LayerwisePolicy<NumericBackend, U> for RebuildingUnitPolicy {
         ));
         if self.fail_acquire == Some(ordinal) {
             return Err(LayerwiseAcquireError::Policy(
-                "injected dense-stream acquisition failure",
+                Error::backend("injected dense-stream acquisition failure"),
             ));
         }
         build(context)
@@ -9398,6 +9605,7 @@ fn architecture_driver_executes_addressable_groups_with_bounded_generic_mechanis
         .forward_grouped(
             &mut resident,
             RoutedExpertRequest {
+                unit_observer: None,
                 bank: eredu_runtime::RoutedBankId::new(0),
                 layer: 0,
                 input: &input,
@@ -9419,6 +9627,7 @@ fn architecture_driver_executes_addressable_groups_with_bounded_generic_mechanis
         .forward_grouped(
             &mut resident,
             RoutedExpertRequest {
+                unit_observer: None,
                 bank: eredu_runtime::RoutedBankId::new(0),
                 layer: 0,
                 input: &input,
@@ -9439,6 +9648,8 @@ fn architecture_driver_executes_addressable_groups_with_bounded_generic_mechanis
             ..NumericBankReport::default()
         }
     );
+    routed_units::verify_gated(&mut provider, &mut resident, &input, &routes, &context);
+    routed_units::verify_failure(&mut provider, &mut resident, &input, &routes, &context);
 }
 
 struct NumericRelu2Acquisition {
@@ -9686,6 +9897,7 @@ fn architecture_driver_executes_relu2_groups_through_the_same_bounded_compositio
         .forward_relu2_routed(
             &mut resident,
             RoutedExpertRequest {
+                unit_observer: None,
                 bank: eredu_runtime::RoutedBankId::new(0),
                 layer: 0,
                 input: &input,
@@ -9705,6 +9917,7 @@ fn architecture_driver_executes_relu2_groups_through_the_same_bounded_compositio
             ..NumericBankReport::default()
         }
     );
+    routed_units::verify_relu(&mut provider, &mut resident, &input, &routes, &context);
 }
 
 #[test]
@@ -11588,11 +11801,13 @@ fn deepseek_v4_tp2_matches_replicated_hyper_and_routed_block() {
     let mut expected_runtime =
         LayerwiseRuntime::new(architecture, ResidentUnitWindow::new(vec![unit]));
     let tokens = NumericTensor::token_ids(&[0, 4, 6]);
+    let mut expected_capture = components::Components::strict();
     let expected = expected_runtime
-        .forward(
+        .forward_with_observer(
             deepseek::mtp::EmbeddedInput::target(&tokens, None),
             &mut expected_state,
             &context,
+            &mut expected_capture,
         )
         .unwrap();
 
@@ -11693,15 +11908,17 @@ fn deepseek_v4_tp2_matches_replicated_hyper_and_routed_block() {
                         })
                         .unwrap();
                     let parallel = NumericParallelContext::new(rank, collective_group);
+                    let mut capture = components::Components::strict();
                     let logits = runtime
-                        .forward_parallel(
+                        .forward_parallel_with_observer(
                             deepseek::mtp::EmbeddedInput::target(&tokens, None),
                             &mut state,
                             &parallel,
                             &context,
+                            &mut capture,
                         )
                         .unwrap();
-                    (logits, parallel.trace(), state)
+                    (logits, parallel.trace(), state, capture.values)
                 })
             })
             .collect::<Vec<_>>();
@@ -11712,7 +11929,21 @@ fn deepseek_v4_tp2_matches_replicated_hyper_and_routed_block() {
     });
     assert_tensor_close(&outputs[0].0, &expected, "DeepSeek-V4 TP2 rank 0 logits");
     assert_tensor_close(&outputs[1].0, &expected, "DeepSeek-V4 TP2 rank 1 logits");
-    for (_, trace, _) in &outputs {
+    for (_, trace, _, capture) in &outputs {
+        for path in [
+            "readout.embedding.effective",
+            "layers.0.hyper.attention.pre",
+            "layers.0.hyper.attention.combination",
+            "layers.0.compressed_attention.output.effective",
+            "layers.0.hyper.attention.streams.effective",
+            "layers.0.feed_forward.contribution.effective",
+            "layers.0.output.effective",
+            "readout.stream_coefficients",
+            "readout.residual",
+            "readout.linear",
+        ] {
+            assert_tensor_close(&capture[path], &expected_capture.values[path], path);
+        }
         assert_eq!(
             trace.iter().map(|event| event.kind).collect::<Vec<_>>(),
             [
@@ -11741,6 +11972,30 @@ fn deepseek_v4_tp2_matches_replicated_hyper_and_routed_block() {
     assert_eq!(outputs[0].1.last().unwrap().input_shape, [1, 3, 4]);
     assert_eq!(outputs[1].1.last().unwrap().input_shape, [1, 3, 3]);
     assert_eq!(outputs[0].1.last().unwrap().output_shape, [1, 3, 7]);
+    let path = "layers.0.compressed_attention.channels.effective";
+    let global = &expected_capture.values[path];
+    for (rank, (_, _, _, capture)) in outputs.iter().enumerate() {
+        let local = &capture[path];
+        assert_eq!(local.shape, [1, 3, 4]);
+        for token in 0..3 {
+            for channel in 0..4 {
+                assert!(
+                    (local.data[token * 4 + channel] - global.data[token * 8 + rank * 4 + channel])
+                        .abs()
+                        < 1e-5
+                );
+            }
+        }
+    }
+    let path = "layers.0.compressed_attention.write";
+    let partials = outputs[0].3[path]
+        .add(&outputs[1].3[path], &context)
+        .unwrap();
+    assert_tensor_close(
+        &partials,
+        &expected_capture.values[path],
+        "V4 partial channel writes sum",
+    );
 }
 
 #[test]
@@ -12229,6 +12484,41 @@ fn qwen_hybrid_constructed_graph_owns_embedded_prediction_depth() {
 
     assert_eq!(architecture.mtp_len(), 2);
     assert_eq!(architecture.unit_layout().unwrap().group_count(), 3);
+    let description = architecture
+        .parameter_description(&NumericContext::default())
+        .unwrap();
+    for target in [
+        "mtp.pre_fc_norm_hidden.weight",
+        "mtp.pre_fc_norm_embedding.weight",
+        "mtp.fc.weight",
+        "mtp.norm.weight",
+    ] {
+        let owners = description
+            .groups()
+            .iter()
+            .filter(|group| {
+                group
+                    .group()
+                    .members()
+                    .iter()
+                    .any(|member| member.target() == target)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(owners.len(), 1, "one canonical owner for {target}");
+        let eredu_runtime::ParameterGroupOwner::StaticUnitConsumers { role, consumers } =
+            owners[0].owner()
+        else {
+            panic!("shared prediction parameters must be pinned for their consumers");
+        };
+        assert_eq!(role, "mtp");
+        assert_eq!(
+            consumers
+                .iter()
+                .map(|(group, unit)| (group.as_str(), *unit))
+                .collect::<Vec<_>>(),
+            [("mtp.0", 0), ("mtp.1", 0)]
+        );
+    }
 }
 
 #[test]
@@ -13789,7 +14079,7 @@ impl RoutedExpertProvider<NumericBackend> for RecordingNumericExpertProvider {
     fn forward_grouped(
         &mut self,
         resident_bank: &mut NumericExpertBank,
-        request: RoutedExpertRequest<'_, NumericTensor>,
+        request: RoutedExpertRequest<'_, '_, NumericTensor>,
         context: &NumericContext,
     ) -> Result<NumericTensor, Self::Error> {
         self.calls.push((
@@ -13805,7 +14095,7 @@ impl RoutedExpertProvider<NumericBackend> for RecordingNumericExpertProvider {
     fn forward_linear_routed(
         &mut self,
         resident_bank: &mut grouped_linear::NumericLinearGroups,
-        request: RoutedExpertRequest<'_, NumericTensor>,
+        request: RoutedExpertRequest<'_, '_, NumericTensor>,
         context: &NumericContext,
     ) -> Result<NumericTensor, Self::Error> {
         resident_bank.forward_grouped(request.input, request.routes, context)
@@ -13814,7 +14104,7 @@ impl RoutedExpertProvider<NumericBackend> for RecordingNumericExpertProvider {
     fn forward_relu2_routed(
         &mut self,
         resident_bank: &mut NumericRelu2Groups,
-        request: RoutedExpertRequest<'_, NumericTensor>,
+        request: RoutedExpertRequest<'_, '_, NumericTensor>,
         context: &NumericContext,
     ) -> Result<NumericTensor, Self::Error> {
         resident_bank.forward_grouped(request.input, request.routes, context)
@@ -13866,6 +14156,7 @@ fn external_expert_provider_preserves_route_order_weights_bias_and_telemetry() {
         .forward_grouped(
             &mut bank,
             RoutedExpertRequest {
+                unit_observer: None,
                 bank: eredu_runtime::RoutedBankId::new(0),
                 layer: 7,
                 input: &input,
@@ -15324,19 +15615,21 @@ fn routed_kimi_partitioned_tp2_pp2_matches_replicated_prefill_and_repeated_decod
                     let actual = inputs
                         .iter()
                         .map(|tokens| {
+                            let mut capture = components::Components::strict();
                             let mut first = input_driver
-                                .begin(
+                                .begin_observed(
                                     &mut input_model,
                                     LayeredPartitionInput::Tokens(tokens),
                                     None,
                                     &mut input_state,
                                     Some(&parallel),
                                     &context,
+                                    &mut capture,
                                 )
                                 .unwrap();
                             for (ordinal, index) in (0..2).enumerate() {
                                 first.hidden = input_model
-                                    .forward_unit_parallel_with_provider(
+                                    .forward_unit_parallel_observed_with_provider(
                                         0,
                                         index,
                                         &mut input_units[ordinal],
@@ -15351,24 +15644,26 @@ fn routed_kimi_partitioned_tp2_pp2_matches_replicated_prefill_and_repeated_decod
                                         &mut input_provider,
                                         &parallel,
                                         &context,
+                                        &mut capture,
                                     )
                                     .unwrap();
                             }
                             let boundary = input_driver
-                                .finish(
+                                .finish_observed(
                                     &mut input_model,
                                     &first.hidden,
                                     &mut input_state,
                                     &mut first.context,
                                     Some(&parallel),
                                     &context,
+                                    &mut capture,
                                 )
                                 .unwrap();
                             let LayeredPartitionOutput::Boundary { hidden, .. } = boundary else {
                                 panic!("input Kimi stage unexpectedly produced logits")
                             };
                             let mut second = output_driver
-                                .begin(
+                                .begin_observed(
                                     &mut output_model,
                                     LayeredPartitionInput::Hidden {
                                         hidden,
@@ -15378,11 +15673,12 @@ fn routed_kimi_partitioned_tp2_pp2_matches_replicated_prefill_and_repeated_decod
                                     &mut output_state,
                                     Some(&parallel),
                                     &context,
+                                    &mut capture,
                                 )
                                 .unwrap();
                             for (ordinal, index) in (2..4).enumerate() {
                                 second.hidden = output_model
-                                    .forward_unit_parallel_with_provider(
+                                    .forward_unit_parallel_observed_with_provider(
                                         0,
                                         index,
                                         &mut output_units[ordinal],
@@ -15397,22 +15693,30 @@ fn routed_kimi_partitioned_tp2_pp2_matches_replicated_prefill_and_repeated_decod
                                         &mut output_provider,
                                         &parallel,
                                         &context,
+                                        &mut capture,
                                     )
                                     .unwrap();
                             }
                             let output = output_driver
-                                .finish(
+                                .finish_observed(
                                     &mut output_model,
                                     &second.hidden,
                                     &mut output_state,
                                     &mut second.context,
                                     Some(&parallel),
                                     &context,
+                                    &mut capture,
                                 )
                                 .unwrap();
                             let LayeredPartitionOutput::Final { output, .. } = output else {
                                 panic!("output Kimi stage unexpectedly produced a boundary")
                             };
+                            for layer in 0..4 {
+                                let path = format!("model.layers.{layer}.attention.channels");
+                                assert_eq!(capture.values[&path].shape, [1, tokens.dim(1), 4]);
+                                assert_tensor_exact(&capture.values[&path], &capture.values[&format!("{path}.effective")], "Kimi TP/PP original and effective channels");
+                            }
+                            assert_eq!(capture.values["readout.linear.effective"].shape, [1, tokens.dim(1), args.vocab_size]);
                             output
                         })
                         .collect::<Vec<_>>();
@@ -16497,6 +16801,7 @@ impl<U> std::ops::DerefMut for NumericReplicatedLease<U> {
 struct NumericReplicatedPolicy<U> {
     resident: Option<std::rc::Rc<std::cell::RefCell<Vec<Option<U>>>>>,
     bounded_binding: Option<payload::BoundedBinding>,
+    parameter_overrides: BTreeMap<String, NumericTensor>,
 }
 
 impl<U> Clone for NumericReplicatedPolicy<U> {
@@ -16504,6 +16809,7 @@ impl<U> Clone for NumericReplicatedPolicy<U> {
         Self {
             resident: self.resident.clone(),
             bounded_binding: self.bounded_binding.clone(),
+            parameter_overrides: self.parameter_overrides.clone(),
         }
     }
 }
@@ -16515,6 +16821,7 @@ impl<U> NumericReplicatedPolicy<U> {
                 units.into_iter().map(Some).collect(),
             ))),
             bounded_binding: None,
+            parameter_overrides: BTreeMap::new(),
         }
     }
 
@@ -16522,6 +16829,7 @@ impl<U> NumericReplicatedPolicy<U> {
         Self {
             resident: None,
             bounded_binding: None,
+            parameter_overrides: BTreeMap::new(),
         }
     }
 }
@@ -16531,6 +16839,70 @@ impl<U: Parameterized<NumericTensor>> LayerwisePolicy<NumericBackend, U>
 {
     type Lease = NumericReplicatedLease<U>;
     type Error = Error;
+
+    fn resident_parameters_available(&self) -> bool {
+        self.resident.as_ref().is_some_and(|units| {
+            units
+                .try_borrow()
+                .is_ok_and(|units| units.iter().all(Option::is_some))
+        })
+    }
+
+    fn visit_resident_units(&mut self, visitor: &mut impl FnMut(&mut U)) -> bool {
+        if !self.resident_parameters_available() {
+            return false;
+        }
+        for unit in self.resident.as_ref().unwrap().borrow_mut().iter_mut() {
+            visitor(unit.as_mut().unwrap());
+        }
+        true
+    }
+
+    fn inspect_unit<E, F, V>(
+        &mut self,
+        ordinal: usize,
+        address: ExecutionUnitAddress,
+        build: F,
+        operation: V,
+        context: &NumericContext,
+    ) -> Result<bool, LayerwiseAcquireError<E, Self::Error>>
+    where
+        F: FnOnce(&NumericContext) -> Result<U, E>,
+        V: FnOnce(&mut U) -> Result<(), Self::Error>,
+    {
+        let mut lease = self.acquire(ordinal, address, build, context)?;
+        let result = operation(&mut lease);
+        // All scalar calculations finish synchronously, including failed work.
+        if let Some(units) = &self.resident {
+            units.borrow_mut()[ordinal] = Some(lease.unit);
+        }
+        result.map_err(LayerwiseAcquireError::Policy)?;
+        Ok(true)
+    }
+
+    fn publish_parameter_replacements(
+        &mut self,
+        values: &BTreeMap<String, NumericTensor>,
+        active: bool,
+    ) -> Result<bool, Self::Error> {
+        if let Some(units) = &self.resident {
+            let mut units = units
+                .try_borrow_mut()
+                .map_err(|_| Error::backend("numeric parameter owner is busy"))?;
+            if units.iter().any(Option::is_none) {
+                return Err(Error::backend("numeric parameter unit is leased"));
+            }
+            for unit in units.iter_mut() {
+                replace_numeric_parameters(unit.as_mut().unwrap(), values);
+            }
+        }
+        self.parameter_overrides = if active {
+            values.clone()
+        } else {
+            BTreeMap::new()
+        };
+        Ok(true)
+    }
 
     fn begin(&mut self, _: &NumericTensor, _: &NumericContext) -> Result<(), Self::Error> {
         Ok(())
@@ -16561,6 +16933,7 @@ impl<U: Parameterized<NumericTensor>> LayerwisePolicy<NumericBackend, U>
             .map(|binding| binding.acquire(ordinal, &mut unit, context))
             .transpose()
             .map_err(LayerwiseAcquireError::Policy)?;
+        replace_numeric_parameters(&mut unit, &self.parameter_overrides);
         Ok(NumericReplicatedLease {
             ordinal,
             unit,
@@ -16605,6 +16978,25 @@ impl<U: Parameterized<NumericTensor>> LayerwisePolicy<NumericBackend, U>
     }
 }
 
+fn replace_numeric_parameters<U: Parameterized<NumericTensor>>(
+    unit: &mut U,
+    replacements: &BTreeMap<String, NumericTensor>,
+) {
+    struct Replace<'a>(&'a BTreeMap<String, NumericTensor>);
+    impl<'a> ParameterVisitorMut<'a, NumericTensor> for Replace<'_> {
+        fn visit_mut(
+            &mut self,
+            metadata: eredu_nn::ParameterMetadata,
+            value: &'a mut NumericTensor,
+        ) {
+            if let Some(replacement) = self.0.get(metadata.id.as_str()) {
+                *value = replacement.clone();
+            }
+        }
+    }
+    unit.visit_parameters_mut(&mut Replace(replacements));
+}
+
 fn numeric_text_output(output: NumericTensor) -> Result<NumericTensor, Error> {
     if output.shape.len() != 3 || output.shape[1] <= 0 {
         return Err(Error::backend(
@@ -16645,6 +17037,14 @@ where
         omitted: &[String],
         context: &NumericContext,
     ) -> Result<(), Self::Error> {
+        // Some architecture shells retain unowned static placeholders. Bind only
+        // selected tasks, and poison those placeholders so accidental execution
+        // cannot pass a numerical comparison against the selected checkpoint.
+        let mut omitted = omitted.to_vec();
+        omitted.extend(payload::poison_unselected_static(
+            architecture.static_modules_mut(),
+            tasks,
+        ));
         self.prepare_materialization(
             architecture,
             layout,
@@ -16652,7 +17052,7 @@ where
             source,
             source_units,
             tasks,
-            omitted,
+            &omitted,
             context,
         )?;
         if let Some(binding) = &mut self.bounded_binding {
@@ -17254,13 +17654,14 @@ type NumericCompositePartitionForward = dyn FnMut(
 type NumericCompositePartitionObservedForward = dyn FnMut(
     &eredu_runtime::PreparedModelInput<NumericTensor>,
     bool,
-    &mut NumericLifecycleObserver,
+    &mut dyn eredu_runtime::ActivationObserver<NumericTensor, Error>,
 ) -> Result<NumericTensor, Error>;
 
 struct NumericCompositePartitionExecutable {
     forward: Box<NumericCompositePartitionForward>,
     forward_observed: Box<NumericCompositePartitionObservedForward>,
     positions: Box<dyn Fn() -> Result<Vec<i32>, Error>>,
+    reset: Box<dyn FnMut() -> Result<(), Error>>,
 }
 
 impl NumericCompositePartitionExecutable {
@@ -17276,9 +17677,13 @@ impl NumericCompositePartitionExecutable {
         &mut self,
         input: &eredu_runtime::PreparedModelInput<NumericTensor>,
         prefill: bool,
-        observer: &mut NumericLifecycleObserver,
+        observer: &mut dyn eredu_runtime::ActivationObserver<NumericTensor, Error>,
     ) -> Result<NumericTensor, Error> {
         (self.forward_observed)(input, prefill, observer)
+    }
+
+    fn reset(&mut self) -> Result<(), Error> {
+        (self.reset)()
     }
 
     fn positions(&self) -> Result<Vec<i32>, Error> {
@@ -17325,41 +17730,115 @@ impl
             .session_facts::<NumericBackend>()
             .map_err(Error::backend)?;
         let tensor_group = facts.tensor_group();
-        let (_, prompt, plan, _) = facts.into_parts();
+        let (text, prompt, plan, _) = facts.into_parts();
+        let (_, _, _, selected_residency) = text.into_parts();
+        let addressable_parameters = prepared
+            .partition_banks()
+            .map(|banks| {
+                banks
+                    .addressable_logical_targets()
+                    .into_iter()
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let mut provider = prepared
+            .partition_banks()
+            .map(|selection| {
+                eredu_architectures::prepared_execution::construct_partition_bank_providers::<
+                    NumericBackend,
+                    _,
+                    _,
+                    _,
+                    _,
+                    Error,
+                >(selection, |selection, options| {
+                    partition_banks::bind(
+                        selection.banks(),
+                        options,
+                        self.checkpoint.as_ref(),
+                        &self.context,
+                    )
+                })
+                .map(|(provider, _)| provider)
+                .map_err(|error| Error::backend(error.to_string()))
+            })
+            .transpose()?;
+        let factory_prompt = prompt.clone();
+        let mut mechanisms = if self.context.bind_checkpoint_values {
+            if matches!(selected_residency, LayerWeightResidency::FullyResident) {
+                NumericReplicatedMechanisms::with_bound_checkpoint(Arc::clone(&self.checkpoint))
+            } else {
+                NumericReplicatedMechanisms::with_bounded_checkpoint(Arc::clone(&self.checkpoint))
+            }
+        } else {
+            NumericReplicatedMechanisms::with_checkpoint(Arc::clone(&self.checkpoint))
+        };
         let admission = prepared.prepared().architecture().admission_config();
         let factory_world = Arc::clone(&self.world);
         let binding = prepared
             .prepare_session_runtime::<NumericBackend, _, _, _, _>(
                 prompt,
                 &self.context,
-                move |input, layout, executor_plan, selected, context| {
-                    let (architecture, partition, manifest, tasks) = input.into_parts();
-                    if tasks.is_empty() || layout != *context.local_layout.as_deref().unwrap() {
+                |input, source_architecture, layout, executor_plan, selected, context| {
+                    let (source_architecture, source_layout) = source_architecture
+                        .map(|(source, layout)| (Some(source), Some(layout)))
+                        .unwrap_or((None, None));
+                    let transformed = selected.parameters().iter().any(|parameter| {
+                        matches!(
+                            parameter.lowering(),
+                            eredu_runtime::WeightLoweringKind::Transform
+                                | eredu_runtime::WeightLoweringKind::DerivedTransform
+                        )
+                    });
+                    assert_eq!(
+                        source_architecture.is_some(),
+                        transformed,
+                        "composite transform work retains its original architecture"
+                    );
+                    let mut scalar_layout = source_layout.as_ref().unwrap_or(&layout).clone();
+                    for (name, companion) in layout.tensors() {
+                        if !scalar_layout.contains(name) {
+                            scalar_layout.insert(name.to_owned(), companion.clone());
+                        }
+                    }
+                    if scalar_layout != *context.local_layout.as_deref().unwrap() {
                         return Err(Error::backend(
-                            "numeric composite local task/layout authority drifted",
+                            "numeric composite local layout authority drifted",
                         ));
                     }
-                    factory_world.record_materialization(manifest.rank(), tasks.len());
+                    let prepared = eredu_runtime::prepare_default_partitioned_runtime(
+                        input,
+                        source_architecture.map(|source| *source),
+                        layout,
+                        source_layout,
+                        selected,
+                        &factory_prompt,
+                        eredu_runtime::PartitionedUnitScope::Owned,
+                        &addressable_parameters,
+                        &mut mechanisms,
+                        context,
+                    )
+                    .map_err(|error| Error::backend(error.to_string()))?;
+                    let (
+                        architecture,
+                        _partition,
+                        manifest,
+                        execution_policy,
+                        bounded_policy,
+                        state,
+                    ) = prepared.into_parts();
                     factory_world.realize_manifest(&manifest)?;
-                    let architecture = architecture.into_inner();
-                    let addresses = partition.units().collect::<Vec<_>>();
-                    let units = addresses
-                        .iter()
-                        .map(|address| {
-                            architecture.build_unit(address.group(), address.index(), context)
-                        })
-                        .collect::<Result<Vec<_>, _>>()?;
-                    let state = numeric_partition_state(selected, &partition)?;
                     let parallel = tensor_group
                         .map(|id| numeric_parallel_context(&factory_world, &manifest, id))
                         .transpose()?;
                     let communication = numeric_partition_communication(&factory_world, manifest)?;
-                    let executor = executor_plan.bind(
-                        architecture,
-                        NumericReplicatedPolicy::resident(units),
+                    let executor = executor_plan.bind_with_provider(
+                        architecture.into_inner(),
+                        execution_policy,
                         parallel,
                         NumericPartitionTensorAllocator,
                         RouteMovement::default(),
+                        provider.take(),
                     )?;
                     let runtime = eredu_runtime::PartitionedTextRuntime::new(
                         plan,
@@ -17369,8 +17848,8 @@ impl
                         eredu_runtime::OpaqueBoundaryTransport,
                         eredu_runtime::OpaqueOutputPublisher,
                         eredu_runtime::OpaqueFailureAgreement,
-                        eredu_runtime::ExecutionResidency::FullyResident,
-                        None::<NumericReplicatedPolicy<A::Unit>>,
+                        selected_residency.execution_residency(),
+                        bounded_policy,
                     )
                     .map_err(|error| Error::backend(error.to_string()))?;
                     Ok((runtime, state))
@@ -17391,19 +17870,27 @@ impl
             .record_prompt_cache_identity(rank, prompt_cache_identity);
         let session = eredu_runtime::construct_replicated_text_session_with_runtime(
             binding,
-            NumericReplicatedMechanisms::with_checkpoint(self.checkpoint),
+            mechanisms,
             eredu_runtime::PartitionedTextExecution::new(),
         )
         .map_err(|error| Error::backend(error.to_string()))?;
         let session = std::rc::Rc::new(RefCell::new(session));
         let observed_session = std::rc::Rc::clone(&session);
         let report_session = std::rc::Rc::clone(&session);
+        let reset_session = std::rc::Rc::clone(&session);
+        let reset_context = self.context.clone();
         let context = self.context;
         let observed_context = context.clone();
         let observed_admission = admission.clone();
         let invocation_world = self.world;
         let observed_world = Arc::clone(&invocation_world);
         Ok(NumericCompositePartitionExecutable {
+            reset: Box::new(move || {
+                reset_session
+                    .borrow_mut()
+                    .reset_distributed(&reset_context)
+                    .map_err(|error| Error::backend(error.to_string()))
+            }),
             forward: Box::new(move |input, prefill| {
                 let admitted = A::admit_prepared_input(&admission, input, &NumericInputInspector)
                     .map_err(|error| Error::backend(error.to_string()))?;
@@ -17489,8 +17976,11 @@ fn numeric_partition_communication(
 }
 
 type NumericPartitionForward = dyn FnMut(&NumericTensor, bool) -> Result<NumericTensor, Error>;
-type NumericPartitionObservedForward =
-    dyn FnMut(&NumericTensor, bool, &mut NumericLifecycleObserver) -> Result<NumericTensor, Error>;
+type NumericPartitionObservedForward = dyn FnMut(
+    &NumericTensor,
+    bool,
+    &mut dyn eredu_runtime::ActivationObserver<NumericTensor, Error>,
+) -> Result<NumericTensor, Error>;
 type NumericPartitionCacheSave = dyn FnMut(
     &std::path::Path,
     eredu_core::cache::PromptCacheDescriptor,
@@ -17567,6 +18057,14 @@ struct NumericPartitionExecutable {
     prompt_cache_identity: Box<dyn Fn() -> eredu_core::cache::PromptCacheModelIdentity>,
     save_prompt_cache: Box<NumericPartitionCacheSave>,
     load_prompt_cache: Box<NumericPartitionCacheLoad>,
+    parameters: Box<
+        dyn FnMut(
+            &eredu_runtime::parameter_operations::PreparedParameterLocation,
+            bool,
+        ) -> Result<BTreeMap<String, NumericTensor>, Error>,
+    >,
+    publish_parameters:
+        Box<dyn FnMut(&BTreeMap<String, NumericTensor>, bool) -> Result<bool, Error>>,
 }
 
 impl NumericPartitionExecutable {
@@ -17582,7 +18080,7 @@ impl NumericPartitionExecutable {
         &mut self,
         tokens: &NumericTensor,
         prefill: bool,
-        observer: &mut NumericLifecycleObserver,
+        observer: &mut dyn eredu_runtime::ActivationObserver<NumericTensor, Error>,
     ) -> Result<NumericTensor, Error> {
         (self.forward_observed)(tokens, prefill, observer)
     }
@@ -17631,12 +18129,25 @@ where
     let reset_session = std::rc::Rc::clone(&session);
     let save_session = std::rc::Rc::clone(&session);
     let load_session = std::rc::Rc::clone(&session);
+    let parameter_session = std::rc::Rc::clone(&session);
+    let publish_session = std::rc::Rc::clone(&session);
     let forward_context = context.clone();
     let observed_context = context.clone();
     let reset_context = context.clone();
     let save_context = context.clone();
+    let parameter_context = context.clone();
     let load_context = context;
     NumericPartitionExecutable {
+        parameters: Box::new(move |location, fail| {
+            (&mut *parameter_session.borrow_mut()).numeric_parameters(
+                location,
+                fail,
+                &parameter_context,
+            )
+        }),
+        publish_parameters: Box::new(move |values, active| {
+            (&mut *publish_session.borrow_mut()).numeric_publish_parameters(values, active)
+        }),
         forward: Box::new(move |tokens, prefill| {
             let mut session = forward_session.borrow_mut();
             let output = if prefill {
@@ -17689,6 +18200,17 @@ where
 }
 
 trait NumericPartitionSession {
+    fn numeric_parameters(
+        self,
+        location: &eredu_runtime::parameter_operations::PreparedParameterLocation,
+        fail: bool,
+        context: &NumericContext,
+    ) -> Result<BTreeMap<String, NumericTensor>, Error>;
+    fn numeric_publish_parameters(
+        self,
+        values: &BTreeMap<String, NumericTensor>,
+        active: bool,
+    ) -> Result<bool, Error>;
     fn numeric_prefill(
         self,
         tokens: &NumericTensor,
@@ -17704,7 +18226,7 @@ trait NumericPartitionSession {
         tokens: &NumericTensor,
         prefill: bool,
         context: &NumericContext,
-        observer: &mut NumericLifecycleObserver,
+        observer: &mut dyn eredu_runtime::ActivationObserver<NumericTensor, Error>,
     ) -> Result<NumericTensor, Error>;
     fn numeric_reset(self, context: &NumericContext) -> Result<(), Error>;
     fn numeric_save_prompt_cache(
@@ -17743,6 +18265,55 @@ where
         NumericReplicatedPolicy<A::Unit>,
     >,
 {
+    fn numeric_parameters(
+        self,
+        location: &eredu_runtime::parameter_operations::PreparedParameterLocation,
+        fail: bool,
+        context: &NumericContext,
+    ) -> Result<BTreeMap<String, NumericTensor>, Error> {
+        struct Read(BTreeMap<String, NumericTensor>);
+        impl eredu_nn::ParameterSlotVisitor<NumericTensor> for Read {
+            fn visit_slot(
+                &mut self,
+                metadata: eredu_nn::ParameterMetadata,
+                value: &mut NumericTensor,
+            ) {
+                assert!(self
+                    .0
+                    .insert(metadata.id.as_str().into(), value.clone())
+                    .is_none());
+            }
+        }
+        let mut read = Read(BTreeMap::new());
+        let available = self
+            .with_parameter_slots(
+                location,
+                &mut |visit| {
+                    visit(&mut read);
+                    if fail {
+                        Err(Error::backend("injected parameter query failure"))
+                    } else {
+                        Ok(())
+                    }
+                },
+                context,
+            )
+            .map_err(|error| match error {
+                LayerwiseAcquireError::Architecture(error)
+                | LayerwiseAcquireError::Policy(error) => error,
+            })?;
+        if !available {
+            return Err(Error::backend("prepared parameter access unavailable"));
+        }
+        Ok(read.0)
+    }
+    fn numeric_publish_parameters(
+        self,
+        values: &BTreeMap<String, NumericTensor>,
+        active: bool,
+    ) -> Result<bool, Error> {
+        self.publish_parameter_replacements(values, active)
+    }
     fn numeric_prefill(
         self,
         tokens: &NumericTensor,
@@ -17766,14 +18337,14 @@ where
         tokens: &NumericTensor,
         prefill: bool,
         context: &NumericContext,
-        observer: &mut NumericLifecycleObserver,
+        observer: &mut dyn eredu_runtime::ActivationObserver<NumericTensor, Error>,
     ) -> Result<NumericTensor, Error> {
         if prefill {
             self.prefill_with_observer(tokens, None, context, observer)
         } else {
             self.decode_with_observer(tokens, context, observer)
         }
-        .map_err(|error| Error::backend(error.to_string()))
+        .map_err(Error::backend_source)
     }
 
     fn numeric_reset(self, context: &NumericContext) -> Result<(), Error> {
@@ -17872,6 +18443,11 @@ where
         DeviceState<NumericBackend, NumericHybridLayerState>,
     >,
 {
+    fn emits_internal_observations(&self, architecture: &A, tensor_parallel: bool) -> bool {
+        self.inner
+            .emits_internal_observations(architecture, tensor_parallel)
+    }
+
     fn has_cross_stage_collective_waves(&self) -> bool {
         self.inner.has_cross_stage_collective_waves()
     }
@@ -17907,6 +18483,43 @@ where
             communication,
             communication_executor,
             context,
+        )
+    }
+
+    fn forward_unit_observed<G, R, I, O>(
+        &mut self,
+        architecture: &mut A,
+        address: ExecutionUnitAddress,
+        unit: &mut A::Unit,
+        hidden: &NumericTensor,
+        state: &mut DeviceState<NumericBackend, NumericHybridLayerState>,
+        forward: &mut A::ForwardContext,
+        pass: ExpertPass,
+        parallel: Option<&NumericParallelContext>,
+        communication: &PartitionCommunication<NumericBackend, G, R, I>,
+        communication_executor: &NumericContext,
+        context: &NumericContext,
+        observer: &mut O,
+    ) -> Result<NumericTensor, Error>
+    where
+        G: std::borrow::Borrow<u64>,
+        R: std::borrow::Borrow<u64>,
+        I: CommunicationTensorMetadata<NumericBackend>,
+        O: eredu_runtime::ActivationObserver<NumericTensor, Error> + ?Sized,
+    {
+        self.inner.forward_unit_observed(
+            architecture,
+            address,
+            unit,
+            hidden,
+            state,
+            forward,
+            pass,
+            parallel,
+            communication,
+            communication_executor,
+            context,
+            observer,
         )
     }
 
@@ -17955,7 +18568,7 @@ impl RoutedExpertProvider<NumericBackend> for CountingPartitionedRoutedProvider 
     fn forward_grouped(
         &mut self,
         resident_bank: &mut NumericExpertBank,
-        request: RoutedExpertRequest<'_, NumericTensor>,
+        request: RoutedExpertRequest<'_, '_, NumericTensor>,
         context: &NumericContext,
     ) -> Result<NumericTensor, Self::Error> {
         self.calls.fetch_add(1, Ordering::Relaxed);
@@ -17971,7 +18584,7 @@ impl RoutedExpertProvider<NumericBackend> for CountingPartitionedRoutedProvider 
     fn forward_linear_routed(
         &mut self,
         resident_bank: &mut grouped_linear::NumericLinearGroups,
-        request: RoutedExpertRequest<'_, NumericTensor>,
+        request: RoutedExpertRequest<'_, '_, NumericTensor>,
         context: &NumericContext,
     ) -> Result<NumericTensor, Self::Error> {
         <eredu_architectures::prepared_execution::PartitionBankProviders<NumericBackend> as RoutedExpertProvider<NumericBackend>>::forward_linear_routed(
@@ -17985,7 +18598,7 @@ impl RoutedExpertProvider<NumericBackend> for CountingPartitionedRoutedProvider 
     fn forward_relu2_routed(
         &mut self,
         resident_bank: &mut NumericRelu2Groups,
-        request: RoutedExpertRequest<'_, NumericTensor>,
+        request: RoutedExpertRequest<'_, '_, NumericTensor>,
         context: &NumericContext,
     ) -> Result<NumericTensor, Self::Error> {
         <eredu_architectures::prepared_execution::PartitionBankProviders<NumericBackend> as RoutedExpertProvider<NumericBackend>>::forward_relu2_routed(
@@ -18001,7 +18614,7 @@ impl TensorParallelRoutedExpertProvider<NumericBackend> for CountingPartitionedR
     fn forward_grouped_tensor_parallel(
         &mut self,
         resident_bank: &mut NumericExpertBank,
-        request: RoutedExpertRequest<'_, NumericTensor>,
+        request: RoutedExpertRequest<'_, '_, NumericTensor>,
         partitions: usize,
         context: &NumericContext,
     ) -> Result<RoutedExpertTensorParallelOutput<NumericTensor>, Self::Error> {
@@ -18018,7 +18631,7 @@ impl TensorParallelRoutedExpertProvider<NumericBackend> for CountingPartitionedR
     fn forward_relu2_routed_tensor_parallel(
         &mut self,
         resident_bank: &mut NumericRelu2Groups,
-        request: RoutedExpertRequest<'_, NumericTensor>,
+        request: RoutedExpertRequest<'_, '_, NumericTensor>,
         partitions: usize,
         context: &NumericContext,
     ) -> Result<RoutedExpertTensorParallelOutput<NumericTensor>, Self::Error> {
@@ -18135,25 +18748,6 @@ impl
     }
 }
 
-fn numeric_partition_state<G, D>(
-    selected: &eredu_runtime::SelectedReplicatedTextRealization,
-    partition: &ArchitecturePartition<G, D>,
-) -> Result<DeviceState<NumericBackend, NumericHybridLayerState>, Error>
-where
-    D: eredu_runtime::ArchitectureBoundary,
-{
-    let local = partition
-        .state()
-        .ok_or_else(|| Error::backend("numeric partition has no local state"))?;
-    let selected = selected
-        .state()
-        .for_partitioned_geometry(local)
-        .map_err(|error| Error::backend(error.to_string()))?;
-    DeviceState::create(selected.layout().clone(), |_, policy| {
-        Ok::<_, Error>(NumericHybridLayerState::new(policy))
-    })
-}
-
 fn numeric_parallel_context(
     world: &Arc<NumericPartitionWorld>,
     manifest: &CommunicationManifest,
@@ -18211,12 +18805,24 @@ where
         .prepare_session_runtime(
             prompt,
             &context,
-            |input, _source, layout, selected, context| {
+            |input, source_architecture, layout, selected, context| {
+                let (source_architecture, source_layout) = source_architecture
+                    .map(|(architecture, layout)| (Some(architecture), Some(layout)))
+                    .unwrap_or((None, None));
+                assert_eq!(
+                    source_architecture.is_some(),
+                    selected.parameters().iter().any(|parameter| matches!(
+                        parameter.lowering(),
+                        eredu_runtime::WeightLoweringKind::Transform
+                            | eredu_runtime::WeightLoweringKind::DerivedTransform
+                    )),
+                    "partition transform work retains its original architecture",
+                );
                 let prepared = eredu_runtime::prepare_default_partitioned_runtime(
                     input,
-                    None,
+                    source_architecture,
                     layout,
-                    None,
+                    source_layout,
                     selected,
                     &factory_prompt,
                     eredu_runtime::PartitionedUnitScope::Owned,
@@ -18303,12 +18909,24 @@ where
         .prepare_session_runtime(
             prompt,
             &context,
-            |input, _source, layout, selected, context| {
+            |input, source_architecture, layout, selected, context| {
+                let (source_architecture, source_layout) = source_architecture
+                    .map(|(architecture, layout)| (Some(architecture), Some(layout)))
+                    .unwrap_or((None, None));
+                assert_eq!(
+                    source_architecture.is_some(),
+                    selected.parameters().iter().any(|parameter| matches!(
+                        parameter.lowering(),
+                        eredu_runtime::WeightLoweringKind::Transform
+                            | eredu_runtime::WeightLoweringKind::DerivedTransform
+                    )),
+                    "partition transform work retains its original architecture",
+                );
                 let prepared = eredu_runtime::prepare_default_partitioned_runtime(
                     input,
-                    None,
+                    source_architecture,
                     layout,
-                    None,
+                    source_layout,
                     selected,
                     &factory_prompt,
                     eredu_runtime::PartitionedUnitScope::Owned,
@@ -18418,12 +19036,24 @@ where
         .prepare_session_runtime(
             prompt,
             &context,
-            |input, layout, selected, execution, context| {
+            |input, source_architecture, layout, selected, execution, context| {
+                let (source_architecture, source_layout) = source_architecture
+                    .map(|(architecture, layout)| (Some(architecture), Some(layout)))
+                    .unwrap_or((None, None));
+                assert_eq!(
+                    source_architecture.is_some(),
+                    selected.parameters().iter().any(|parameter| matches!(
+                        parameter.lowering(),
+                        eredu_runtime::WeightLoweringKind::Transform
+                            | eredu_runtime::WeightLoweringKind::DerivedTransform
+                    )),
+                    "partition transform work retains its original architecture",
+                );
                 let prepared = eredu_runtime::prepare_default_partitioned_runtime(
                     input,
-                    None,
+                    source_architecture,
                     layout,
-                    None,
+                    source_layout,
                     selected,
                     &factory_prompt,
                     eredu_runtime::PartitionedUnitScope::Owned,
@@ -18583,9 +19213,21 @@ where
         .prepare_session_runtime(
             prompt,
             &context,
-            |input, layout, selected, execution, context| {
+            |input, source_architecture, layout, selected, execution, context| {
+                let (source_architecture, source_layout) = source_architecture
+                    .map(|(architecture, layout)| (Some(architecture), Some(layout)))
+                    .unwrap_or((None, None));
+                assert_eq!(
+                    source_architecture.is_some(),
+                    selected.parameters().iter().any(|parameter| matches!(
+                        parameter.lowering(),
+                        eredu_runtime::WeightLoweringKind::Transform
+                            | eredu_runtime::WeightLoweringKind::DerivedTransform
+                    )),
+                    "partition transform work retains its original architecture",
+                );
                 let prepared = eredu_runtime::prepare_default_partitioned_runtime(
-                    input, None, layout, None, selected, &factory_prompt,
+                    input, source_architecture, layout, source_layout, selected, &factory_prompt,
                     eredu_runtime::PartitionedUnitScope::Owned, &addressable_parameters, &mut mechanisms, context,
                 ).map_err(|e| Error::backend(e.to_string()))?;
                 let (architecture, partition, manifest, execution_policy, bounded_policy, state) = prepared.into_parts();
@@ -19312,6 +19954,7 @@ fn routed_tp_pp_ep_collective_wave_schedule_is_exact_for_qwen_and_gpt_oss() {
         Operation::ForwardInput,
         Operation::ForwardScores,
         Operation::ForwardCoefficients,
+        Operation::ProviderSuccessAgreement,
         Operation::ReverseOutput,
         Operation::ReverseRouteTags,
     ];
@@ -19323,6 +19966,7 @@ fn routed_tp_pp_ep_collective_wave_schedule_is_exact_for_qwen_and_gpt_oss() {
         Operation::ForwardInput,
         Operation::ForwardScores,
         Operation::ForwardCoefficients,
+        Operation::ProviderSuccessAgreement,
         Operation::ReverseOutput,
         Operation::ReversePostReduceBias,
         Operation::ReverseRouteTags,
@@ -20294,7 +20938,11 @@ impl<'a>
         }
         eredu_architectures::prepared_execution::construct_selected_routed_composite_session(
             prepared,
-            NumericReplicatedMechanisms::with_checkpoint(checkpoint),
+            if self.context.bind_checkpoint_values {
+                NumericReplicatedMechanisms::with_bound_checkpoint(checkpoint)
+            } else {
+                NumericReplicatedMechanisms::with_checkpoint(checkpoint)
+            },
             self.context,
             |banks, _options| {
                 banks
@@ -20411,7 +21059,11 @@ impl<'a>
         }
         eredu_architectures::prepared_execution::construct_selected_routed_session(
             prepared,
-            NumericReplicatedMechanisms::with_checkpoint(checkpoint),
+            if self.context.bind_checkpoint_values {
+                NumericReplicatedMechanisms::with_bound_checkpoint(checkpoint)
+            } else {
+                NumericReplicatedMechanisms::with_checkpoint(checkpoint)
+            },
             self.context,
             |banks, _options| {
                 banks
@@ -20508,7 +21160,11 @@ impl<'a>
         }
         eredu_architectures::prepared_execution::construct_selected_routed_session(
             prepared,
-            NumericReplicatedMechanisms::with_checkpoint(checkpoint),
+            if self.context.bind_checkpoint_values {
+                NumericReplicatedMechanisms::with_bound_checkpoint(checkpoint)
+            } else {
+                NumericReplicatedMechanisms::with_checkpoint(checkpoint)
+            },
             self.context,
             |banks, options| {
                 banks
@@ -20546,7 +21202,7 @@ impl<'a>
                             _ => {
                                 return Err(
                                     "gated/linear visitor received a different equation".into()
-                                )
+                                );
                             }
                         };
                         Ok::<_, String>((*id, (bank, NumericIndexedMovement)))
@@ -21111,7 +21767,9 @@ fn execute_numeric_composite_visitor_with_observer(
         plan = plan.with_expert_cache(Some(eredu_core::ExpertCachePlan::new(
             Some(member_bytes),
             Some(member_bytes),
-            member_bytes.checked_mul(2).unwrap(),
+            member_bytes
+                .checked_mul(routed.routes_per_token() as u64)
+                .unwrap(),
             member_bytes,
             eredu_core::residency::CacheEvictionPolicy::LeastRecentlyUsed,
         )));
@@ -21833,6 +22491,10 @@ pub(crate) fn non_mlx_routed_composite_reuses_the_planned_provider() {
 }
 
 pub(crate) fn non_mlx_inkling_composite_executes_routed_and_shared_banks() {
+    non_mlx_inkling_composite_with_shared_banks(1);
+}
+
+fn non_mlx_inkling_composite_with_shared_banks(shared: i32) {
     let config = serde_json::json!({
         "model_type":"inkling_mm_model","image_token_id":5,
         "text_config":{
@@ -21842,7 +22504,7 @@ pub(crate) fn non_mlx_inkling_composite_executes_routed_and_shared_banks() {
             "mlp_layer_types":["moe"],"sconv_kernel_size":3,
             "d_rel":2,"rel_extent":8,"intermediate_size":12,
             "dense_intermediate_size":12,"moe_intermediate_size":6,
-            "n_routed_experts":3,"num_experts_per_tok":2,"n_shared_experts":1,
+            "n_routed_experts":3,"num_experts_per_tok":2,"n_shared_experts":shared,
             "unpadded_vocab_size":19
         },
         "vision_config":{"text_hidden_size":8,"patch_size":40,"temporal_patch_size":2,
@@ -23418,7 +24080,7 @@ impl RoutedExpertProvider<NumericBackend> for TypedRelu2ProviderProbe {
     fn forward_grouped(
         &mut self,
         _resident_bank: &mut NumericExpertBank,
-        request: RoutedExpertRequest<'_, NumericTensor>,
+        request: RoutedExpertRequest<'_, '_, NumericTensor>,
         _: &NumericContext,
     ) -> Result<NumericTensor, Self::Error> {
         Ok(request.input.clone())
@@ -23428,7 +24090,7 @@ impl RoutedExpertProvider<NumericBackend> for TypedRelu2ProviderProbe {
     fn forward_linear_routed(
         &mut self,
         _resident_bank: &mut grouped_linear::NumericLinearGroups,
-        request: RoutedExpertRequest<'_, NumericTensor>,
+        request: RoutedExpertRequest<'_, '_, NumericTensor>,
         _: &NumericContext,
     ) -> Result<NumericTensor, Self::Error> {
         self.replicated_calls += 1;
@@ -23438,7 +24100,7 @@ impl RoutedExpertProvider<NumericBackend> for TypedRelu2ProviderProbe {
     fn forward_relu2_routed(
         &mut self,
         _resident_bank: &mut NumericRelu2Groups,
-        request: RoutedExpertRequest<'_, NumericTensor>,
+        request: RoutedExpertRequest<'_, '_, NumericTensor>,
         _: &NumericContext,
     ) -> Result<NumericTensor, Self::Error> {
         self.replicated_calls += 1;
@@ -23450,7 +24112,7 @@ impl TensorParallelRoutedExpertProvider<NumericBackend> for TypedRelu2ProviderPr
     fn forward_grouped_tensor_parallel(
         &mut self,
         _resident_bank: &mut NumericExpertBank,
-        request: RoutedExpertRequest<'_, NumericTensor>,
+        request: RoutedExpertRequest<'_, '_, NumericTensor>,
         partitions: usize,
         _: &NumericContext,
     ) -> Result<RoutedExpertTensorParallelOutput<NumericTensor>, Self::Error> {
@@ -23463,7 +24125,7 @@ impl TensorParallelRoutedExpertProvider<NumericBackend> for TypedRelu2ProviderPr
     fn forward_relu2_routed_tensor_parallel(
         &mut self,
         _resident_bank: &mut NumericRelu2Groups,
-        request: RoutedExpertRequest<'_, NumericTensor>,
+        request: RoutedExpertRequest<'_, '_, NumericTensor>,
         partitions: usize,
         _: &NumericContext,
     ) -> Result<RoutedExpertTensorParallelOutput<NumericTensor>, Self::Error> {
@@ -24232,7 +24894,11 @@ fn v3_target_model_runs_end_to_end_through_resident_runtime() {
 }
 
 fn tiny_v4_args() -> deepseek::V4Args {
-    deepseek::parse_v4_config(&serde_json::json!({
+    deepseek::parse_v4_config(&tiny_v4_config()).unwrap()
+}
+
+fn tiny_v4_config() -> serde_json::Value {
+    serde_json::json!({
         "model_type": "deepseek_v4",
         "hidden_size": 4,
         "moe_intermediate_size": 4,
@@ -24262,8 +24928,7 @@ fn tiny_v4_args() -> deepseek::V4Args {
         "norm_topk_prob": true,
         "routed_scaling_factor": 1.0,
         "swiglu_limit": 4.0
-    }))
-    .unwrap()
+    })
 }
 
 struct CaptureOnlyModule<T>(std::marker::PhantomData<fn() -> T>);
@@ -24323,6 +24988,15 @@ impl eredu_architectures::prediction_extension::PredictionExtensionMaterializer<
     type SequentialState = NumericCompressedCache;
     type ModelState = CaptureOnlyModelState;
     type Context<'a> = ();
+
+    fn complete_prediction_values<'a>(
+        values: impl IntoIterator<Item = &'a NumericTensor>,
+        _context: &<NumericTensor as eredu_nn::Tensor>::Context,
+    ) -> Result<(), eredu_core::BackendFailure> {
+        // The reference tensors are eager; consume the complete dependency set.
+        for _value in values {}
+        Ok(())
+    }
 
     fn materialize_module<M>(
         _context: &mut Self::Context<'_>,
@@ -24936,6 +25610,39 @@ fn deepseek_execution_graphs_run_target_mtp_and_dspark_transactions() {
     assert_eq!(v4_state.layer(2).unwrap().offset(), 2);
     transaction.rollback(&mut v4_state);
     assert_eq!(v4_state.layer(2).unwrap().offset(), 2);
+
+    // After context exceeds the cache window, appending a whole bidirectional
+    // proposal retains more keys than a single-token window. Mask geometry must
+    // follow the actual cache return, including on repeated transactions.
+    let long_context = NumericTensor::concatenate(&vec![captures; 6], 1, &context).unwrap();
+    v4_runtime
+        .forward(
+            deepseek::mtp::EmbeddedInput::dspark_context(&long_context),
+            &mut v4_state,
+            &context,
+        )
+        .unwrap();
+    let frontier = v4_state.layer(2).unwrap().offset();
+    assert!(frontier > 8);
+    let mut expected = None;
+    for _ in 0..2 {
+        let mut transaction = eredu_runtime::DraftStateTransaction::fork(&v4_state);
+        let proposal = v4_runtime
+            .forward(
+                deepseek::mtp::EmbeddedInput::dspark_proposal(&anchor, 2),
+                transaction.draft_mut(),
+                &context,
+            )
+            .unwrap();
+        assert_eq!(proposal.shape, [1, 2, 16]);
+        assert!(proposal.data.iter().all(|v| v.is_finite()));
+        if let Some(expected) = &expected {
+            assert_tensor_exact(&proposal, expected, "long-context DSpark rollback replay");
+        }
+        expected = Some(proposal);
+        transaction.rollback(&mut v4_state);
+        assert_eq!(v4_state.layer(2).unwrap().offset(), frontier);
+    }
 }
 
 #[test]
@@ -25183,6 +25890,9 @@ struct IdentityRouteExchange {
 
 impl ExpertRouteExchange<NumericTensor> for IdentityRouteExchange {
     type Error = Error;
+    fn agree_provider_success(&mut self, local_success: bool) -> Result<bool, Self::Error> {
+        Ok(local_success)
+    }
 
     fn exchange_tensor(
         &mut self,
@@ -25860,8 +26570,15 @@ fn numeric_composite_parameter_description(
         .unwrap()
         .parameter_description(&context)
         .unwrap(),
-        "qwen3_5" => qwen::hybrid::ConditionalLayeredModel::<NumericBackend>::new(
+        "qwen3_5" | "qwen3_5_moe" => qwen::hybrid::ConditionalLayeredModel::<NumericBackend>::new(
             qwen::hybrid::model_args_from_config_value(config).unwrap(),
+            &context,
+        )
+        .unwrap()
+        .parameter_description(&context)
+        .unwrap(),
+        "qwen3_vl" | "qwen3_vl_moe" => qwen::vl::LayeredModel::<NumericBackend>::new(
+            qwen::vl::model_args_from_config_value(config).unwrap(),
             &context,
         )
         .unwrap()
@@ -27129,6 +27846,37 @@ fn inkling_dense_partition_prepared_multimodal_identity_is_causal() {
     let prepared =
         eredu_architectures::composite_execution::PreparedCompositeInput::new(&original, &admitted)
             .unwrap();
+    let context = NumericContext::default();
+    let prediction_tokens = <inkling::LayeredModel<NumericBackend> as
+        eredu_architectures::composite_execution::CompositeArchitecture<
+            NumericBackend,
+            DeviceState<NumericBackend, NumericHybridLayerState>,
+        >>::prepared_prediction_token_ids(prepared, &context)
+    .unwrap();
+    assert_tensor_exact(
+        &prediction_tokens,
+        &NumericTensor::token_ids(&[1, 2, 5]),
+        "Inkling prediction retains projected image placeholder identity",
+    );
+    inkling::prepare_input(prepared, &context)
+        .unwrap()
+        .with_model_input(|input| {
+            let parts = input
+                .parts
+                .iter()
+                .map(|part| match part {
+                    inkling::DecoderInputPart::Text(tokens)
+                    | inkling::DecoderInputPart::Image(tokens)
+                    | inkling::DecoderInputPart::Audio(tokens)
+                    | inkling::DecoderInputPart::Projected { tokens, .. } => (*tokens).clone(),
+                })
+                .collect::<Vec<_>>();
+            assert_tensor_exact(
+                &NumericTensor::concatenate(&parts, 1, &context).unwrap(),
+                &prediction_tokens,
+                "Inkling target and prediction semantic identity",
+            );
+        });
     let architecture =
         inkling::LayeredModel::<NumericBackend>::new(args.clone(), &NumericContext::default())
             .unwrap();
@@ -27464,3 +28212,6 @@ fn deepseek_prediction_free_boundaries_preserve_exact_roles_and_values() {
     )
     .is_err());
 }
+
+#[path = "reference_numeric/routed_units.rs"]
+mod routed_units;

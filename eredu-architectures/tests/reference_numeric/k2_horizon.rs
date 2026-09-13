@@ -5,9 +5,168 @@ fn fixture() -> serde_json::Value {
     serde_json::from_str(include_str!("../fixtures/k2_horizon/reference.json")).unwrap()
 }
 
+#[test]
+fn k2_mixed_encoding_partitions_construct_independent_shared_widths_and_reconstruct_writes() {
+    use eredu_architectures::decoder::{
+        BlockFactory, DecoderProjectionOperator, TensorParallelProjectionOperator,
+    };
+    use eredu_architectures::partitioned_execution::derive_partitioned_local_layout;
+    use eredu_checkpoint::{BlockFp8Format, BlockFp8ScaleEncoding, LinearFormat};
+    for routed_encoded in [true, false] {
+        for shared_count in [1, 2] {
+            let mut config = fixture()["mova"]["config"].clone();
+            config["hidden_size"] = 130.into();
+            config["moe_intermediate_size"] = 384.into();
+            config["num_shared_experts"] = shared_count.into();
+            let mut args = family::model_args_from_config_value(&config).unwrap();
+            let format = LinearFormat::E4M3BlockFp8(
+                BlockFp8Format::new(128, 128, BlockFp8ScaleEncoding::FloatingPoint).unwrap(),
+            );
+            let names = if routed_encoded {
+                vec![
+                    "model.layers.1.mlp.experts.gate_up_proj",
+                    "model.layers.1.mlp.experts.down_proj",
+                ]
+            } else {
+                vec![
+                    "model.layers.1.mlp.shared_experts.gate_proj.weight",
+                    "model.layers.1.mlp.shared_experts.up_proj.weight",
+                    "model.layers.1.mlp.shared_experts.down_proj.weight",
+                ]
+            };
+            args = family::with_checkpoint_formats(
+                &args,
+                names.into_iter().map(|name| (name.into(), format)),
+            )
+            .unwrap();
+            let description = family::parameter_description(&args).unwrap();
+            let input = NumericTensor::new(
+                vec![1, 3, 130],
+                (0..390).map(|i| (i as f32 * 0.37).sin() * 0.1).collect(),
+            );
+            let global =
+                family::new_block::<NumericBackend>(&args, 1, &NumericContext::default()).unwrap();
+            let family::FeedForward::Routed {
+                shared: Some(mut shared),
+                ..
+            } = global.mlp.feed_forward
+            else {
+                panic!("shared branch")
+            };
+            let expected = shared
+                .forward_feed_forward(&input, &NumericContext::default())
+                .unwrap();
+            assert!(expected.data.iter().any(|v| v.abs() > 1e-5));
+            let collective = NumericParallelGroup::new(2);
+            let results = std::thread::scope(|scope| {
+                let handles = (0..2)
+                    .map(|rank| {
+                        let topology = ParallelTopology::new(2, 1, 1, 1).unwrap();
+                        let layout = derive_partitioned_local_layout(
+                            &description,
+                            ParallelRankTopology::new(topology, rank).unwrap(),
+                        )
+                        .unwrap();
+                        let local = family::local_block_args(&args, 1, &layout).unwrap();
+                        let planned = layout
+                            .tensor("model.layers.1.mlp.shared_experts.down_proj.weight")
+                            .unwrap()
+                            .local_shape()[1];
+                        if routed_encoded {
+                            assert_eq!(planned, (192 * shared_count) as usize);
+                            assert_ne!(
+                                planned,
+                                (local.moe_intermediate_size * shared_count) as usize
+                            );
+                        }
+                        let args = &args;
+                        let input = &input;
+                        let collective = Arc::clone(&collective);
+                        scope.spawn(move || {
+                            let context = NumericContext::with_local_layout(layout);
+                            let block = <family::BlockFactory as BlockFactory<
+                                NumericBackend,
+                                family::ModelArgs,
+                            >>::build_partitioned(
+                                args, &local, 1, &context
+                            )
+                            .unwrap();
+                            let family::FeedForward::Routed {
+                                shared: Some(mut shared),
+                                ..
+                            } = block.mlp.feed_forward
+                            else {
+                                panic!("shared branch")
+                            };
+                            assert_eq!(shared.down.weight.shape, [130, planned as i32]);
+                            shared
+                                .forward_feed_forward_parallel(
+                                    input,
+                                    &NumericParallelContext::new(rank, collective),
+                                    &context,
+                                )
+                                .unwrap()
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                handles
+                    .into_iter()
+                    .map(|h| h.join().unwrap())
+                    .collect::<Vec<_>>()
+            });
+            for actual in results {
+                assert_tensor_close(&actual, &expected, "independently placed shared FFN sum");
+            }
+        }
+    }
+}
+
+#[test]
+fn k2_partial_fp8_blocks_load_whole_and_reject_unaligned_rank_slices() {
+    use eredu_architectures::partitioned_execution::derive_partitioned_local_layout;
+    use eredu_core::{ParallelRankTopology, ParallelTopology};
+    let mut config = fixture()["dense"]["config"].clone();
+    config["hidden_size"] = 130.into();
+    config["intermediate_size"] = 130.into();
+    config["vocab_size"] = 129.into();
+    config["quantization_config"] = serde_json::json!({
+        "quant_method": "fp8", "activation_scheme": "dynamic",
+        "weight_block_size": [128, 128], "ignored_layers": []
+    });
+    let args = family::model_args_from_config_value(&config).unwrap();
+    let description = family::parameter_description(&args).unwrap();
+    let topology = ParallelTopology::new(1, 1, 1, 1).unwrap();
+    let layout = derive_partitioned_local_layout(
+        &description,
+        ParallelRankTopology::new(topology, 0).unwrap(),
+    )
+    .unwrap();
+    for (name, shape) in [
+        ("model.layers.0.mlp.gate_proj.weight", vec![130, 130]),
+        ("model.layers.0.mlp.gate_proj.weight_scale_inv", vec![2, 2]),
+        ("model.layers.0.self_attn.o_proj.weight", vec![130, 16]),
+        (
+            "model.layers.0.self_attn.o_proj.weight_scale_inv",
+            vec![2, 1],
+        ),
+    ] {
+        let tensor = layout.tensor(name).unwrap();
+        assert_eq!(tensor.global_shape(), shape);
+        assert_eq!(tensor.local_shape(), shape);
+    }
+    let topology = ParallelTopology::new(2, 1, 1, 1).unwrap();
+    for rank in 0..2 {
+        assert!(derive_partitioned_local_layout(
+            &description,
+            ParallelRankTopology::new(topology, rank).unwrap(),
+        )
+        .is_err());
+    }
+}
+
 // Serialize the exact logical oracle matrices into the publisher's individual
 // expert layout. The packed oracle name supplies a single reproducible matrix.
-fn checkpoint_fixture(
+pub(super) fn checkpoint_fixture(
     config: &serde_json::Value,
     scale: f32,
 ) -> (tempfile::TempDir, prepared_adapter::ParameterBits) {
@@ -326,7 +485,7 @@ struct BankRecorder {
     calls: Vec<(usize, NumericTensor, NumericTensor, NumericTensor)>,
 }
 impl BankRecorder {
-    fn record(&mut self, request: &RoutedExpertRequest<'_, NumericTensor>) {
+    fn record(&mut self, request: &RoutedExpertRequest<'_, '_, NumericTensor>) {
         self.calls.push((
             request.layer,
             request.routes.group_indices().clone(),
@@ -340,7 +499,7 @@ impl RoutedExpertProvider<NumericBackend> for BankRecorder {
     fn forward_grouped(
         &mut self,
         bank: &mut NumericExpertBank,
-        request: RoutedExpertRequest<'_, NumericTensor>,
+        request: RoutedExpertRequest<'_, '_, NumericTensor>,
         context: &NumericContext,
     ) -> Result<NumericTensor, Error> {
         self.record(&request);
@@ -349,7 +508,7 @@ impl RoutedExpertProvider<NumericBackend> for BankRecorder {
     fn forward_linear_routed(
         &mut self,
         bank: &mut grouped_linear::NumericLinearGroups,
-        request: RoutedExpertRequest<'_, NumericTensor>,
+        request: RoutedExpertRequest<'_, '_, NumericTensor>,
         context: &NumericContext,
     ) -> Result<NumericTensor, Error> {
         self.record(&request);
@@ -358,7 +517,7 @@ impl RoutedExpertProvider<NumericBackend> for BankRecorder {
     fn forward_relu2_routed(
         &mut self,
         bank: &mut NumericRelu2Groups,
-        request: RoutedExpertRequest<'_, NumericTensor>,
+        request: RoutedExpertRequest<'_, '_, NumericTensor>,
         context: &NumericContext,
     ) -> Result<NumericTensor, Error> {
         self.record(&request);
@@ -903,6 +1062,7 @@ fn bounded_value_bank_chunks_prefill_union_and_reacquires_with_complete_projecti
             .forward_linear_routed(
                 &mut resident,
                 RoutedExpertRequest {
+                    unit_observer: None,
                     bank: family::ExpertBank::AttentionValue.id(),
                     layer: 1,
                     input: &input,

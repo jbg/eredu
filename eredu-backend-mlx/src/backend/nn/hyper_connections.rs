@@ -199,6 +199,16 @@ impl HyperHead {
 
     /// Collapses `[batch, tokens, streams, hidden]` into `[batch, tokens, hidden]`.
     pub fn forward(&mut self, residual: &Array, stream: &Stream) -> Result<Array, Exception> {
+        self.forward_with_coefficients_observer(residual, stream, None)
+    }
+
+    /// Borrows the coefficients already consumed by the ordinary final sum.
+    pub fn forward_with_coefficients_observer(
+        &mut self,
+        residual: &Array,
+        stream: &Stream,
+        observer: Option<&mut dyn FnMut(&Array) -> Result<(), Exception>>,
+    ) -> Result<Array, Exception> {
         let dtype = residual.dtype();
         let fp32 = residual.as_dtype(Dtype::Float32, stream)?;
         let flat = fp32.reshape(
@@ -222,6 +232,9 @@ impl HyperHead {
             stream,
         )?
         .add(Array::from_f32(self.epsilon), stream)?;
+        if let Some(observer) = observer {
+            observer(&pre)?;
+        }
         pre.try_index_device((.., .., .., safemlx::ops::indexing::NewAxis), stream)?
             .multiply(&fp32, stream)?
             .sum_axis(2, false, stream)?

@@ -150,7 +150,8 @@ impl PartitionCommunicationAuthority {
         self.poison_guard().is_some()
     }
 
-    /// Records a native submission failure after preflight admission succeeded.
+    /// Records a diagnostic-only submission rejection and poisons the authority.
+    /// Use [`Self::submission_failure`] when an owned error is available.
     pub fn submission_error(
         &self,
         error: impl std::fmt::Display,
@@ -173,10 +174,12 @@ impl PartitionCommunicationAuthority {
             phase,
             route,
             error: error.to_string(),
+            source: None,
         }
     }
 
-    /// Records an exact native completion failure in the shared poison domain.
+    /// Records a diagnostic-only completion rejection in the shared poison domain.
+    /// Use [`Self::completion_failure`] when an owned error is available.
     pub fn completion_error(
         &self,
         error: impl std::fmt::Display,
@@ -199,7 +202,38 @@ impl PartitionCommunicationAuthority {
             phase,
             route,
             error: error.to_string(),
+            source: None,
         }
+    }
+
+    /// Records a submission failure while retaining its original typed cause.
+    pub fn submission_failure(
+        &self,
+        error: impl std::error::Error + Send + Sync + 'static,
+        operation: CommunicationOperation,
+        phase: DistributedExecutionPhase,
+        route: Option<CommunicationRouteId>,
+    ) -> PartitionExecutionError {
+        let mut failure = self.submission_error(&error, operation, phase, route);
+        if let PartitionExecutionError::CommunicationSubmissionFailed { source, .. } = &mut failure {
+            *source = Some(eredu_core::BackendFailure::from_error(error));
+        }
+        failure
+    }
+
+    /// Records a completion failure without treating the error as release evidence.
+    pub fn completion_failure(
+        &self,
+        error: impl std::error::Error + Send + Sync + 'static,
+        operation: CommunicationOperation,
+        phase: DistributedExecutionPhase,
+        route: Option<CommunicationRouteId>,
+    ) -> PartitionExecutionError {
+        let mut failure = self.completion_error(&error, operation, phase, route);
+        if let PartitionExecutionError::CommunicationCompletionFailed { source, .. } = &mut failure {
+            *source = Some(eredu_core::BackendFailure::from_error(error));
+        }
+        failure
     }
 
     /// Waits under the selected bound and permanently poisons this session on failure.
@@ -233,6 +267,7 @@ impl PartitionCommunicationAuthority {
                     phase,
                     route,
                     error: error.to_string(),
+                    source: Some(eredu_core::BackendFailure::from_error(error)),
                 });
             }
         };
@@ -282,6 +317,7 @@ impl PartitionCommunicationAuthority {
                 phase,
                 route,
                 error: error.to_string(),
+                source: Some(eredu_core::BackendFailure::from_error(error)),
             }
         })?;
         match outcome {
@@ -325,6 +361,7 @@ impl PartitionCommunicationAuthority {
                 phase,
                 route,
                 error: error.to_string(),
+                source: Some(eredu_core::BackendFailure::from_error(error)),
             }
         })? {
             BoundedSubmissionOutcome::Completed(output) => Ok(output),
@@ -437,13 +474,13 @@ where
 
     fn submission_error(
         &self,
-        error: impl std::fmt::Display,
+        error: impl std::error::Error + Send + Sync + 'static,
         operation: CommunicationOperation,
         phase: DistributedExecutionPhase,
         route: Option<CommunicationRouteId>,
     ) -> PartitionExecutionError {
         self.authority
-            .submission_error(error, operation, phase, route)
+            .submission_failure(error, operation, phase, route)
     }
 
     fn group(
@@ -1074,6 +1111,7 @@ where
                     phase: DistributedExecutionPhase::Commit,
                     route: None,
                     error: error.to_string(),
+                    source: Some(eredu_core::BackendFailure::from_error(error)),
                 });
             }
         };
@@ -1131,6 +1169,7 @@ where
                 phase,
                 route: None,
                 error: error.to_string(),
+                source: Some(eredu_core::BackendFailure::from_error(error)),
             }
         })
     }
@@ -1186,6 +1225,7 @@ where
                 phase,
                 route: None,
                 error: error.to_string(),
+                source: Some(eredu_core::BackendFailure::from_error(error)),
             }
         })?;
         let output = self.authority.wait_after_prior_failure(
@@ -1210,6 +1250,7 @@ where
                 phase,
                 route: None,
                 error: error.to_string(),
+                source: Some(eredu_core::BackendFailure::from_error(error)),
             }
         })
     }
@@ -1243,6 +1284,7 @@ where
                     phase,
                     route: Some(route),
                     error: error.to_string(),
+                    source: Some(eredu_core::BackendFailure::from_error(error)),
                 }
             } else {
                 self.submission_error(
@@ -1308,6 +1350,18 @@ where
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum DistributedExecutionPhase {
+    /// Every rank prepared its input before observation admission or mutable execution.
+    InputPreparation,
+    /// Checks whether every rank omits a transactional observer.
+    ObservationParticipation,
+    /// Checks whether every rank supplies a transactional observer.
+    ObservationParticipationRequired,
+    /// Every transactional observer completed local admission before any model work.
+    ObservationPreparation,
+    /// Prepared observer identities and quotas agree before the forward.
+    ObservationCoordination,
+    /// Completed observer records are staged before state commitment.
+    ObservationDelivery,
     /// Every rank captured the state checkpoint required for transactional rollback.
     StateCheckpoint,
     /// Every rank accepted the exact prompt-cache load identity and input.
@@ -1657,6 +1711,12 @@ where
     R: Borrow<B::CommunicationRoute>,
     I: CommunicationTensorMetadata<B>,
 {
+    /// Internal hook coverage of this exact architecture/executor pairing.
+    /// The shared partition session adds its final-publication seam separately.
+    fn observation_hooks(&self) -> crate::inspection::ObservationHookSupport {
+        Default::default()
+    }
+
     /// Per-invocation architecture-owned state, including the prepared model input.
     type Pass<'a>;
 
@@ -2150,6 +2210,7 @@ where
     boundary_transport: T,
     output_publisher: U,
     commit_agreement: V,
+    execution_rejection_agreed: bool,
     residency: ExecutionResidency,
     bounded_policy: Option<P>,
     marker: PhantomData<fn(A, S)>,
@@ -2292,6 +2353,7 @@ where
             boundary_transport,
             output_publisher,
             commit_agreement,
+            execution_rejection_agreed: false,
             residency,
             bounded_policy,
             marker: PhantomData,
@@ -2495,7 +2557,9 @@ where
     A: LayeredArchitecture<B, S>,
     Resident: LayerwisePolicy<B, A::Unit>,
     Bounded: LayerwisePolicy<B, A::Unit, Error = Resident::Error>,
-    E: PartitionedGroupExecutor<A, B, S, G, R, I>,
+    E: PartitionedGroupExecutor<A, B, S, G, R, I>
+        + crate::parameter_operations::LayeredParameterOwner<B, S, Architecture = A>,
+    E::Policy: LayerwisePolicy<B, A::Unit, Error = Resident::Error>,
     G: Borrow<B::CommunicationGroup>,
     R: Borrow<B::CommunicationRoute>,
     I: CommunicationTensorMetadata<B>,
@@ -2509,6 +2573,42 @@ where
     const DISTRIBUTED_PHASE_AGREEMENT: bool = V::PHASE_FAILURE_AGREEMENT;
 
     type Runtime = PartitionedTextRuntime<A, B, S, Bounded, E, G, R, I, T, U, V>;
+
+    fn observation_hooks(runtime: &Self::Runtime) -> crate::inspection::ObservationHookSupport {
+        runtime.executor.observation_hooks().with_publication(true)
+    }
+
+    fn visit_loaded_parameters(
+        runtime: &mut Self::Runtime,
+        visitor: &mut dyn eredu_nn::ParameterSlotVisitor<B::Tensor>,
+    ) -> bool {
+        runtime.executor.visit_loaded_parameters(visitor)
+    }
+
+    fn with_parameter_slots(
+        runtime: &mut Self::Runtime,
+        location: &crate::parameter_operations::PreparedParameterLocation,
+        operation: &mut crate::parameter_operations::ParameterSlotOperation<
+            '_,
+            B::Tensor,
+            Resident::Error,
+        >,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<bool, crate::LayerwiseAcquireError<A::Error, Resident::Error>> {
+        runtime
+            .executor
+            .with_parameter_slots(location, operation, context)
+    }
+
+    fn publish_parameter_replacements(
+        runtime: &mut Self::Runtime,
+        values: &std::collections::BTreeMap<String, B::Tensor>,
+        active: bool,
+    ) -> Result<bool, Resident::Error> {
+        runtime
+            .executor
+            .publish_parameter_replacements(values, active)
+    }
 
     fn bounded_policy(runtime: &Self::Runtime) -> Option<&Bounded> {
         runtime.bounded_policy.as_ref()
@@ -2536,6 +2636,7 @@ where
     where
         O: ActivationObserver<B::Tensor, A::Error> + ?Sized,
     {
+        runtime.execution_rejection_agreed = false;
         let mut pass = runtime
             .executor
             .begin(input, state, pass_kind, context)
@@ -2633,6 +2734,27 @@ where
                             }
                             _ => None,
                         };
+                        let execution_agreement = runtime.commit_agreement.agree_phase(
+                            &runtime.communication,
+                            phase_agreement_group.expect("selected execution agreement group"),
+                            DistributedExecutionPhase::Execution,
+                            local_error.is_none(),
+                            runtime.communication_executor.borrow(),
+                        );
+                        // A completed vote proves all ranks reached this boundary
+                        // before any boundary payload was prepared or submitted.
+                        runtime.execution_rejection_agreed |=
+                            matches!(execution_agreement, Ok(false));
+                        if let Some(error) = local_error.take() {
+                            return Err(map_partition_route_error(error));
+                        }
+                        if !execution_agreement.map_err(ReplicatedTextSessionError::Partition)? {
+                            return Err(ReplicatedTextSessionError::Partition(
+                                PartitionExecutionError::RemotePhaseFailure(
+                                    DistributedExecutionPhase::Execution,
+                                ),
+                            ));
+                        }
                         let mut prepared_wave = Vec::with_capacity(wave.len());
                         for index in wave.iter().copied() {
                             let route = &same_group_routes[index];
@@ -2746,7 +2868,7 @@ where
                                     runtime.communication_executor.borrow(),
                                 )
                                 .map_err(|error| {
-                                    ReplicatedTextSessionError::Contract(error.to_string())
+                                    ReplicatedTextSessionError::Partition(error)
                                 })?;
                             if !ready && remote_failure.is_none() {
                                 remote_failure = Some(route.route);
@@ -2831,6 +2953,30 @@ where
                             )
                         })
                     };
+
+                if V::PHASE_FAILURE_AGREEMENT {
+                    let execution_agreement = runtime.commit_agreement.agree_phase(
+                        &runtime.communication,
+                        phase_agreement_group.expect("selected execution agreement group"),
+                        DistributedExecutionPhase::Execution,
+                        local_execution.as_ref().is_none_or(Result::is_ok),
+                        runtime.communication_executor.borrow(),
+                    );
+                    runtime.execution_rejection_agreed |= matches!(execution_agreement, Ok(false));
+                    if local_execution.as_ref().is_some_and(Result::is_err) {
+                        let Some(Err(error)) = local_execution.take() else {
+                            unreachable!("local execution failure was checked")
+                        };
+                        return Err(ReplicatedTextSessionError::Architecture(error));
+                    }
+                    if !execution_agreement.map_err(ReplicatedTextSessionError::Partition)? {
+                        return Err(ReplicatedTextSessionError::Partition(
+                            PartitionExecutionError::RemotePhaseFailure(
+                                DistributedExecutionPhase::Execution,
+                            ),
+                        ));
+                    }
+                }
 
                 let outgoing_routes = runtime
                     .plan
@@ -2957,7 +3103,7 @@ where
                                 runtime.communication_executor.borrow(),
                             )
                             .map_err(|error| {
-                                ReplicatedTextSessionError::Contract(error.to_string())
+                                ReplicatedTextSessionError::Partition(error)
                             })?;
                         if let Some(error) = local_error {
                             runtime.communication.authority.fence_protocol_failure(
@@ -2994,7 +3140,7 @@ where
                                 runtime.communication_executor.borrow(),
                             )
                             .map_err(|error| {
-                                ReplicatedTextSessionError::Contract(error.to_string())
+                                ReplicatedTextSessionError::Partition(error)
                             })?;
                         if !ready {
                             return Err(ReplicatedTextSessionError::Contract(
@@ -3096,6 +3242,11 @@ where
                 ));
             }
             if rank != publication.owner_rank {
+                if local_output {
+                    observer
+                        .observe_replica(eredu_core::MODEL_LOGITS_OBSERVATION_PATH, output)
+                        .map_err(ReplicatedTextSessionError::Architecture)?;
+                }
                 return Ok(output.clone());
             }
         }
@@ -3121,7 +3272,7 @@ where
                     DistributedExecutionPhase::OutputPublication,
                     runtime.communication_executor.borrow(),
                 )
-                .map_err(|error| ReplicatedTextSessionError::Contract(error.to_string())),
+                .map_err(ReplicatedTextSessionError::Partition),
             None => Ok(output),
         }
     }
@@ -3158,7 +3309,7 @@ where
                     DistributedExecutionPhase::PredictionTargetCapture,
                     runtime.communication_executor.borrow(),
                 )
-                .map_err(|error| ReplicatedTextSessionError::Contract(error.to_string())),
+                .map_err(ReplicatedTextSessionError::Partition),
             None => Ok(capture),
         }
     }
@@ -3207,6 +3358,7 @@ where
         let cross_stage_failure = phase == DistributedExecutionPhase::Execution
             && runtime.executor.has_cross_stage_collective_waves();
         let needs_recovery_agreement = cross_stage_failure
+            && !runtime.execution_rejection_agreed
             && (!local_success || runtime.communication.authority.is_poisoned());
         let agreed = if needs_recovery_agreement {
             match runtime.plan.commit_barrier {
@@ -3222,8 +3374,8 @@ where
         } else {
             runtime.agree_phase(phase, local_success)
         }
-        .map_err(|error| ReplicatedTextSessionError::Contract(error.to_string()))?;
-        if cross_stage_failure && !agreed {
+        .map_err(ReplicatedTextSessionError::Partition)?;
+        if cross_stage_failure && !agreed && !runtime.execution_rejection_agreed {
             let _ = runtime.communication.authority.submission_error(
                 "routed pipeline collective wave failed on at least one rank",
                 CommunicationOperation::AllGatherEven,
@@ -3254,7 +3406,7 @@ fn map_partition_route_error<E: std::fmt::Display, P: std::fmt::Display>(
             ReplicatedTextSessionError::Architecture(error)
         }
         PartitionRouteTransferError::Contract(error) => {
-            ReplicatedTextSessionError::Contract(error.to_string())
+            ReplicatedTextSessionError::Partition(error)
         }
     }
 }
@@ -3603,6 +3755,8 @@ pub enum PartitionExecutionError {
         phase: DistributedExecutionPhase,
         route: Option<CommunicationRouteId>,
         error: String,
+        #[source]
+        source: Option<eredu_core::BackendFailure>,
     },
     /// Native submission failed after entering one communication operation.
     #[error(
@@ -3613,6 +3767,8 @@ pub enum PartitionExecutionError {
         phase: DistributedExecutionPhase,
         route: Option<CommunicationRouteId>,
         error: String,
+        #[source]
+        source: Option<eredu_core::BackendFailure>,
     },
     /// A prior timed-out or failed operation left this communicator unsafe for reuse.
     #[error(
@@ -3628,7 +3784,9 @@ pub enum PartitionExecutionError {
     #[error("recovery agreement was requested without a prior failure during {phase:?}")]
     RecoveryAgreementWithoutFailure { phase: DistributedExecutionPhase },
     /// Native resources were not paired one-for-one with manifest descriptors.
-    #[error("communication resource count mismatch (groups {actual_groups}/{expected_groups}, routes {actual_routes}/{expected_routes})")]
+    #[error(
+        "communication resource count mismatch (groups {actual_groups}/{expected_groups}, routes {actual_routes}/{expected_routes})"
+    )]
     ResourceCount {
         expected_groups: usize,
         actual_groups: usize,

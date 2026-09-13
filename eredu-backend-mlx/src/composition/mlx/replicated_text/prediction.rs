@@ -1,4 +1,8 @@
 use super::*;
+use eredu_checkpoint::store::SharedCheckpointSource;
+
+pub(super) mod parameters;
+pub(super) use parameters::MlxPredictionModule;
 
 #[cfg(test)]
 pub(super) type StatePresenceSnapshot = Vec<(i32, Vec<(eredu_core::cache::StateTensorRole, bool)>)>;
@@ -26,6 +30,11 @@ pub(super) type CheckpointRestoreProbe = (
 );
 
 pub(super) trait MlxParameterBankTelemetry {
+    fn parameter_banks(
+        &self,
+    ) -> std::collections::BTreeMap<eredu_runtime::RoutedBankId, MlxSharedAddressableBank> {
+        Default::default()
+    }
     fn parameter_bank_report(
         &self,
     ) -> Result<
@@ -83,6 +92,15 @@ pub(super) type MlxAddressableBanks = eredu_runtime::RoutedBankProviders<
 impl MlxParameterBankTelemetry
     for eredu_runtime::RoutedReplicatedTextExecution<MlxAddressableBanks>
 {
+    fn parameter_banks(
+        &self,
+    ) -> std::collections::BTreeMap<eredu_runtime::RoutedBankId, MlxSharedAddressableBank> {
+        self.provider()
+            .banks()
+            .iter()
+            .map(|(id, provider)| (*id, provider.bank_storage().clone()))
+            .collect()
+    }
     fn parameter_bank_report(
         &self,
     ) -> Result<
@@ -272,6 +290,19 @@ impl ExactPredictionCaptureObserver {
 impl eredu_runtime::ActivationObserver<MlxTensor, eredu_nn::Error>
     for ExactPredictionCaptureObserver
 {
+    fn observe_generated(
+        &mut self,
+        path: &str,
+        _: &MlxTensor,
+        _: &eredu_core::capture::GeneratedCaptureSource,
+        generate: &mut dyn FnMut() -> Result<MlxTensor, eredu_nn::Error>,
+    ) -> Result<(), eredu_nn::Error> {
+        if self.paths.iter().any(|expected| expected == path) {
+            self.observe(path, &generate()?)?;
+        }
+        Ok(())
+    }
+
     fn observe(&mut self, path: &str, value: &MlxTensor) -> Result<(), eredu_nn::Error> {
         if let Some(index) = self.paths.iter().position(|expected| expected == path) {
             if self.values.borrow_mut()[index]
@@ -337,46 +368,87 @@ pub(crate) type MaterializedEmbeddedPrediction =
 pub(super) fn materialize_prepared_prediction_unit<M>(
     prepared: eredu_architectures::prediction_extension::PreparedPredictionUnit<M>,
     layout: Option<&eredu_runtime::LocalModelLayout>,
-    store: &dyn CheckpointSource,
+    store: SharedCheckpointSource,
     stream: &Stream,
-    weights_stream: &Stream,
-) -> Result<crate::backend::nn::shared::MlxModule<M>, Error>
+    _weights_stream: &Stream,
+) -> Result<MlxPredictionModule<M>, Error>
 where
     M: Parameterized<MlxTensor>,
 {
-    use crate::backend::runtime::checkpoint::binding::{
-        build_mlx_exact_replicated_text_bindings, materialize_module_bindings,
-        populate_module_from_arrays_excluding,
-    };
+    use crate::backend::runtime::checkpoint::binding::build_mlx_exact_replicated_text_bindings;
 
-    let (source, mut local, selected_tasks) = prepared.into_parts();
+    let residency = prepared.residency();
+    let shared =
+        prepared.role() == eredu_architectures::prediction_extension::PredictionModuleRole::Shared;
+    let source_layout = prepared.source_layout().cloned();
+    let (source, local, selected_tasks) = prepared.into_parts();
+    let mut store = store;
+    let mut materialization = eredu_runtime::WeightMaterializationReport::default();
+    for group in eredu_runtime::group_replicated_text_transform_tasks(&selected_tasks)
+        .map_err(|error| Error::Quantization(error.to_string()))?
+    {
+        let tasks = group
+            .tasks(&selected_tasks)
+            .map_err(|error| Error::Quantization(error.to_string()))?;
+        let (transformed, report) = quantize_exact_replicated_text_tasks(
+            store,
+            &source,
+            &local,
+            &[] as &[M],
+            &[],
+            source_layout.as_deref(),
+            group.quantization(),
+            &tasks,
+            stream,
+        )?;
+        store = transformed;
+        materialization.merge(report);
+    }
     let task_refs = selected_tasks.iter().collect::<Vec<_>>();
     let bindings = build_mlx_exact_replicated_text_bindings(
-        &source,
-        store,
+        &local,
+        store.as_ref(),
         &task_refs,
         &std::collections::BTreeSet::new(),
-        None,
+        layout,
     )?;
-    let bindings = match layout {
-        Some(layout) => shard_unmaterialized_bindings(
-            bindings,
-            store,
-            layout,
-            &std::collections::BTreeSet::new(),
-        )?,
-        None => bindings,
-    };
-    let arrays = materialize_module_bindings(store, &bindings, weights_stream, stream)?;
-    populate_module_from_arrays_excluding(&mut local, &arrays, |_| false)?;
-    Ok(crate::backend::nn::shared::MlxModule::new(local))
+    let mut parameters = Vec::new();
+    let mut declarations = Vec::new();
+    super::session::prepared_parameters::collect_module(
+        &local,
+        &bindings,
+        eredu_runtime::parameter_operations::PreparedParameterLocation::Prediction { module: 0 },
+        store.as_ref(),
+        &mut parameters,
+        &mut declarations,
+    )?;
+    if parameters.len() != declarations.len() {
+        return Err(Error::ArchitectureModel(
+            "prediction parameters lack exact prepared binding owners".into(),
+        ));
+    }
+    Ok(MlxPredictionModule {
+        placeholders: parameters::placeholders(&local),
+        replacements: BTreeMap::new(),
+        source: store,
+        bindings,
+        residency,
+        shared,
+        manager: Arc::new(std::sync::OnceLock::new()),
+        id: None,
+        stream: stream.clone(),
+        inner: local,
+        parameters,
+        tasks: selected_tasks,
+        materialization,
+    })
 }
 
 pub(crate) fn materialize_prediction_extension(
     prepared: eredu_architectures::prediction_extension::PreparedPredictionExtension<
         MlxNeuralBackend,
     >,
-    store: &dyn CheckpointSource,
+    store: SharedCheckpointSource,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<MaterializedEmbeddedPrediction, Error> {
@@ -389,7 +461,7 @@ pub(crate) fn materialize_prediction_extension(
 }
 
 pub(crate) struct MlxPredictionMaterializationContext<'a> {
-    store: &'a dyn CheckpointSource,
+    store: SharedCheckpointSource,
     stream: &'a Stream,
     weights_stream: &'a Stream,
 }
@@ -398,11 +470,27 @@ impl eredu_architectures::prediction_extension::PredictionExtensionMaterializer<
     for MlxEmbeddedPredictionMaterializer
 {
     type Error = Error;
-    type Module<M> = crate::backend::nn::shared::MlxModule<M>;
+    type Module<M> = MlxPredictionModule<M>;
     type PoolingState = crate::backend::runtime::cache::state::MlxPoolingAttentionCache;
     type SequentialState = crate::backend::runtime::cache::kv::CompressedLatentCache;
     type ModelState = MlxHybridState;
     type Context<'a> = MlxPredictionMaterializationContext<'a>;
+
+    fn complete_prediction_values<'a>(
+        values: impl IntoIterator<Item = &'a MlxTensor>,
+        _context: &Stream,
+    ) -> Result<(), eredu_core::BackendFailure> {
+        let token_validations = active_token_validation_arrays();
+        async_eval_with_event(
+            values
+                .into_iter()
+                .map(|value| value.as_array())
+                .chain(token_validations.iter()),
+        )
+        .and_then(|completion| completion.synchronize())
+        .and_then(|()| validate_active_token_validations())
+        .map_err(eredu_core::BackendFailure::from_error)
+    }
 
     fn materialize_module<M>(
         context: &mut Self::Context<'_>,
@@ -415,10 +503,36 @@ impl eredu_architectures::prediction_extension::PredictionExtensionMaterializer<
         materialize_prepared_prediction_unit(
             prepared,
             layout,
-            context.store,
+            Arc::clone(&context.store),
             context.stream,
             context.weights_stream,
         )
+    }
+
+    fn invoke_module<U, O>(
+        module: &mut Self::Module<U>,
+        context: &Stream,
+        operation: impl FnOnce(
+            &mut U,
+        )
+            -> eredu_architectures::prediction_extension::PredictionInvocation<
+            MlxTensor,
+            O,
+        >,
+    ) -> Result<O, eredu_nn::Error>
+    where
+        U: Parameterized<MlxTensor>,
+    {
+        module
+            .invoke(context, |inner| {
+                let invocation = operation(inner);
+                let roots = invocation.retained_values().cloned().collect();
+                (invocation.into_outcome().map_err(Error::from), roots)
+            })
+            .map_err(|error| match error {
+                Error::Neural(error) => error,
+                error => eredu_nn::Error::backend_source(error),
+            })
     }
 
     fn pooling_state(
@@ -438,6 +552,86 @@ impl eredu_architectures::prediction_extension::PredictionExtensionMaterializer<
 
     fn sequential_state() -> Self::SequentialState {
         Self::SequentialState::new()
+    }
+
+    fn pooling_snapshot_estimate(
+        state: &Self::PoolingState,
+    ) -> Option<eredu_core::execution_control::SnapshotEstimate> {
+        let mut estimate = super::super::speculative::state_snapshot::estimate_state::<
+            Self::PoolingState,
+        >(state.retained_arrays())?;
+        let auxiliary = state
+            .residency_manager()
+            .map(|manager| manager.isolated_snapshot_bytes())
+            .unwrap_or(Some(0))?;
+        estimate.retained_bytes = estimate.retained_bytes.checked_add(auxiliary)?;
+        estimate.copy_bytes = estimate.copy_bytes.checked_add(auxiliary)?;
+        Some(estimate)
+    }
+
+    fn pooling_snapshot(
+        state: &Self::PoolingState,
+        stream: &Stream,
+    ) -> Result<Option<Self::PoolingState>, eredu_core::BackendFailure> {
+        let copy = (|| {
+            super::super::speculative::state_snapshot::settle(state.retained_arrays())?;
+            let copy = state.isolated_snapshot(stream)?;
+            super::super::speculative::state_snapshot::settle(copy.retained_arrays())?;
+            Ok::<_, Exception>(copy)
+        })()
+        .map_err(eredu_core::BackendFailure::from_error)?;
+        Ok(Some(copy))
+    }
+
+    fn sequential_snapshot_estimate(
+        state: &Self::SequentialState,
+    ) -> Option<eredu_core::execution_control::SnapshotEstimate> {
+        if state.is_paged() {
+            return None;
+        }
+        super::super::speculative::state_snapshot::estimate_state::<Self::SequentialState>(
+            state.retained_arrays(),
+        )
+    }
+
+    fn sequential_snapshot(
+        state: &Self::SequentialState,
+        stream: &Stream,
+    ) -> Result<Option<Self::SequentialState>, eredu_core::BackendFailure> {
+        if state.is_paged() {
+            return Ok(None);
+        }
+        let copy = (|| {
+            super::super::speculative::state_snapshot::settle(state.retained_arrays())?;
+            let copy = state.isolated_snapshot(stream)?;
+            super::super::speculative::state_snapshot::settle(copy.retained_arrays())?;
+            Ok::<_, Exception>(copy)
+        })()
+        .map_err(eredu_core::BackendFailure::from_error)?;
+        Ok(Some(copy))
+    }
+
+    fn model_snapshot_estimate(
+        state: &Self::ModelState,
+    ) -> Option<eredu_core::execution_control::SnapshotEstimate> {
+        state.isolated_snapshot_estimate()
+    }
+
+    fn model_snapshot(
+        state: &Self::ModelState,
+        stream: &Stream,
+    ) -> Result<Option<Self::ModelState>, eredu_core::BackendFailure> {
+        if !state.supports_isolated_snapshot() {
+            return Ok(None);
+        }
+        let copy = (|| {
+            super::super::speculative::state_snapshot::settle(state.retained_arrays())?;
+            let copy = state.isolated_snapshot(stream)?;
+            super::super::speculative::state_snapshot::settle(copy.retained_arrays())?;
+            Ok::<_, Exception>(copy)
+        })()
+        .map_err(eredu_core::BackendFailure::from_error)?;
+        Ok(Some(copy))
     }
 }
 
@@ -478,6 +672,33 @@ where
     ) -> Option<Result<eredu_core::SpeculativeGenerationBatchOutput, Error>>;
 
     fn present() -> bool;
+    fn publish_parameter_replacements(
+        &mut self,
+        _values: &BTreeMap<String, MlxTensor>,
+        _active: bool,
+    ) {
+    }
+    fn visit_parameter_slots(
+        &mut self,
+        _visitor: &mut dyn eredu_nn::ParameterSlotVisitor<MlxTensor>,
+    ) {
+    }
+    fn with_parameter_slots(
+        &mut self,
+        _module: usize,
+        _operation: &mut eredu_runtime::parameter_operations::ParameterSlotOperation<
+            '_,
+            MlxTensor,
+            Error,
+        >,
+    ) -> Result<bool, Error> {
+        Ok(false)
+    }
+    fn activation_execution(
+        &self,
+    ) -> Option<eredu_architectures::speculative_execution::SpeculativeActivationExecution> {
+        None
+    }
 }
 
 impl<A, S, D> ReplicatedPredictionCapability<A, S, D> for NoSelectedPrediction
@@ -530,6 +751,93 @@ pub(crate) trait ErasedExternalPredictionExecutable: 'static {
 
 /// Backend-private erased operations for a paired architecture and mutable state.
 pub(crate) trait ErasedReplicatedTextExecutable {
+    fn prepared_input_plans(
+        &self,
+        input: input::ModelInput<'_>,
+    ) -> Result<
+        Vec<eredu_architectures::media_plan::PreparedInputPartPlan>,
+        eredu_core::CapabilityError,
+    > {
+        input
+            .parts
+            .iter()
+            .map(|part| {
+                eredu_architectures::media_plan::text_only_input_part(
+                    self.effective_model_type(),
+                    part,
+                    &input::MlxInputInspector,
+                )
+            })
+            .collect()
+    }
+
+    fn partition_observation_hooks(
+        &self,
+    ) -> Option<eredu_runtime::inspection::ObservationHookSupport> {
+        None
+    }
+
+    fn partition_parameter_description(
+        &self,
+    ) -> Option<&std::sync::Arc<eredu_runtime::ArchitectureParameterDescription>> {
+        None
+    }
+
+    fn visit_loaded_parameters(
+        &mut self,
+        _visitor: &mut dyn eredu_nn::ParameterSlotVisitor<MlxTensor>,
+    ) -> bool {
+        false
+    }
+    fn parameter_materialization_tasks(
+        &self,
+    ) -> &[eredu_runtime::ReplicatedTextMaterializationTask] {
+        &[]
+    }
+    fn prepared_parameter_slots(
+        &self,
+    ) -> &[eredu_runtime::parameter_operations::PreparedParameterSlot] {
+        &[]
+    }
+    fn with_parameter_slots(
+        &mut self,
+        _location: &eredu_runtime::parameter_operations::PreparedParameterLocation,
+        _selected: &std::collections::BTreeSet<String>,
+        _operation: &mut eredu_runtime::parameter_operations::ParameterSlotOperation<
+            '_,
+            MlxTensor,
+            Error,
+        >,
+        _stream: &Stream,
+    ) -> Result<bool, Error> {
+        Ok(false)
+    }
+    fn publish_parameter_replacements(
+        &mut self,
+        _values: &std::collections::BTreeMap<String, MlxTensor>,
+        _active: bool,
+    ) -> Result<bool, Error> {
+        Ok(false)
+    }
+    fn invalidate_parameter_snapshots(&mut self) {}
+    fn estimate_parameter_reset_state(
+        &self,
+    ) -> Option<eredu_core::execution_control::SnapshotEstimate> {
+        None
+    }
+    fn prepare_parameter_reset_state(&mut self) -> Result<Box<dyn std::any::Any>, Error> {
+        Err(Error::ArchitectureModel(
+            "parameter state reset is unavailable".into(),
+        ))
+    }
+    fn exchange_parameter_reset_state(
+        &mut self,
+        _slot: &mut dyn std::any::Any,
+    ) -> Result<(), Error> {
+        Err(Error::ArchitectureModel(
+            "parameter state exchange is unavailable".into(),
+        ))
+    }
     fn prepare_autoregressive_cache(&mut self) -> Result<MlxPredictionTargetState, Error> {
         Err(Error::Speculative(
             "ordinary prediction state is unavailable".into(),
@@ -639,11 +947,26 @@ pub(crate) trait ErasedReplicatedTextExecutable {
     fn has_embedded_prediction(&self) -> bool {
         false
     }
+    fn speculative_activation_execution(
+        &self,
+    ) -> Option<eredu_architectures::speculative_execution::SpeculativeActivationExecution> {
+        None
+    }
     fn install_embedded_prediction_observers(
         &mut self,
         _observers: MlxEmbeddedPredictionObservers,
     ) -> bool {
         false
+    }
+    fn take_speculative_activation_capture(
+        &mut self,
+    ) -> Option<eredu_core::speculative::SpeculativeActivationCapture> {
+        None
+    }
+    fn take_speculative_activation_error(
+        &mut self,
+    ) -> Option<eredu_core::speculative::SpeculativeControlError> {
+        None
     }
     fn external_prediction_mut(
         &mut self,
@@ -705,28 +1028,50 @@ pub(crate) trait ErasedReplicatedTextExecutable {
         input_identity: &eredu_runtime::PreparedInputCacheIdentity,
     ) -> Result<Option<PromptCacheManifest>, Error>;
     fn cache_residency_report(&self) -> Result<Option<CacheResidencyReport>, Exception>;
-    fn prefill(&mut self, input: input::ModelInput<'_>, stream: &Stream) -> Result<Array, Error>;
-    fn decode(&mut self, tokens: &Array, stream: &Stream) -> Result<Array, Error>;
+    fn prefill(&mut self, input: input::ModelInput<'_>, stream: &Stream) -> Result<Array, Error> {
+        self.prefill_result_with_observer(
+            Ok(input),
+            None,
+            None,
+            stream,
+            &mut eredu_runtime::NoopObserver,
+        )
+    }
+    #[cfg(test)]
+    fn decode(&mut self, tokens: &Array, stream: &Stream) -> Result<Array, Error> {
+        self.decode_result_with_observer(Ok(tokens), stream, &mut eredu_runtime::NoopObserver)
+    }
     #[cfg(test)]
     fn forward_with_observer(
         &mut self,
         tokens: &Array,
         mask: Option<&Array>,
         stream: &Stream,
-        observer: &mut dyn eredu_runtime::ActivationObserver<Array, Exception>,
+        observer: &mut dyn eredu_runtime::ActivationObserver<Array, Error>,
     ) -> Result<Array, Error>;
+    #[cfg(test)]
     fn prefill_with_observer(
         &mut self,
         input: input::ModelInput<'_>,
         mask: Option<&Array>,
         stream: &Stream,
-        observer: &mut dyn eredu_runtime::ActivationObserver<Array, Exception>,
-    ) -> Result<Array, Error>;
-    fn decode_with_observer(
+        observer: &mut dyn eredu_runtime::ActivationObserver<Array, Error>,
+    ) -> Result<Array, Error> {
+        self.prefill_result_with_observer(Ok(input), mask, None, stream, observer)
+    }
+    fn prefill_result_with_observer(
         &mut self,
-        tokens: &Array,
+        input: Result<input::ModelInput<'_>, Error>,
+        mask: Option<&Array>,
+        capture_geometry: Option<eredu_core::capture::CaptureRequestShape>,
         stream: &Stream,
-        observer: &mut dyn eredu_runtime::ActivationObserver<Array, Exception>,
+        observer: &mut dyn eredu_runtime::ActivationObserver<Array, Error>,
+    ) -> Result<Array, Error>;
+    fn decode_result_with_observer(
+        &mut self,
+        tokens: Result<&Array, Error>,
+        stream: &Stream,
+        observer: &mut dyn eredu_runtime::ActivationObserver<Array, Error>,
     ) -> Result<Array, Error>;
 }
 
@@ -770,4 +1115,68 @@ pub(crate) fn prepared_composite_input(
     let inspector = input::MlxTensorInputInspector;
     eredu_runtime::PreparedModelInput::new(parts, |tensor| inspector.identity(tensor))
         .map_err(|error| Error::ArchitectureModel(error.to_string()))
+}
+
+#[cfg(test)]
+mod completion_tests {
+    use super::*;
+    use crate::backend::{
+        nn::tensor::{validate_token_domain, TokenValidationScope},
+        ExecutionContext,
+    };
+    use eredu_architectures::prediction_extension::PredictionExtensionMaterializer;
+    use safemlx::{Device, DeviceType};
+    use std::error::Error as _;
+
+    fn prove(device: DeviceType) {
+        let execution = ExecutionContext::new(Device::new(device, 0));
+        let stream = execution.stream();
+        for token in [2, 4] {
+            let scope = TokenValidationScope::begin().unwrap();
+            let tokens = Array::from_slice(&[token], &[1]);
+            let _validated = validate_token_domain(&tokens, 4, None, stream)
+                .expect("deferred token checks must not fail during graph construction");
+            // The assertion is independent of the retained tensor. Completion must
+            // settle both without relying on an output's dependency graph.
+            let retained = MlxTensor::from_array(
+                Array::from_slice(&[2.0_f32, -3.0], &[2])
+                    .multiply(Array::from_f32(3.0), stream)
+                    .unwrap(),
+            );
+            let result =
+                MlxEmbeddedPredictionMaterializer::complete_prediction_values([&retained], stream);
+            assert_eq!(
+                retained
+                    .as_array()
+                    .evaluated()
+                    .unwrap()
+                    .try_as_slice::<f32>()
+                    .unwrap(),
+                &[6.0, -9.0]
+            );
+            if token == 2 {
+                result.unwrap();
+            } else {
+                let failure = result.unwrap_err();
+                let source = failure
+                    .source()
+                    .unwrap()
+                    .downcast_ref::<Exception>()
+                    .expect("native exception must remain the error source");
+                assert!(source.to_string().contains("token ID is outside 0..4"));
+            }
+            drop(scope);
+        }
+    }
+
+    #[test]
+    fn prediction_completion_retains_dependencies_and_errors_cpu() {
+        prove(DeviceType::Cpu);
+    }
+    #[cfg(feature = "metal")]
+    #[test]
+    #[ignore = "requires a local MLX Metal device"]
+    fn prediction_completion_retains_dependencies_and_errors_metal() {
+        prove(DeviceType::Gpu);
+    }
 }

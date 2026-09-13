@@ -54,16 +54,41 @@ pub(crate) fn detached<T>(
     roots: Vec<safemlx::Array>,
     operation: impl FnOnce() -> Result<T, crate::backend::error::Error>,
 ) -> Result<T, crate::backend::error::Error> {
-    let mut recovery = Recovery::begin(roots)?;
+    detached_preparation(roots, operation, |error| error)
+}
+
+/// Preserves caller-owned text/media errors alongside detached native recovery.
+pub(crate) fn detached_preparation<T, E>(
+    roots: Vec<safemlx::Array>,
+    operation: impl FnOnce() -> Result<T, E>,
+    map_backend: impl FnOnce(crate::backend::error::Error) -> E,
+) -> Result<T, E> {
+    let recovery = match Recovery::begin(roots) {
+        Ok(recovery) => recovery,
+        Err(error) => return Err(map_backend(error.into())),
+    };
+    detached_with_recovery(recovery, operation, map_backend)
+}
+
+fn detached_with_recovery<T, E, R: Retention, P: Probe>(
+    mut recovery: Recovery<R, P>,
+    operation: impl FnOnce() -> Result<T, E>,
+    map_backend: impl FnOnce(crate::backend::error::Error) -> E,
+) -> Result<T, E> {
     let result = operation();
     recovery.seal();
     let status = recovery.progress();
+    // The scope still retains unresolved work, but an existing operation error
+    // carries the precise native or policy cause and must survive that status.
+    let output = result?;
     if status.failed || status.blocked {
-        return Err(crate::backend::error::Error::ArchitectureModel(
-            "native input/token work failed or is unobservable".into(),
+        return Err(map_backend(
+            crate::backend::error::Error::ArchitectureModel(
+                "native input/token work failed or is unobservable".into(),
+            ),
         ));
     }
-    result
+    Ok(output)
 }
 
 trait Pending {
@@ -347,6 +372,64 @@ mod tests {
         let status = recovery.finish();
         assert!(status.settled && !status.failed && !status.blocked);
         assert_eq!(drops.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn detached_preparation_preserves_caller_error_without_native_error_mapping() {
+        #[derive(Debug, PartialEq)]
+        struct CallerError(&'static str);
+        let drops = Arc::new(AtomicUsize::new(0));
+        let recovery = Recovery::with_probe(CountDrop(Arc::clone(&drops)), Terminal);
+        let result = detached_with_recovery::<(), _, _, _>(
+            recovery,
+            || Err(CallerError("tokenizer failed")),
+            |_| panic!("local caller failure must not be replaced"),
+        );
+        assert_eq!(result, Err(CallerError("tokenizer failed")));
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn detached_failure_preserves_native_cause_and_pending_ownership() {
+        use std::cell::Cell;
+        struct Pending(Rc<Cell<Status>>);
+        impl Probe for Pending {
+            fn seal(&mut self) {}
+            fn progress(&self) -> Status {
+                self.0.get()
+            }
+        }
+        for blocked in [false, true] {
+            let status = Rc::new(Cell::new(Status {
+                settled: false,
+                failed: !blocked,
+                blocked,
+            }));
+            let drops = Arc::new(AtomicUsize::new(0));
+            let recovery =
+                Recovery::with_probe(CountDrop(Arc::clone(&drops)), Pending(Rc::clone(&status)));
+            let result = detached_with_recovery::<(), _, _, _>(
+                recovery,
+                || Err(Exception::custom("precise detached operation cause").into()),
+                |error| error,
+            );
+            let crate::backend::error::Error::Exception(cause) = result.unwrap_err() else {
+                panic!("the original native exception must remain available");
+            };
+            assert_eq!(cause.what(), "precise detached operation cause");
+            assert_eq!(
+                drops.load(Ordering::SeqCst),
+                0,
+                "an operation error is not completion"
+            );
+            status.set(Status {
+                settled: true,
+                failed: true,
+                blocked: false,
+            });
+            await_retirement(&drops);
+            assert_eq!(drops.load(Ordering::SeqCst), 1);
+        }
     }
 
     #[test]

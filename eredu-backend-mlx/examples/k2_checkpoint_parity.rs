@@ -32,7 +32,7 @@ struct Capture {
 impl Capture {
     fn routes(
         &mut self,
-        request: &RoutedExpertRequest<'_, MlxTensor>,
+        request: &RoutedExpertRequest<'_, '_, MlxTensor>,
         stream: &Stream,
     ) -> Result<(), eredu_nn::Error> {
         if self.output.is_none() {
@@ -71,7 +71,7 @@ impl RoutedExpertProvider<MlxNeuralBackend> for Capture {
     fn forward_grouped(
         &mut self,
         bank: &mut <MlxNeuralBackend as GroupedNeuralBackend>::GatedProductGroups,
-        request: RoutedExpertRequest<'_, MlxTensor>,
+        request: RoutedExpertRequest<'_, '_, MlxTensor>,
         stream: &Stream,
     ) -> Result<MlxTensor, Self::Error> {
         self.routes(&request, stream)?;
@@ -95,7 +95,7 @@ impl RoutedExpertProvider<MlxNeuralBackend> for Capture {
     fn forward_linear_routed(
         &mut self,
         bank: &mut <MlxNeuralBackend as GroupedNeuralBackend>::LinearGroups,
-        request: RoutedExpertRequest<'_, MlxTensor>,
+        request: RoutedExpertRequest<'_, '_, MlxTensor>,
         stream: &Stream,
     ) -> Result<MlxTensor, Self::Error> {
         self.routes(&request, stream)?;
@@ -104,7 +104,7 @@ impl RoutedExpertProvider<MlxNeuralBackend> for Capture {
     fn forward_relu2_routed(
         &mut self,
         bank: &mut <MlxNeuralBackend as GroupedNeuralBackend>::Relu2Groups,
-        request: RoutedExpertRequest<'_, MlxTensor>,
+        request: RoutedExpertRequest<'_, '_, MlxTensor>,
         stream: &Stream,
     ) -> Result<MlxTensor, Self::Error> {
         self.routes(&request, stream)?;

@@ -94,6 +94,22 @@ impl CaptureBackend for Host {
     }
 }
 impl InterventionBackend for Host {
+    fn mask_components(
+        &mut self,
+        value: &Value,
+        ids: &[u32],
+        keep_selected: bool,
+    ) -> std::result::Result<Value, std::io::Error> {
+        let width = *value.shape.last().unwrap() as usize;
+        let mut result = value.clone();
+        for (index, value) in result.values.iter_mut().enumerate() {
+            if ids.contains(&((index % width) as u32)) != keep_selected {
+                *value = 0.0;
+            }
+        }
+        Ok(result)
+    }
+
     fn intervention_dtype(&self, value: &Value) -> Result<InterventionDtype> {
         Ok(value.dtype)
     }

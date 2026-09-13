@@ -95,6 +95,7 @@ pub struct PreparedModelSourceGraph {
     format: ArtifactFormat,
     architecture: ArtifactArchitecturePlan,
     prediction_extension: Option<PredictionExtensionPlan>,
+    pub(crate) prediction_placement: crate::prediction_extension::PredictionPlacementSlot,
     primary: SharedCheckpointSource,
     companions: BTreeMap<GgufCompanionRole, SharedCheckpointSource>,
     complete: SharedCheckpointSource,
@@ -108,12 +109,216 @@ pub struct PreparedModelSourceGraph {
 #[derive(Debug, Clone)]
 pub struct PreparedModelDiscovery {
     identity: DeferredArtifactIdentity,
-    catalog: eredu_core::ObservationCatalog,
+    execution_identity: String,
+    descriptor: eredu_core::ArchitectureDescriptor,
+    partition_selection: Option<crate::SelectedExecution>,
+    partition_parameters: Option<Arc<eredu_runtime::ArchitectureParameterDescription>>,
+    partition_parameter_index: Option<Arc<crate::parameter_partition::ParameterMemberIndex>>,
+    partition_hooks: Option<eredu_runtime::inspection::ObservationHookSupport>,
     support: eredu_core::ObservationSupportReport,
+    observation_context: eredu_runtime::inspection::ObservationExecutionContext,
+    intervention_points: Vec<eredu_core::intervention::InterventionPoint>,
+    prediction: Option<PreparedPredictionDiscovery>,
+}
+
+#[derive(Debug, Clone)]
+struct PreparedPredictionDiscovery {
+    placement: crate::prediction_extension::PredictionPlacementSlot,
+    descriptor: eredu_core::ArchitectureDescriptor,
     intervention_points: Vec<eredu_core::intervention::InterventionPoint>,
 }
 
 impl PreparedModelDiscovery {
+    /// Retains hook facts projected from the actual constructed executor and
+    /// architecture. Backend collectors cannot infer these from parameter shapes.
+    pub fn bind_partition_observation_hooks(
+        mut self,
+        hooks: Option<eredu_runtime::inspection::ObservationHookSupport>,
+    ) -> Result<Self, eredu_core::capture::CaptureError> {
+        match (&self.partition_selection, &self.partition_parameters, hooks) {
+            (Some(_), Some(_), Some(_)) | (None, None, None) => {}
+            _ => {
+                return Err(eredu_core::capture::CaptureError::Invalid(
+                    "partition hook facts differ from the constructed execution".into(),
+                ))
+            }
+        }
+        self.partition_hooks = hooks;
+        Ok(self)
+    }
+
+    /// Pairs retained cold discovery with the global parameter declaration that
+    /// the shared partition constructor checked before native materialization.
+    /// Backends forward this declaration from the completed session; checkpoint
+    /// metadata and locally visited native slots are not substitutes.
+    pub fn bind_partition_parameters(
+        mut self,
+        parameters: Option<Arc<eredu_runtime::ArchitectureParameterDescription>>,
+    ) -> Result<Self, eredu_core::capture::CaptureError> {
+        use eredu_core::capture::CaptureError;
+        match (&self.partition_selection, &parameters) {
+            (Some(selected), Some(parameters)) => {
+                let requirements = selected.text_realization().requirements();
+                if parameters.graph() != requirements.execution_graph()
+                    || parameters.unit_layout() != requirements.execution_units()
+                {
+                    return Err(CaptureError::Invalid(
+                        "prepared parameter topology differs from retained execution".into(),
+                    ));
+                }
+            }
+            (None, None) => {}
+            _ => {
+                return Err(CaptureError::Invalid(
+                    "prepared partition metadata and retained execution disagree".into(),
+                ));
+            }
+        }
+        self.partition_parameter_index = self
+            .partition_selection
+            .as_ref()
+            .zip(parameters.as_ref())
+            .map(|(selected, parameters)| {
+                Arc::new(crate::parameter_partition::ParameterMemberIndex::new(
+                    selected.text_realization().materialization_tasks(),
+                    parameters,
+                ))
+            });
+        self.partition_parameters = parameters;
+        Ok(self)
+    }
+
+    /// Placement retained by successful prediction materialization for these exact
+    /// prepared sources. Cold discovery has no constructed placement yet.
+    pub fn prediction_placement(
+        &self,
+    ) -> Option<&Arc<crate::prediction_extension::PreparedPredictionPlacement>> {
+        self.prediction.as_ref()?.placement.get()
+    }
+
+    /// Exact architecture execution identity, independent of rank-local shapes.
+    pub fn execution_identity(&self) -> &str {
+        &self.execution_identity
+    }
+
+    /// Global selected parameter tasks retained by the actual partition
+    /// construction. These are declarations, not evidence of loaded local slots.
+    /// Reading them neither resolves sources nor allocates native resources.
+    pub fn partition_parameter_tasks(
+        &self,
+    ) -> Option<impl Iterator<Item = &eredu_runtime::ReplicatedTextMaterializationTask> + Clone>
+    {
+        self.partition_parameters.as_ref()?;
+        let text = self.partition_selection.as_ref()?.text_realization();
+        Some(
+            text.materialization_tasks()
+                .iter()
+                .chain(text.auxiliary_materialization_tasks()),
+        )
+    }
+
+    /// Resolves one global parameter through the retained executable task,
+    /// physical placement and pipeline ownership. It never resolves sources or
+    /// accesses native values, and charges metadata before allocating it.
+    pub fn parameter_partition_layout_for_rank(
+        &self,
+        parameter: &str,
+        global_rank: usize,
+        reservation: &mut impl eredu_core::capture::CaptureReservation,
+    ) -> Result<
+        Option<crate::parameter_partition::ParameterPartitionLayout>,
+        eredu_core::parameters::ParameterError,
+    > {
+        let Some(selected) = &self.partition_selection else {
+            return Ok(None);
+        };
+        let parameters = self.partition_parameters.as_ref().ok_or_else(|| {
+            eredu_core::parameters::ParameterError::Invalid(
+                "parameter discovery has not been bound to the constructed partition".into(),
+            )
+        })?;
+        let target = selected.parameter_partition_layout_with_index(
+            parameters,
+            parameter,
+            global_rank,
+            self.partition_parameter_index.as_deref(),
+            reservation,
+        );
+        match (target, self.prediction_placement()) {
+            (Err(eredu_core::parameters::ParameterError::Missing(_)), Some(prediction)) => {
+                if selected.parallel_topology().map(|rank| rank.topology())
+                    != Some(prediction.topology().topology())
+                {
+                    return Err(eredu_core::parameters::ParameterError::Invalid(
+                        "prediction parameter placement differs from retained target topology"
+                            .into(),
+                    ));
+                }
+                crate::partitioned_execution::prediction_parameter_layout_for_rank(
+                    prediction,
+                    selected
+                        .text_realization()
+                        .auxiliary_materialization_tasks(),
+                    parameter,
+                    global_rank,
+                    reservation,
+                )
+                .map(Some)
+            }
+            (result, _) => result,
+        }
+    }
+
+    /// Compiles bounded global producer layouts from the actual retained model.
+    /// This performs no content hashing, artifact access or native work. Layouts
+    /// are declarations; they do not grant capture or communication authority.
+    pub fn component_partition_layouts(
+        &self,
+        max_ranks: usize,
+    ) -> Result<
+        Option<crate::component_partition::ComponentPartitionLayouts>,
+        crate::component_partition::ComponentPartitionError,
+    > {
+        let Some(selected) = &self.partition_selection else {
+            return Ok(None);
+        };
+        let parameters = self.partition_parameters.as_ref().ok_or_else(|| {
+            eredu_core::capture::CaptureError::Invalid(
+                "component discovery has not been bound to the constructed partition".into(),
+            )
+        })?;
+        selected.component_partition_layouts(&self.descriptor, parameters, max_ranks)
+    }
+
+    /// Combines target ownership with the actual prepared prediction modules.
+    /// Each prediction scope keeps its independent head and invocation geometry;
+    /// this projection performs no native work and grants no capture authority.
+    pub fn speculative_component_partition_layouts(
+        &self,
+        execution: &crate::speculative_execution::SpeculativeActivationExecution,
+        max_ranks: usize,
+    ) -> Result<
+        Option<crate::component_partition::ComponentPartitionLayouts>,
+        crate::component_partition::ComponentPartitionError,
+    > {
+        let Some(target) = self.component_partition_layouts(max_ranks)? else {
+            return Ok(None);
+        };
+        let prediction = self.prediction.as_ref().ok_or_else(|| {
+            eredu_core::capture::CaptureError::Unsupported(
+                "prepared sources have no selected prediction catalog".into(),
+            )
+        })?;
+        let placement = prediction.placement.get().ok_or_else(|| {
+            eredu_core::capture::CaptureError::Invalid(
+                "prediction placement has not been bound by materialization".into(),
+            )
+        })?;
+        target
+            .with_prediction(&prediction.descriptor, placement, execution)
+            .map(Some)
+    }
+
     /// Resolves the exact content identity for a caller using capture features.
     pub fn capture(
         &self,
@@ -124,9 +329,33 @@ impl PreparedModelDiscovery {
                 .resolve()
                 .map_err(|error| eredu_core::capture::CaptureError::Invalid(error.to_string()))?
                 .to_string(),
-            catalog: self.catalog.clone(),
+            catalog: self.descriptor.observations.clone(),
             support: self.support.clone(),
         })
+    }
+
+    /// Refines partition support using retained architecture placement and exact
+    /// native collector facts. Existing selection/phase/mechanism gates still
+    /// apply; a callback cannot enable a disabled instrumented execution route.
+    pub fn capture_with_partition_support(
+        &self,
+        layouts: &crate::component_partition::ComponentPartitionLayouts,
+        mut partition: impl FnMut(&eredu_core::ObservationPoint) -> eredu_core::ObservationSupportStatus,
+    ) -> Result<eredu_core::capture::CaptureDiscovery, eredu_core::capture::CaptureError> {
+        let mut discovery = self.capture()?;
+        let mut support = eredu_runtime::inspection::observation_support_with_partition(
+            &self.descriptor.observations,
+            self.observation_context,
+            |point| match layouts
+                .capture_hook_support(&point.path, self.partition_hooks.unwrap_or_default())
+            {
+                eredu_core::ObservationSupportStatus::Supported => partition(point),
+                status => status,
+            },
+        );
+        support.capture = self.support.capture.clone();
+        discovery.support = support;
+        Ok(discovery)
     }
 
     /// Combines retained semantic points with current native intervention facts.
@@ -140,6 +369,170 @@ impl PreparedModelDiscovery {
             &self.capture()?,
             mechanisms,
         ))
+    }
+
+    /// Projects invocation-scoped support from actual typed prediction hooks.
+    /// Only the declared prediction condition is discharged; media, collector,
+    /// phase and partition requirements retain their own admission gates.
+    pub fn speculative_activations(
+        &self,
+        execution: &crate::speculative_execution::SpeculativeActivationExecution,
+        mechanisms: &eredu_core::intervention::InterventionMechanisms,
+        session_identity: &str,
+        active_overlay: Option<&str>,
+    ) -> Result<
+        eredu_core::speculative::SpeculativeActivationDiscovery,
+        eredu_core::capture::CaptureError,
+    > {
+        self.speculative_activations_inner(
+            execution,
+            mechanisms,
+            session_identity,
+            active_overlay,
+            None,
+            |_| {
+                eredu_core::ObservationSupportStatus::Unverified(
+                    "partition collector is not bound".into(),
+                )
+            },
+        )
+    }
+
+    /// Refines the internal report with exact retained producer layouts and
+    /// native collector facts. Prediction hooks come from the sealed execution
+    /// contract; target hooks retain their ordinary constructed-executor gate.
+    #[allow(clippy::too_many_arguments)]
+    pub fn speculative_activations_with_partition_support(
+        &self,
+        execution: &crate::speculative_execution::SpeculativeActivationExecution,
+        mechanisms: &eredu_core::intervention::InterventionMechanisms,
+        session_identity: &str,
+        active_overlay: Option<&str>,
+        layouts: &crate::component_partition::ComponentPartitionLayouts,
+        partition: impl FnMut(&eredu_core::ObservationPoint) -> eredu_core::ObservationSupportStatus,
+    ) -> Result<
+        eredu_core::speculative::SpeculativeActivationDiscovery,
+        eredu_core::capture::CaptureError,
+    > {
+        self.speculative_activations_inner(
+            execution,
+            mechanisms,
+            session_identity,
+            active_overlay,
+            Some(layouts),
+            partition,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn speculative_activations_inner(
+        &self,
+        execution: &crate::speculative_execution::SpeculativeActivationExecution,
+        mechanisms: &eredu_core::intervention::InterventionMechanisms,
+        session_identity: &str,
+        active_overlay: Option<&str>,
+        layouts: Option<&crate::component_partition::ComponentPartitionLayouts>,
+        mut partition: impl FnMut(&eredu_core::ObservationPoint) -> eredu_core::ObservationSupportStatus,
+    ) -> Result<
+        eredu_core::speculative::SpeculativeActivationDiscovery,
+        eredu_core::capture::CaptureError,
+    > {
+        use eredu_core::{capture::CaptureError, speculative::*, ObservationRequirement};
+        if self.observation_context.partitioned && layouts.is_none() {
+            return Err(CaptureError::Unsupported(
+                "partition capture requires invocation-aware producer admission".into(),
+            ));
+        }
+        if let Some(layouts) = layouts {
+            if self
+                .partition_selection
+                .as_ref()
+                .and_then(|selected| selected.parallel_topology())
+                .map(|rank| rank.topology())
+                != Some(layouts.topology())
+            {
+                return Err(CaptureError::Invalid(
+                    "speculative layouts differ from retained execution topology".into(),
+                ));
+            }
+        }
+        let prediction = self.prediction.as_ref().ok_or_else(|| {
+            CaptureError::Unsupported("prepared sources have no selected prediction catalog".into())
+        })?;
+        let mut captures = self.capture()?;
+        captures.catalog = prediction.descriptor.observations.clone();
+        let mut bindings = std::collections::BTreeMap::new();
+        for point in &mut captures.catalog.points {
+            let scope = crate::speculative_execution::speculative_capture_scope(
+                &prediction.descriptor,
+                &point.node_id,
+            )?;
+            execution.validate_scope(scope)?;
+            if scope != SpeculativeCaptureScope::Target {
+                point
+                    .requirements
+                    .retain(|r| *r != ObservationRequirement::PredictionExecution);
+            }
+            bindings.insert(point.node_id.clone(), scope);
+        }
+        let mut context = self.observation_context;
+        context.prediction_inspection = true;
+        captures.support = eredu_runtime::inspection::observation_support_with_partition(
+            &captures.catalog,
+            context,
+            |point| {
+                use eredu_core::ObservationSupportStatus as Status;
+                let Some(layouts) = layouts else {
+                    return Status::Unverified("partition layout is absent".into());
+                };
+                let hooks = match bindings.get(&point.node_id) {
+                    Some(SpeculativeCaptureScope::Target) => layouts.capture_hook_support(
+                        &point.path,
+                        self.partition_hooks.unwrap_or_default(),
+                    ),
+                    Some(
+                        SpeculativeCaptureScope::Prediction { .. }
+                        | SpeculativeCaptureScope::PredictionContext
+                        | SpeculativeCaptureScope::FusedProposal,
+                    ) if layouts.observation_site(&point.path).is_some() => Status::Supported,
+                    _ => Status::Unverified(
+                        "selected prediction has no producer declaration for this point".into(),
+                    ),
+                };
+                match hooks {
+                    Status::Supported => partition(point),
+                    status => status,
+                }
+            },
+        );
+        captures.support.capture = self.support.capture.clone();
+        // Keep the semantic declaration; only this report discharges its
+        // prediction requirement for the scoped execution.
+        captures.catalog = prediction.descriptor.observations.clone();
+        let mut interventions = eredu_runtime::inspection::intervention_support(
+            prediction.intervention_points.clone(),
+            &captures,
+            mechanisms,
+        );
+        for point in &interventions.points {
+            let scope = crate::speculative_execution::speculative_capture_scope(
+                &prediction.descriptor,
+                &point.node_id,
+            )?;
+            bindings.insert(point.node_id.clone(), scope);
+        }
+        interventions.session_identity = Some(session_identity.to_owned());
+        Ok(SpeculativeActivationDiscovery {
+            schema_version: SPECULATIVE_ACTIVATION_SCHEMA_VERSION,
+            execution_identity: serde_json::to_string(&(self.execution_identity(), active_overlay))
+                .map_err(|error| CaptureError::Invalid(error.to_string()))?,
+            captures,
+            interventions,
+            bindings: bindings
+                .into_iter()
+                .map(|(node_id, scope)| SpeculativeCaptureBinding { node_id, scope })
+                .collect(),
+        })
     }
 
     /// Whether exact content identity has been requested for this source graph.
@@ -174,25 +567,45 @@ impl PreparedModelSources {
         mechanisms: eredu_core::ObservationMechanisms,
         capture: eredu_core::capture::CaptureCapabilities,
     ) -> PreparedModelDiscovery {
-        let catalog = self.architecture().architecture_descriptor().observations;
+        let descriptor = self.architecture().architecture_descriptor();
+        let observation_context = eredu_runtime::inspection::ObservationExecutionContext {
+            activation_inspection: self
+                .selected()
+                .session_capabilities()
+                .activation_inspection(),
+            prediction_inspection: false,
+            partitioned: self.selected().execution().parallel_topology().is_some(),
+            selected: true,
+            mechanisms,
+        };
         let mut support = eredu_runtime::inspection::observation_support(
-            &catalog,
-            eredu_runtime::inspection::ObservationExecutionContext {
-                activation_inspection: self
-                    .selected()
-                    .session_capabilities()
-                    .activation_inspection(),
-                partitioned: self.selected().execution().parallel_topology().is_some(),
-                selected: true,
-                mechanisms,
-            },
+            &descriptor.observations,
+            observation_context,
         );
         support.capture = capture;
         PreparedModelDiscovery {
             identity: self.graph.source_identity().clone(),
-            catalog,
+            execution_identity: self.execution_identity().to_owned(),
+            descriptor,
+            partition_selection: self
+                .selected()
+                .execution()
+                .parallel_topology()
+                .map(|_| self.selected().execution().clone()),
+            partition_parameters: None,
+            partition_parameter_index: None,
+            partition_hooks: None,
             support,
+            observation_context,
             intervention_points: self.architecture().intervention_points(),
+            prediction: self.prediction_extension().map(|_| {
+                let complete = self.inspection.architecture_plan();
+                PreparedPredictionDiscovery {
+                    placement: Arc::clone(&self.graph.prediction_placement),
+                    descriptor: complete.architecture_descriptor(),
+                    intervention_points: complete.intervention_points(),
+                }
+            }),
         }
     }
 
@@ -436,6 +849,13 @@ pub fn prepare_model_sources(
         }
         (_, None) => None,
     };
+    // Keep the source graph's construction requirements identical to cold
+    // selection when the request disables the artifact's additive predictor.
+    let architecture = if prediction_extension.is_some() {
+        architecture
+    } else {
+        architecture.without_prediction_extension()
+    };
     let execution_inspection = plan
         .inspection()
         .clone()
@@ -598,6 +1018,7 @@ fn prepare_safetensors_sources(
     };
     let source_metadata = metadata_snapshot(complete.as_ref())?;
     Ok(PreparedModelSourceGraph {
+        prediction_placement: Arc::default(),
         source_identity,
         execution_identity,
         format: ArtifactFormat::SafeTensors,
@@ -706,6 +1127,7 @@ fn prepare_gguf_sources(
     let source_metadata = metadata_snapshot(complete.as_ref())?;
     let target_companion_resolutions = companion_resolutions.clone();
     Ok(PreparedModelSourceGraph {
+        prediction_placement: Arc::default(),
         source_identity,
         execution_identity,
         format: ArtifactFormat::Gguf,

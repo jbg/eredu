@@ -196,14 +196,9 @@ impl PartitionLocalGeometry {
             expected_roles.push("embedding".into());
         }
         if self.text_units.end == text_count {
-            expected_roles.push("norm".into());
-            if args.tie_word_embeddings {
-                if !expected_roles.iter().any(|role| role == "embedding") {
-                    expected_roles.push("embedding".into());
-                }
-            } else {
-                expected_roles.push("output".into());
-            }
+            // The output consumer exists even when its parameter is the
+            // shared embedding group retained by either endpoint.
+            expected_roles.extend(["norm".into(), "output".into()]);
         }
         if self.static_roles != expected_roles {
             return Err(invalid(format!(
@@ -648,6 +643,15 @@ pub fn layer_parameter_groups(
             ),
         ],
     )?);
+    if args.weight_convention == super::WeightConvention::Gguf {
+        groups.push(replicated(
+            format!("{attention}.qk_norm"),
+            [
+                (format!("{attention}.q_norm.weight"), vec![head]),
+                (format!("{attention}.k_norm.weight"), vec![head]),
+            ],
+        )?);
+    }
     if args.is_moe() {
         let experts = dim(args.num_experts)?;
         let intermediate = dim(args.moe_intermediate_size)?;
@@ -878,6 +882,32 @@ pub fn vision_parameter_groups(
     })
 }
 
+/// Vision units whose owners need each pinned static module. Every vision
+/// partition constructs the parameter-free request context through `begin`;
+/// patch/position and static norm groups therefore remain available on those
+/// owners. The large merge adapter and projection are needed only at the end.
+pub(crate) fn vision_static_consumer_units(
+    args: &DecoderConfig,
+    target: &str,
+) -> Option<std::ops::Range<usize>> {
+    let count = args.vision_config.as_ref()?.layer_count();
+    if count == 0
+        || !target.starts_with("model.vision_")
+        || target.starts_with("model.vision_tower.layers.")
+    {
+        return None;
+    }
+    Some(
+        if target.starts_with("model.vision_adapter.")
+            || target.starts_with("model.vision_projection.")
+        {
+            count - 1..count
+        } else {
+            0..count
+        },
+    )
+}
+
 /// Declares only the pinned patch/position, merge, projection, and norm groups.
 pub fn vision_static_parameter_groups(
     args: &DecoderConfig,
@@ -1009,6 +1039,33 @@ mod tests {
             .members()
             .iter()
             .all(|member| member.sharding() == &MemberSharding::Replicated)));
+    }
+
+    #[test]
+    fn gguf_head_norm_gains_are_replicated_and_hf_norms_remain_weightless() {
+        let mut args = args();
+        for convention in [
+            super::super::WeightConvention::HuggingFace,
+            super::super::WeightConvention::Gguf,
+        ] {
+            args.weight_convention = convention;
+            let groups = layer_parameter_groups(&args, 0).unwrap();
+            for suffix in ["q_norm.weight", "k_norm.weight"] {
+                let name = format!("model.layers.0.self_attn.{suffix}");
+                let members = groups
+                    .iter()
+                    .flat_map(|g| g.members())
+                    .filter(|m| m.target() == name)
+                    .collect::<Vec<_>>();
+                if convention == super::super::WeightConvention::Gguf {
+                    assert_eq!(members.len(), 1);
+                    assert_eq!(members[0].global_shape(), &[args.head_dim as usize]);
+                    assert_eq!(members[0].sharding(), &MemberSharding::Replicated);
+                } else {
+                    assert!(members.is_empty());
+                }
+            }
+        }
     }
 
     #[test]

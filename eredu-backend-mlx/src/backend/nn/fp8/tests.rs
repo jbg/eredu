@@ -14,6 +14,128 @@ fn decodes_native_e8m0_scale_bytes() {
 use crate::backend::ExecutionContext;
 use safemlx::{ops::indexing::TryIndexOp, Array, Device, DeviceType, Dtype};
 
+fn verify_independent_row_tails(device: DeviceType) {
+    let context = ExecutionContext::new(Device::new(device, 0));
+    let stream = context.stream();
+    let layout = eredu_nn::LinearRowLayout::equal_partitions(2).unwrap();
+    let decode = |code: u8| {
+        let exponent = ((code >> 3) & 15) as i32;
+        let value = if exponent == 0 {
+            (code & 7) as f32 * 2_f32.powi(-9)
+        } else {
+            (1. + (code & 7) as f32 / 8.) * 2_f32.powi(exponent - 7)
+        };
+        if code & 128 == 0 {
+            value
+        } else {
+            -value
+        }
+    };
+    for width in [3_usize, 259] {
+        let (groups, columns, rows) = (2, 130, width * 2);
+        let scale_rows = width.div_ceil(128) * 2;
+        let codes = [0x28, 0x38, 0x44, 0xa8, 0xb8, 0xc4];
+        let bytes = (0..groups * rows * columns)
+            .map(|i| codes[(i * 7 + i / columns) % codes.len()])
+            .collect::<Vec<_>>();
+        let scales = (0..groups * scale_rows * 2)
+            .map(|i| 2_f32.powi((i % 5) as i32 - 5))
+            .collect::<Vec<_>>();
+        let scale_bytes = (0..scales.len())
+            .map(|i| 122 + (i % 5) as u8)
+            .collect::<Vec<_>>();
+        let weight = Array::from_slice(&bytes, &[groups as i32, rows as i32, columns as i32]);
+        for integer_scales in [false, true] {
+            let scale = if integer_scales {
+                Array::from_slice(&scale_bytes, &[groups as i32, scale_rows as i32, 2])
+            } else {
+                Array::from_slice(&scales, &[groups as i32, scale_rows as i32, 2])
+            };
+            let expected_weight = (0..bytes.len())
+                .map(|i| {
+                    let col = i % columns;
+                    let row = i / columns % rows;
+                    let group = i / (columns * rows);
+                    let sr = row / width * width.div_ceil(128) + row % width / 128;
+                    decode(bytes[i]) * scales[(group * scale_rows + sr) * 2 + col / 128]
+                })
+                .collect::<Vec<_>>();
+            let decoded =
+                super::dequantize_with_row_layout(&weight, &scale, layout, stream).unwrap();
+            assert_eq!(
+                decoded.evaluated().unwrap().as_slice::<f32>(),
+                expected_weight
+            );
+            let decoded_matrix = super::dequantize_with_row_layout(
+                &weight.try_index_device(1, stream).unwrap(),
+                &scale.try_index_device(1, stream).unwrap(),
+                layout,
+                stream,
+            )
+            .unwrap();
+            assert_eq!(
+                decoded_matrix.evaluated().unwrap().as_slice::<f32>(),
+                &expected_weight[rows * columns..]
+            );
+            for routes in [1_usize, 9] {
+                let input = (0..routes * columns)
+                    .map(|i| {
+                        if (i % columns) % 128 == 0 {
+                            448.
+                        } else {
+                            decode(codes[i % codes.len()])
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                let ids = (0..routes)
+                    .map(|i| ((i + 1) % groups) as u32)
+                    .collect::<Vec<_>>();
+                let output = super::grouped_linear_with_row_layout(
+                    &Array::from_slice(&input, &[routes as i32, columns as i32]),
+                    &weight,
+                    &scale,
+                    &Array::from_slice(&ids, &[routes as i32]),
+                    layout,
+                    stream,
+                )
+                .unwrap();
+                let evaluated = output.evaluated().unwrap();
+                for route in 0..routes {
+                    for row in 0..rows {
+                        let mut expected = 0_f64;
+                        let mut magnitude = 0_f64;
+                        for column in 0..columns {
+                            let term = input[route * columns + column] as f64
+                                * expected_weight
+                                    [(ids[route] as usize * rows + row) * columns + column]
+                                    as f64;
+                            expected += term;
+                            magnitude += term.abs();
+                        }
+                        let actual = evaluated.as_slice::<f32>()[route * rows + row] as f64;
+                        assert!(
+                            (actual - expected).abs() <= 2e-6 * magnitude.max(1.),
+                            "width={width} routes={routes} row={row}: {actual} vs {expected}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires native MLX CPU execution"]
+fn independent_row_tails_cpu() {
+    verify_independent_row_tails(DeviceType::Cpu);
+}
+
+#[test]
+#[ignore = "requires native MLX Metal execution"]
+fn independent_row_tails_metal() {
+    verify_independent_row_tails(DeviceType::Gpu);
+}
+
 fn assert_block_fp8_dense_and_grouped_projections(device_type: DeviceType) {
     let context = ExecutionContext::new(Device::new(device_type, 0));
     let stream = context.stream();
@@ -384,4 +506,202 @@ fn mixed_fp8_projections_match_independent_block_scaled_reference() {
             }
         }
     }
+}
+
+// An independent exhaustive-codebook reference, deliberately unlike the native
+// exponent/mantissa conversion. Includes the final partial block and amax floor.
+fn host_e4m3(code: u8) -> f32 {
+    let magnitude = code & 0x7f;
+    let exponent = (magnitude >> 3) as i32;
+    let mantissa = (magnitude & 7) as f32;
+    let value = if exponent == 0 {
+        mantissa * 2.0f32.powi(-9)
+    } else {
+        (1.0 + mantissa / 8.0) * 2.0f32.powi(exponent - 7)
+    };
+    if code & 0x80 != 0 {
+        -value
+    } else {
+        value
+    }
+}
+fn host_fp8_input(values: &[f32], width: usize) -> Vec<f32> {
+    values
+        .chunks(width)
+        .flat_map(|row| {
+            row.chunks(128).flat_map(|block| {
+                let scale = block.iter().fold(1e-4f32, |a, b| a.max(b.abs())) / 448.0;
+                block.iter().map(move |value| {
+                    let scaled = (value / scale).abs();
+                    let code = (0u8..=126)
+                        .min_by(|a, b| {
+                            (host_e4m3(*a) - scaled)
+                                .abs()
+                                .total_cmp(&(host_e4m3(*b) - scaled).abs())
+                                .then_with(|| (a & 1).cmp(&(b & 1)))
+                        })
+                        .unwrap();
+                    host_e4m3(code) * scale * if value.is_sign_negative() { -1.0 } else { 1.0 }
+                })
+            })
+        })
+        .collect()
+}
+#[derive(Default)]
+struct CapturedProjectionInput {
+    values: Vec<f32>,
+    generated: usize,
+}
+impl crate::backend::nn::linear::NativeProjectionInputObserver for CapturedProjectionInput {
+    fn observe(&mut self, input: &Array) -> Result<(), safemlx::error::Exception> {
+        self.values = input.evaluated()?.as_slice::<f32>().to_vec();
+        Ok(())
+    }
+    fn observe_generated(
+        &mut self,
+        prototype: &Array,
+        bytes: &eredu_nn::GeneratedTensorSource,
+        generate: &mut dyn FnMut() -> Result<Array, safemlx::error::Exception>,
+    ) -> Result<(), safemlx::error::Exception> {
+        let elements = prototype.size() as u64;
+        let width = prototype.dim(-1) as u64;
+        let padded_scales = elements / width * width.div_ceil(128) * 128;
+        assert_eq!(bytes.element_type, Some(eredu_nn::TensorElementType::F32));
+        assert!(bytes.creation_bytes >= (padded_scales + elements * 2) * 4);
+        self.generated += 1;
+        self.observe(&generate()?)
+    }
+}
+fn verify_actual_fp8_projection_input(device: DeviceType) {
+    use crate::backend::nn::linear::PhysicalLinear;
+    use eredu_checkpoint::{BlockFp8Format, BlockFp8ScaleEncoding, LinearFormat};
+    let context = ExecutionContext::new(Device::new(device, 0));
+    let stream = context.stream();
+    if device == DeviceType::Gpu {
+        // Each of these very narrow rows still expands a full scale block.
+        let mut narrow = CapturedProjectionInput::default();
+        super::linear_with_input_observer(
+            &Array::from_slice(&[1.234e-7f32; 129], &[129, 1]),
+            &Array::from_slice(&[0x38u8, 0xb8], &[2, 1]),
+            &Array::from_slice(&[1.0f32], &[1, 1]),
+            stream,
+            Some(&mut narrow),
+        )
+        .unwrap();
+        assert_eq!(narrow.generated, 1);
+        let expected = host_fp8_input(&[1.234e-7f32; 129], 1);
+        for (actual, expected) in narrow.values.iter().zip(expected) {
+            assert!((actual - expected).abs() <= 1e-11 + expected.abs() * 2e-7);
+        }
+    }
+    let (width, outputs) = (259usize, 129usize);
+    let codes: Vec<u8> = (0..width * outputs)
+        .map(|i| (0x28 + (i * 13 % 40)) as u8 | if i % 3 == 0 { 0x80 } else { 0 })
+        .collect();
+    let scales: Vec<f32> = (1..=6).map(|i| i as f32 / 64.0).collect();
+    let weights: Vec<f32> = codes
+        .iter()
+        .enumerate()
+        .map(|(i, code)| host_e4m3(*code) * scales[(i / width / 128) * 3 + i % width / 128])
+        .collect();
+    let mut module = PhysicalLinear::unloaded(
+        width as i32,
+        outputs as i32,
+        false,
+        LinearFormat::E4M3BlockFp8(
+            BlockFp8Format::new(128, 128, BlockFp8ScaleEncoding::FloatingPoint).unwrap(),
+        ),
+        stream,
+    )
+    .unwrap();
+    module.weight.value = Array::from_slice(&codes, &[outputs as i32, width as i32]);
+    module.weight_scale_inv.value = Some(Array::from_slice(&scales, &[2, 3]));
+    let original = module.weight.value.clone();
+    for rows in [1usize, 9] {
+        let input: Vec<f32> = (0..rows * width)
+            .map(|i| {
+                let base = ((i * 17 % 137) as f32 - 68.0) * 0.03137;
+                if i % width >= 256 {
+                    base * 1e-7
+                } else if i % width >= 128 {
+                    base * 3.17
+                } else {
+                    base
+                }
+            })
+            .collect();
+        let expected_input = host_fp8_input(&input, width);
+        assert!(input
+            .iter()
+            .zip(&expected_input)
+            .any(|(a, b)| (a - b).abs() > 0.01));
+        let input_array = Array::from_slice(&input, &[1, rows as i32, width as i32]);
+        let mut evidence = CapturedProjectionInput::default();
+        let actual = module
+            .forward_with_input_observer(&input_array, stream, Some(&mut evidence))
+            .unwrap();
+        assert_eq!(evidence.generated, usize::from(device == DeviceType::Gpu));
+        for (a, b) in evidence.values.iter().zip(&expected_input) {
+            assert!(
+                (a - b).abs() <= 1e-11 + b.abs() * 2e-7,
+                "actual projection input {a} != {b}"
+            );
+        }
+        let expected: Vec<f32> = expected_input
+            .chunks(width)
+            .flat_map(|row| {
+                weights.chunks(width).map(move |weight| {
+                    row.iter()
+                        .zip(weight)
+                        .map(|(a, b)| *a as f64 * *b as f64)
+                        .sum::<f64>() as f32
+                })
+            })
+            .collect();
+        let actual = actual.evaluated().unwrap().as_slice::<f32>().to_vec();
+        for (a, b) in actual.iter().zip(&expected) {
+            assert!(
+                (a - b).abs() <= 4e-5 + b.abs() * 4e-5,
+                "projection {a} != {b}"
+            );
+        }
+        assert_eq!(
+            actual,
+            module
+                .forward(&input_array, stream)
+                .unwrap()
+                .evaluated()
+                .unwrap()
+                .as_slice::<f32>()
+        );
+        // A zero edit still publishes F32 weights and changes the input arithmetic.
+        module.weight.value = Array::from_slice(&weights, &[outputs as i32, width as i32]);
+        let mut dense_evidence = CapturedProjectionInput::default();
+        let dense = module
+            .forward_with_input_observer(&input_array, stream, Some(&mut dense_evidence))
+            .unwrap();
+        assert_eq!(dense_evidence.values, input);
+        assert_eq!(dense_evidence.generated, 0);
+        assert_ne!(dense.evaluated().unwrap().as_slice::<f32>(), actual);
+        module.weight.value = original.clone();
+        assert_eq!(
+            actual,
+            module
+                .forward(&input_array, stream)
+                .unwrap()
+                .evaluated()
+                .unwrap()
+                .as_slice::<f32>()
+        );
+    }
+}
+#[test]
+#[ignore = "requires MLX runtime execution"]
+fn actual_fp8_projection_input_cpu() {
+    verify_actual_fp8_projection_input(DeviceType::Cpu);
+}
+#[test]
+#[ignore = "requires Metal device"]
+fn actual_fp8_projection_input_metal() {
+    verify_actual_fp8_projection_input(DeviceType::Gpu);
 }

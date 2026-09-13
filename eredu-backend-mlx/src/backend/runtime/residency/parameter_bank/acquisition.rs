@@ -2,8 +2,52 @@
 
 use super::*;
 
+fn prepared_parameter_members(
+    entries: &[ParameterBankEntry],
+    targets: &BTreeMap<(ParameterBankKey, String), String>,
+    store: &dyn eredu_checkpoint::store::CheckpointSource,
+) -> Result<
+    Vec<eredu_runtime::parameter_operations::PreparedBankParameterMember>,
+    AddressableParameterBankError,
+> {
+    let result = entries
+        .iter()
+        .flat_map(|entry| {
+            entry
+                .unit
+                .bindings()
+                .iter()
+                .map(move |binding| (entry, binding))
+        })
+        .map(|(entry, binding)| {
+            let parameter = targets
+                .get(&(entry.identity, binding.name().to_owned()))
+                .ok_or_else(|| {
+                    Error::ArchitectureModel(
+                        "selected bank binding has no logical destination".into(),
+                    )
+                })?;
+            Ok(
+                eredu_runtime::parameter_operations::PreparedBankParameterMember {
+                    key: entry.identity,
+                    binding: binding.name().to_owned(),
+                    parameter: parameter.clone(),
+                    materialized: binding.source_recipe().infer(store)?,
+                },
+            )
+        })
+        .collect::<Result<Vec<_>, Error>>();
+    result.map_err(|source| AddressableParameterBankError::Transformation {
+        source: Box::new(source),
+    })
+}
+
 /// Shared entry catalog, scheduler, residency manager, and telemetry.
 pub struct AddressableParameterBank {
+    pub(super) parameter_members:
+        Vec<eredu_runtime::parameter_operations::PreparedBankParameterMember>,
+    pub(super) parameter_replacements: BTreeMap<String, MlxTensor>,
+    pub(super) effective_member_bytes: BTreeMap<ParameterBankKey, u64>,
     pub(super) pool_id: u64,
     pub(super) manager: ResidencyManager,
     pub(super) catalog: BTreeMap<ParameterBankKey, u64>,
@@ -45,13 +89,27 @@ pub(super) fn preflight_selected_entry_bindings(
             entry.unit.bindings(),
         )
         .map_err(|error| AddressableParameterBankError::Transformation {
-            source: Box::new(Error::ArchitectureModel(error.to_string())),
+            source: Box::new(Error::Other(Box::new(error))),
         })?;
     }
     Ok(())
 }
 
 impl SharedAddressableParameterBank {
+    /// Reads exact member destinations retained after lowering, without source work.
+    pub fn prepared_parameter_members(
+        &self,
+    ) -> Result<Vec<eredu_runtime::parameter_operations::PreparedBankParameterMember>, Error> {
+        let bank = self.inner.lock().map_err(|_| {
+            Error::ArchitectureModel("addressable parameter bank lock was poisoned".into())
+        })?;
+        Ok(bank
+            .parameter_members
+            .iter()
+            .filter(|member| self.scope.is_none_or(|scope| member.key.bank() == scope))
+            .cloned()
+            .collect())
+    }
     /// Wraps one selected native bank for shared provider/telemetry ownership.
     pub fn new(bank: AddressableParameterBank) -> Self {
         Self {
@@ -212,7 +270,12 @@ impl AddressableParameterBank {
             }
         }
         if selected.transformations.is_empty() {
-            return Self::new_shared_with_policy(
+            let parameter_members = prepared_parameter_members(
+                &selected.entries,
+                &selected.parameter_targets,
+                store.as_ref(),
+            )?;
+            let mut bank = Self::new_shared_with_policy(
                 store,
                 selected.entries,
                 options,
@@ -223,7 +286,9 @@ impl AddressableParameterBank {
                 Vec::new(),
                 selected.placements,
                 None,
-            );
+            )?;
+            bank.parameter_members = parameter_members;
+            return Ok(bank);
         }
         let telemetry_formats = selected_transformation_formats(&selected.transformations);
         let transformed = quantize_selected_entry_catalog(
@@ -246,7 +311,12 @@ impl AddressableParameterBank {
                 });
             }
         }
-        Self::new_shared_with_policy(
+        let parameter_members = prepared_parameter_members(
+            &transformed.entries,
+            &selected.parameter_targets,
+            transformed.store.as_ref(),
+        )?;
+        let mut bank = Self::new_shared_with_policy(
             transformed.store,
             transformed.entries,
             options,
@@ -257,7 +327,9 @@ impl AddressableParameterBank {
             telemetry_formats,
             selected.placements,
             Some(transformed.report),
-        )
+        )?;
+        bank.parameter_members = parameter_members;
+        Ok(bank)
     }
 
     /// Creates a fully resident store over exactly the supplied owned entries.
@@ -344,6 +416,9 @@ impl AddressableParameterBank {
         manager.initialize()?;
         static NEXT_POOL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         Ok(Self {
+            parameter_members: Vec::new(),
+            parameter_replacements: BTreeMap::new(),
+            effective_member_bytes: catalog.clone(),
             pool_id: NEXT_POOL.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             manager,
             unit_banks: catalog
@@ -482,7 +557,7 @@ impl AddressableParameterBank {
         }
         let scratch_bytes = demand.keys().try_fold(0u64, |total, identity| {
             total
-                .checked_add(self.catalog[identity])
+                .checked_add(self.effective_member_bytes[identity])
                 .ok_or(AddressableParameterBankError::ByteOverflow)
         })?;
         if scratch_bytes > self.scratch_limit {

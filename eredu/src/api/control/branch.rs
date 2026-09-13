@@ -216,6 +216,8 @@ impl<B: TextSnapshotBackend + TextSamplingControlBackend> ControlledGenerationSe
                         schema_version: CAPTURE_SCHEMA_VERSION,
                         run_id: run_id.clone(),
                         artifact_identity: snapshot.metadata.artifact_identity.clone(),
+                        parameter_overlay_id: B::active_parameter_overlay(runtime)
+                            .map(str::to_owned),
                         session_id: session_id.clone(),
                         capture_plan_id: capture.map_or_else(
                             || snapshot.metadata.capture_plan_id.clone(),

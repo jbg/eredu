@@ -190,40 +190,48 @@ impl ModelProcessor {
     where
         E: std::fmt::Display,
     {
-        let mut observer = ProcessorObserver::<E> {
-            inner: observer,
-            marker: std::marker::PhantomData,
-        };
-        self.processor
-            .prepare_with_observer(
-                request,
-                &mut MlxProcessorMechanisms,
-                encode_text,
-                &mut observer,
-            )
-            .and_then(|prepared| {
-                if retain_semantic_identity {
-                    PreparedModelInput::from_runtime_with_semantic_content(
-                        prepared,
-                        request.semantic_content_fingerprint(),
+        crate::backend::submission_recovery::detached_preparation(
+            Vec::new(),
+            || {
+                let mut observer = ProcessorObserver::<E> {
+                    inner: observer,
+                    marker: std::marker::PhantomData,
+                };
+                self.processor
+                    .prepare_with_observer(
+                        request,
+                        &mut MlxProcessorMechanisms,
+                        encode_text,
+                        &mut observer,
                     )
-                    .map_err(ProcessorExecutionError::Mechanism)
-                } else {
-                    Ok(PreparedModelInput::from_observed_runtime(prepared))
-                }
-            })
-            .map_err(|error| match error {
-                ProcessorExecutionError::Text(error) => ProcessorPreparationError::Text(error),
-                ProcessorExecutionError::Plan(error) => {
-                    ProcessorPreparationError::Backend(Error::Processor(error))
-                }
-                ProcessorExecutionError::Mechanism(error) => {
-                    ProcessorPreparationError::Backend(error)
-                }
-                ProcessorExecutionError::Prepared(error) => {
-                    ProcessorPreparationError::Backend(Error::Processor(error.to_string()))
-                }
-            })
+                    .and_then(|prepared| {
+                        if retain_semantic_identity {
+                            PreparedModelInput::from_runtime_with_semantic_content(
+                                prepared,
+                                request.semantic_content_fingerprint(),
+                            )
+                            .map_err(ProcessorExecutionError::Mechanism)
+                        } else {
+                            Ok(PreparedModelInput::from_observed_runtime(prepared))
+                        }
+                    })
+                    .map_err(|error| match error {
+                        ProcessorExecutionError::Text(error) => {
+                            ProcessorPreparationError::Text(error)
+                        }
+                        ProcessorExecutionError::Plan(error) => {
+                            ProcessorPreparationError::Backend(Error::Processor(error))
+                        }
+                        ProcessorExecutionError::Mechanism(error) => {
+                            ProcessorPreparationError::Backend(error)
+                        }
+                        ProcessorExecutionError::Prepared(error) => {
+                            ProcessorPreparationError::Backend(Error::Processor(error.to_string()))
+                        }
+                    })
+            },
+            ProcessorPreparationError::Backend,
+        )
     }
 }
 
@@ -244,9 +252,9 @@ where
         path: &str,
         value: &Array,
     ) -> Result<(), ProcessorExecutionError<E, Error>> {
-        self.inner.observe(path, value).map_err(|error| {
-            ProcessorExecutionError::Mechanism(Error::Processor(error.to_string()))
-        })
+        self.inner
+            .observe(path, value)
+            .map_err(|error| ProcessorExecutionError::Mechanism(Error::from(error)))
     }
 
     fn intervene(
@@ -254,8 +262,8 @@ where
         path: &str,
         value: &Array,
     ) -> Result<Option<Array>, ProcessorExecutionError<E, Error>> {
-        self.inner.intervene(path, value).map_err(|error| {
-            ProcessorExecutionError::Mechanism(Error::Processor(error.to_string()))
-        })
+        self.inner
+            .intervene(path, value)
+            .map_err(|error| ProcessorExecutionError::Mechanism(Error::from(error)))
     }
 }

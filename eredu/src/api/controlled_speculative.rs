@@ -3,16 +3,19 @@
 use super::request::PreparedGenerationMode;
 use super::{LoadedModel, PreparedChatSpeculativeError, PreparedChatSpeculativeGenerationRequest};
 pub use eredu_core::speculative::{
-    SpeculativeCaptureRole, SpeculativeControlError, SpeculativeInterventionPlan,
-    SpeculativePredictionCapture, SpeculativeProposalView,
+    AdmittedSpeculativeActivations, SpeculativeActivationCapture, SpeculativeActivationDiscovery,
+    SpeculativeActivationOrigin, SpeculativeActivationPhase, SpeculativeActivationPlan,
+    SpeculativeCaptureBinding, SpeculativeCaptureRole, SpeculativeCaptureScope,
+    SpeculativeControlError, SpeculativeInterventionPlan, SpeculativePredictionCapture,
+    SpeculativeProposalView, SPECULATIVE_ACTIVATION_SCHEMA_VERSION,
 };
 use eredu_core::{
     generation::SemanticEvent, SpeculativeGenerationBackend, SpeculativeGenerationOutput,
 };
 pub use eredu_runtime::speculative::{
-    ControlledSpeculativeOptions, ControlledSpeculativeSession, ControlledSpeculativeStep,
-    SpeculativeBranchHandle, SpeculativeBranchInfo, SpeculativeProposalDisposition,
-    SpeculativeSnapshotHandle, SpeculativeVerificationRecord,
+    ControlledSpeculativeActivation, ControlledSpeculativeOptions, ControlledSpeculativeSession,
+    ControlledSpeculativeStep, SpeculativeBranchHandle, SpeculativeBranchInfo,
+    SpeculativeProposalDisposition, SpeculativeSnapshotHandle, SpeculativeVerificationRecord,
 };
 
 /// Preparation or controlled speculative execution failure, with neutral causes.
@@ -27,6 +30,26 @@ pub enum ControlledSpeculativeGenerationError {
 }
 
 impl<B: SpeculativeGenerationBackend> LoadedModel<B> {
+    /// Internal forward capture and edit support for the actually loaded
+    /// speculative executor. Ordinary sampler capture uses a separate report.
+    pub fn speculative_activation_discovery(
+        &self,
+    ) -> Result<SpeculativeActivationDiscovery, eredu_core::capture::CaptureError> {
+        B::speculative_activation_discovery(&self.runtime)
+    }
+
+    /// Admits capture and optional edits together, bound to the loaded session
+    /// and effective parameters. The bounds describe physical forward rows;
+    /// prediction schedules remain coordinates in the generated token prefix.
+    pub fn prepare_speculative_activations(
+        &self,
+        plan: SpeculativeActivationPlan,
+    ) -> Result<AdmittedSpeculativeActivations, eredu_core::capture::CaptureError> {
+        let admitted = plan.admit(&self.speculative_activation_discovery()?)?;
+        B::validate_speculative_activations(&self.runtime, &admitted)?;
+        Ok(admitted)
+    }
+
     /// Admits bounded speculative prediction captures against this loaded model.
     /// Each raw-logit observation is one vocabulary row, including target prefill;
     /// sequence slices therefore address a single row rather than the full prompt.
@@ -69,6 +92,38 @@ impl<B: SpeculativeGenerationBackend> LoadedModel<B> {
         let plan = plan.admit(&discovery, capture.request(), &self.session_identity)?;
         B::validate_speculative_interventions(&self.runtime, capture, &plan)?;
         Ok(SpeculativeInterventionPlan { role, plan })
+    }
+
+    /// Runs the shared controlled driver continuously, delivering each bounded
+    /// speculative step immediately. Breaking the callback cancels and settles
+    /// execution through the same scheduler. Use the scoped controlled API when
+    /// aborted invocation evidence must be drained after a failed action.
+    pub fn generate_observed_chat_speculative<'a, F, D>(
+        &mut self,
+        request: PreparedChatSpeculativeGenerationRequest<'a, B, B::Drafter, F>,
+        options: ControlledSpeculativeOptions,
+        on_step: D,
+    ) -> Result<SpeculativeGenerationOutput, ControlledSpeculativeGenerationError>
+    where
+        F: FnMut(SemanticEvent),
+        D: FnMut(ControlledSpeculativeStep) -> std::ops::ControlFlow<()>,
+    {
+        self.with_controlled_chat_speculative(request, options, continuous_steps(on_step))
+    }
+
+    /// Literal-text equivalent of `generate_observed_chat_speculative`, sharing
+    /// the ordinary decoding, termination and controlled advancement policy.
+    pub fn generate_observed_text_speculative<'a, F, D>(
+        &mut self,
+        request: PreparedChatSpeculativeGenerationRequest<'a, B, B::Drafter, F>,
+        options: ControlledSpeculativeOptions,
+        on_step: D,
+    ) -> Result<SpeculativeGenerationOutput, ControlledSpeculativeGenerationError>
+    where
+        F: FnMut(SemanticEvent),
+        D: FnMut(ControlledSpeculativeStep) -> std::ops::ControlFlow<()>,
+    {
+        self.with_controlled_text_speculative(request, options, continuous_steps(on_step))
     }
 
     /// Lends a controlled speculative chat to an Inspector or worker command loop.
@@ -141,7 +196,52 @@ impl<B: SpeculativeGenerationBackend> LoadedModel<B> {
         F: FnMut(SemanticEvent),
         D: FnOnce(&mut dyn ControlledSpeculativeSession) -> Result<(), SpeculativeControlError>,
     {
-        let capture = options.capture.clone();
+        let validation = (|| -> Result<(), ControlledSpeculativeGenerationError> {
+            if let Some(plan) = options.activations.as_ref() {
+                B::validate_speculative_activations(&self.runtime, plan)
+                    .map_err(SpeculativeControlError::from)?;
+                let (_, maximum) = self
+                    .resolve_text_generation_settings(request.settings)
+                    .map_err(PreparedChatSpeculativeError::from)?;
+                if plan.captures().invocation_bounds().is_none_or(|bounds| {
+                    bounds.batch != 1 || bounds.max_predictions < maximum.get() as u64
+                }) {
+                    return Err(SpeculativeControlError::Capture(
+                        eredu_core::capture::CaptureError::Invalid(
+                            "internal activation admission does not cover this speculative request"
+                                .into(),
+                        ),
+                    )
+                    .into());
+                }
+            }
+            if let Some(plan) = options.capture.as_ref() {
+                if plan.request().prompt_tokens != 1 || plan.request().batch != 1 {
+                    return Err(SpeculativeControlError::Capture(eredu_core::capture::CaptureError::Invalid(
+                    "speculative captures require one-row admission from prepare_speculative_capture".into())).into());
+                }
+                B::validate_speculative_capture(&self.runtime, plan)
+                    .map_err(SpeculativeControlError::from)?;
+                let (_, maximum) = self
+                    .resolve_text_generation_settings(request.settings)
+                    .map_err(PreparedChatSpeculativeError::from)?;
+                if plan.request().max_predictions < maximum.get() as u64 {
+                    return Err(SpeculativeControlError::Capture(
+                    eredu_core::capture::CaptureError::Invalid(
+                        "capture admission does not cover the requested speculative token limit"
+                            .into(),
+                    ),
+                )
+                .into());
+                }
+            }
+            Ok(())
+        })();
+        self.runtime.finish_text_preparation(
+            eredu_core::run_preparation::TextPreparationStage::Instrumentation,
+            validation,
+            |error| PreparedChatSpeculativeError::Backend(error).into(),
+        )?;
         let mut failure = None;
         let driver = eredu_runtime::speculative::DriveControlledSpeculation::new(
             request.options.scheduler,
@@ -157,31 +257,26 @@ impl<B: SpeculativeGenerationBackend> LoadedModel<B> {
                 .max()
                 .map_or(0, |id| id as usize + 1),
         )
-        .with_intervention_discovery(B::speculative_intervention_discovery(&self.runtime).ok());
-        if let Some(plan) = capture.as_ref() {
-            if plan.request().prompt_tokens != 1 || plan.request().batch != 1 {
-                return Err(SpeculativeControlError::Capture(eredu_core::capture::CaptureError::Invalid(
-                    "speculative captures require one-row admission from prepare_speculative_capture".into())).into());
-            }
-            B::validate_speculative_capture(&self.runtime, plan)
-                .map_err(SpeculativeControlError::from)?;
-            let (_, maximum) = self
-                .resolve_text_generation_settings(request.settings)
-                .map_err(PreparedChatSpeculativeError::from)?;
-            if plan.request().max_predictions < maximum.get() as u64 {
-                return Err(SpeculativeControlError::Capture(
-                    eredu_core::capture::CaptureError::Invalid(
-                        "capture admission does not cover the requested speculative token limit"
-                            .into(),
-                    ),
-                )
-                .into());
-            }
-        }
+        .with_intervention_discovery(B::speculative_intervention_discovery(&self.runtime).ok())
+        .with_activation_discovery(B::speculative_activation_discovery(&self.runtime).ok());
         let result = self.generate_prepared_speculative_with(request, mode, driver);
         if let Some(error) = failure {
             return Err(error.into());
         }
         result.map_err(Into::into)
+    }
+}
+
+fn continuous_steps(
+    mut on_step: impl FnMut(ControlledSpeculativeStep) -> std::ops::ControlFlow<()>,
+) -> impl FnOnce(&mut dyn ControlledSpeculativeSession) -> Result<(), SpeculativeControlError> {
+    move |session| {
+        while let Some(step) = session.step()? {
+            if on_step(step).is_break() {
+                session.cancel()?;
+                break;
+            }
+        }
+        Ok(())
     }
 }

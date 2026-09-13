@@ -372,8 +372,15 @@ impl<M: AutoregressiveMechanisms> SpeculativeExecutor for AutoregressiveExecutor
         cache: &Self::Cache,
         state: &Self::TargetState,
         _: Self::Context<'_>,
-    ) -> Result<Option<(Self::CacheCheckpoint, Self::TargetState)>, Self::Error> {
-        Ok(Some((self.checkpoint(cache)?, state.clone())))
+    ) -> Result<
+        Option<(Self::CacheCheckpoint, Self::TargetState)>,
+        eredu_core::speculative::SpeculativeControlError,
+    > {
+        Ok(Some((
+            self.checkpoint(cache)
+                .map_err(eredu_core::speculative::SpeculativeControlError::backend)?,
+            state.clone(),
+        )))
     }
 
     fn restore_control_snapshot(
@@ -382,8 +389,9 @@ impl<M: AutoregressiveMechanisms> SpeculativeExecutor for AutoregressiveExecutor
         saved: &Self::CacheCheckpoint,
         state: &Self::TargetState,
         context: Self::Context<'_>,
-    ) -> Result<Option<Self::TargetState>, Self::Error> {
-        self.restore_checkpoint(cache, saved, context)?;
+    ) -> Result<Option<Self::TargetState>, eredu_core::speculative::SpeculativeControlError> {
+        self.restore_checkpoint(cache, saved, context)
+            .map_err(eredu_core::speculative::SpeculativeControlError::backend)?;
         Ok(Some(state.clone()))
     }
 }

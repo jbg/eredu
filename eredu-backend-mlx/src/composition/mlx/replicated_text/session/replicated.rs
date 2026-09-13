@@ -25,6 +25,9 @@ pub(in crate::composition::mlx::replicated_text) struct CompletedReplicatedText<
     effective_model_type: String,
     pub(super) prediction: P,
     pub(super) embedded_prediction_observers: MlxEmbeddedPredictionObservers,
+    prepared_parameters: Vec<eredu_runtime::parameter_operations::PreparedParameterSlot>,
+    parameter_tasks: Vec<eredu_runtime::ReplicatedTextMaterializationTask>,
+    prepared_bank_parameters: Vec<eredu_runtime::parameter_operations::PreparedBankParameter>,
     parameter_banks: std::collections::BTreeMap<
         eredu_runtime::RoutedBankId,
         crate::backend::runtime::residency::parameter_bank::SharedAddressableParameterBank,
@@ -51,7 +54,18 @@ where
         stream: &Stream,
         weights_stream: &Stream,
     ) -> Result<Self, Error> {
-        let mechanisms = MlxReplicatedTextMechanisms::new(store, stream, weights_stream);
+        Self::new_with_residency(prepared, store, stream, weights_stream, Default::default())
+    }
+
+    pub(super) fn new_with_residency(
+        prepared: PreparedReplicatedTextArchitecture<A>,
+        store: Arc<dyn CheckpointSource>,
+        stream: &Stream,
+        weights_stream: &Stream,
+        residency: super::super::prediction::parameters::PredictionResidency,
+    ) -> Result<Self, Error> {
+        let mut mechanisms = MlxReplicatedTextMechanisms::new(store, stream, weights_stream);
+        mechanisms.set_prediction_residency(residency);
         #[cfg(test)]
         crate::tests::support::path_instrumentation::constructor();
         let (session, facts) =
@@ -95,6 +109,9 @@ where
         #[cfg(not(test))]
         let _ = selected_residency;
         Self {
+            prepared_parameters: session.prepared_parameter_slots().to_vec(),
+            parameter_tasks: session.parameter_materialization_tasks().to_vec(),
+            prepared_bank_parameters: Vec::new(),
             session,
             prompt_cache_identity,
             capability_estimate,
@@ -118,14 +135,28 @@ where
             eredu_runtime::RoutedBankId,
             crate::backend::runtime::residency::parameter_bank::SharedAddressableParameterBank,
         >,
-    ) -> Self {
+    ) -> Result<Self, Error> {
+        let mut members = Vec::new();
+        for bank in parameter_banks.values() {
+            members.extend(bank.prepared_parameter_members()?);
+        }
+        self.prepared_bank_parameters =
+            eredu_runtime::parameter_operations::prepare_bank_parameter_slots(
+                self.session.parameter_declarations(),
+                members,
+            )
+            .map_err(eredu_nn::Error::backend_source)?;
+        self.prepared_parameters
+            .extend(self.prepared_bank_parameters.iter().map(|p| p.slot.clone()));
+        self.prepared_parameters
+            .sort_unstable_by(|a, b| a.parameter.id.cmp(&b.parameter.id));
         self.parameter_banks = parameter_banks;
-        self
+        Ok(self)
     }
 
     pub(super) fn with_prediction<P>(
-        self,
-        prediction: SelectedPrediction<P>,
+        mut self,
+        mut prediction: SelectedPrediction<P>,
         capability: eredu_architectures::capability::CapabilityEstimate,
     ) -> Result<CompletedReplicatedText<A, S, D, SelectedPrediction<P>>, Error>
     where
@@ -140,6 +171,15 @@ where
                 "prediction extension contract is missing executable draft depth".into(),
             ));
         }
+        let materialization = super::super::prediction::parameters::collect::<A, P>(
+            &mut prediction.extension,
+            &mut self.prepared_parameters,
+            &mut self.parameter_tasks,
+        )?;
+        if materialization.transformed_weights > 0 {
+            self.session
+                .record_auxiliary_materialization(materialization);
+        }
         Ok(CompletedReplicatedText {
             session: self.session,
             prompt_cache_identity: self.prompt_cache_identity,
@@ -148,6 +188,9 @@ where
             prediction,
             embedded_prediction_observers: self.embedded_prediction_observers,
             parameter_banks: self.parameter_banks,
+            prepared_parameters: self.prepared_parameters,
+            parameter_tasks: self.parameter_tasks,
+            prepared_bank_parameters: self.prepared_bank_parameters,
             #[cfg(test)]
             selected_residency: self.selected_residency,
             partition_sampling_group: self.partition_sampling_group,
@@ -196,11 +239,143 @@ where
         + 'static,
     P: ReplicatedPredictionCapability<A, S, D> + 'static,
 {
+    fn visit_loaded_parameters(
+        &mut self,
+        visitor: &mut dyn eredu_nn::ParameterSlotVisitor<MlxTensor>,
+    ) -> bool {
+        if P::present() || !self.parameter_banks.is_empty() {
+            return false;
+        }
+        if !self.session.visit_loaded_parameters(visitor) {
+            return false;
+        }
+        self.prediction.visit_parameter_slots(visitor);
+        true
+    }
+
+    fn parameter_materialization_tasks(
+        &self,
+    ) -> &[eredu_runtime::ReplicatedTextMaterializationTask] {
+        &self.parameter_tasks
+    }
+
+    fn partition_parameter_description(
+        &self,
+    ) -> Option<&std::sync::Arc<eredu_runtime::ArchitectureParameterDescription>> {
+        self.session.partition_parameter_description()
+    }
+
+    fn partition_observation_hooks(
+        &self,
+    ) -> Option<eredu_runtime::inspection::ObservationHookSupport> {
+        self.session.partition_observation_hooks()
+    }
+
+    fn prepared_parameter_slots(
+        &self,
+    ) -> &[eredu_runtime::parameter_operations::PreparedParameterSlot] {
+        &self.prepared_parameters
+    }
+
+    fn with_parameter_slots(
+        &mut self,
+        location: &eredu_runtime::parameter_operations::PreparedParameterLocation,
+        selected: &std::collections::BTreeSet<String>,
+        operation: &mut eredu_runtime::parameter_operations::ParameterSlotOperation<
+            '_,
+            MlxTensor,
+            Error,
+        >,
+        stream: &Stream,
+    ) -> Result<bool, Error> {
+        if let eredu_runtime::parameter_operations::PreparedParameterLocation::Prediction {
+            module,
+        } = location
+        {
+            return self.prediction.with_parameter_slots(*module, operation);
+        }
+        if let eredu_runtime::parameter_operations::PreparedParameterLocation::Bank { bank, unit } =
+            location
+        {
+            let owner = self
+                .parameter_banks
+                .values()
+                .find(|owner| owner.owns_parameter_bank(*bank));
+            let Some(owner) = owner else {
+                return Ok(false);
+            };
+            return owner.with_parameter_slots(
+                *bank,
+                *unit,
+                &self.prepared_bank_parameters,
+                selected,
+                operation,
+                stream,
+            );
+        }
+        self.session
+            .with_parameter_slots(location, operation, stream)
+            .map_err(|error| match error {
+                eredu_runtime::LayerwiseAcquireError::Architecture(error) => {
+                    Error::Other(Box::new(error))
+                }
+                eredu_runtime::LayerwiseAcquireError::Policy(error) => error,
+            })
+    }
+
+    fn publish_parameter_replacements(
+        &mut self,
+        values: &std::collections::BTreeMap<String, MlxTensor>,
+        active: bool,
+    ) -> Result<bool, Error> {
+        let banks = self.parameter_banks.values().cloned().collect::<Vec<_>>();
+        let published = crate::backend::runtime::residency::parameter_bank::publish_bank_parameter_replacements(
+            &banks,
+            values,
+            active,
+            || self.session.publish_parameter_replacements(values, active),
+        )?;
+        if published {
+            self.prediction
+                .publish_parameter_replacements(values, active);
+        }
+        Ok(published)
+    }
+
+    fn invalidate_parameter_snapshots(&mut self) {
+        self.session.invalidate_parameter_snapshots();
+    }
+
+    fn estimate_parameter_reset_state(
+        &self,
+    ) -> Option<eredu_core::execution_control::SnapshotEstimate> {
+        self.session.estimate_parameter_reset_state()
+    }
+
+    fn prepare_parameter_reset_state(&mut self) -> Result<Box<dyn std::any::Any>, Error> {
+        self.session
+            .prepare_parameter_reset_state(&self.stream)
+            .map(|state| Box::new(state) as Box<dyn std::any::Any>)
+            .map_err(|error| Error::Other(Box::new(error)))
+    }
+
+    fn exchange_parameter_reset_state(
+        &mut self,
+        slot: &mut dyn std::any::Any,
+    ) -> Result<(), Error> {
+        let slot = slot
+            .downcast_mut::<eredu_runtime::replicated_session::ReplicatedTextControlState<S>>()
+            .ok_or_else(|| Error::ArchitectureModel("parameter reset state type differs".into()))?;
+        self.session
+            .exchange_parameter_reset_state(slot)
+            .map_err(|error| Error::Other(Box::new(error)))
+    }
+
     fn prepare_autoregressive_cache(&mut self) -> Result<MlxPredictionTargetState, Error> {
         self.session
             .prepare_prediction_target_state(&self.stream)
             .map(MlxPredictionTargetState::new)
-            .map_err(|e| Error::Speculative(e.to_string()))
+            .map_err(|e| Error::Other(Box::new(e)))
     }
     fn autoregressive_forward(
         &mut self,
@@ -220,7 +395,7 @@ where
             .exchange_prediction_target_state(&mut lane, stream)
         {
             cache.restore_state(lane);
-            return Err(Error::Speculative(error.to_string()));
+            return Err(Error::Other(Box::new(error)));
         }
         let tokens = MlxTensor::from_array(tokens.clone());
         let result = self.session.sequence_logits(
@@ -237,19 +412,18 @@ where
             .exchange_prediction_target_state(&mut lane, stream)
         {
             Ok(()) => Ok(()),
-            Err(error) => self
-                .session
-                .recover_prediction_target_state_after_failure(&mut lane)
-                .map_err(|recovery| {
-                    Error::Speculative(format!(
-                        "lane exchange failed: {error}; ownership recovery failed: {recovery}"
-                    ))
-                })
-                .and(Err(Error::Speculative(error.to_string()))),
+            Err(error) => super::finish_prediction_state_operation(
+                Err(Error::Other(Box::new(error))),
+                self.session
+                    .recover_prediction_target_state_after_failure(&mut lane)
+                    .map_err(|recovery| Error::Other(Box::new(recovery))),
+            ),
         };
         cache.restore_state(lane);
-        let output = result.map_err(|e| Error::Speculative(e.to_string()))?;
-        restored?;
+        let output = super::finish_prediction_state_operation(
+            result.map_err(|e| Error::Other(Box::new(e))),
+            restored,
+        )?;
         Ok(self.published(output.into_array()))
     }
 
@@ -293,7 +467,7 @@ where
                     .ok_or_else(|| Error::ArchitectureModel("native control state type differs".into()))?;
                 self.session
                     .estimate_control_state_copy(saved)
-                    .map_err(|error| Error::ArchitectureModel(error.to_string()))
+                    .map_err(|error| Error::Other(Box::new(error)))
             }
         }
     }
@@ -307,7 +481,7 @@ where
         self.session
             .capture_control_state(&self.stream)
             .map(|state| Box::new(state) as Box<dyn std::any::Any>)
-            .map_err(|error| Error::ArchitectureModel(error.to_string()))
+            .map_err(|error| Error::Other(Box::new(error)))
     }
 
     fn estimate_native_control_growth(
@@ -321,7 +495,7 @@ where
             .ok_or_else(|| Error::ArchitectureModel("native control state type differs".into()))?;
         self.session
             .estimate_control_state_growth(saved, additional)
-            .map_err(|error| Error::ArchitectureModel(error.to_string()))
+            .map_err(|error| Error::Other(Box::new(error)))
     }
 
     fn copy_native_control_state(
@@ -335,7 +509,7 @@ where
         self.session
             .copy_control_state(saved, &self.stream)
             .map(|state| Box::new(state) as Box<dyn std::any::Any>)
-            .map_err(|error| Error::ArchitectureModel(error.to_string()))
+            .map_err(|error| Error::Other(Box::new(error)))
     }
 
     fn validate_native_control_state(&self, saved: &dyn std::any::Any) -> Result<(), Error> {
@@ -349,7 +523,7 @@ where
             .ok_or_else(|| Error::ArchitectureModel("native control state type differs".into()))?;
         self.session
             .validate_control_state(saved)
-            .map_err(|error| Error::ArchitectureModel(error.to_string()))
+            .map_err(|error| Error::Other(Box::new(error)))
     }
 
     fn exchange_native_control_state(&mut self, slot: &mut dyn std::any::Any) -> Result<(), Error> {
@@ -359,7 +533,7 @@ where
             .ok_or_else(|| Error::ArchitectureModel("native control state type differs".into()))?;
         self.session
             .exchange_control_state(slot, &self.stream)
-            .map_err(|error| Error::ArchitectureModel(error.to_string()))
+            .map_err(|error| Error::Other(Box::new(error)))
     }
 
     fn effective_model_type(&self) -> &str {
@@ -409,6 +583,11 @@ where
     fn has_embedded_prediction(&self) -> bool {
         P::present()
     }
+    fn speculative_activation_execution(
+        &self,
+    ) -> Option<eredu_architectures::speculative_execution::SpeculativeActivationExecution> {
+        self.prediction.activation_execution()
+    }
 
     fn install_embedded_prediction_observers(
         &mut self,
@@ -420,6 +599,17 @@ where
         } else {
             false
         }
+    }
+
+    fn take_speculative_activation_capture(
+        &mut self,
+    ) -> Option<eredu_core::speculative::SpeculativeActivationCapture> {
+        self.embedded_prediction_observers.take_activation_capture()
+    }
+    fn take_speculative_activation_error(
+        &mut self,
+    ) -> Option<eredu_core::speculative::SpeculativeControlError> {
+        self.embedded_prediction_observers.take_activation_error()
     }
 
     #[cfg(test)]
@@ -442,7 +632,7 @@ where
         self.session
             .report()
             .map(|report| report.state_report().fixed_numeric.clone())
-            .map_err(|error| Exception::custom(error.to_string()))
+            .map_err(Exception::from_source)
     }
 
     #[cfg(test)]
@@ -454,18 +644,18 @@ where
         let before_report = self
             .session
             .report()
-            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+            .map_err(|error| Error::Other(Box::new(error)))?;
         let before = before_report.state_report().presence.clone();
         let before_numeric = before_report.state_report().fixed_numeric.clone();
         let before_retained = before_report.state_report().retained_numeric.clone();
         let checkpoint = self
             .session
             .checkpoint(stream)
-            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+            .map_err(|error| Error::Other(Box::new(error)))?;
         let continuation = self
             .session
             .forward(&MlxTensor::from_array(tokens.clone()), None, stream)
-            .map_err(|error| Error::ArchitectureModel(error.to_string()))?
+            .map_err(|error| Error::Other(Box::new(error)))?
             .into_array()
             .evaluated()?
             .as_slice::<f32>()
@@ -473,16 +663,16 @@ where
         let advanced_report = self
             .session
             .report()
-            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+            .map_err(|error| Error::Other(Box::new(error)))?;
         let advanced = advanced_report.state_report().presence.clone();
         let advanced_numeric = advanced_report.state_report().fixed_numeric.clone();
         self.session
             .rollback(checkpoint, stream)
-            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+            .map_err(|error| Error::Other(Box::new(error)))?;
         let restored_report = self
             .session
             .report()
-            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+            .map_err(|error| Error::Other(Box::new(error)))?;
         let restored = restored_report.state_report().presence.clone();
         let restored_numeric = restored_report.state_report().fixed_numeric.clone();
         let restored_retained = restored_report.state_report().retained_numeric.clone();
@@ -502,14 +692,14 @@ where
         self.session
             .report()
             .map(|report| Some(report.execution_report().residency.clone()))
-            .map_err(|error| Error::ArchitectureModel(error.to_string()))
+            .map_err(|error| Error::Other(Box::new(error)))
     }
 
     fn dense_stream_report(&self) -> Result<Option<DenseDiskStreamReport>, Error> {
         self.session
             .report()
             .map(|report| report.execution_report().dense.clone())
-            .map_err(|error| Error::ArchitectureModel(error.to_string()))
+            .map_err(|error| Error::Other(Box::new(error)))
     }
 
     fn materialization_report(&self) -> Option<&eredu_runtime::WeightMaterializationReport> {
@@ -538,13 +728,13 @@ where
     fn reset_cache(&mut self) -> Result<(), Exception> {
         self.session
             .reset(&self.stream)
-            .map_err(|error| Exception::custom(error.to_string()))
+            .map_err(Exception::from_source)
     }
 
     fn reset_cache_distributed(&mut self) -> Result<(), Error> {
         self.session
             .reset_distributed(&self.stream)
-            .map_err(|error| Error::ArchitectureModel(error.to_string()))
+            .map_err(|error| Error::Other(Box::new(error)))
     }
 
     fn load_prompt_cache(
@@ -555,7 +745,7 @@ where
     ) -> Result<PromptCacheManifest, Error> {
         self.session
             .load_prompt_cache(directory, expected, prefix_token_ids, &self.stream)
-            .map_err(|error| Error::ArchitectureModel(error.to_string()))
+            .map_err(|error| Error::Other(Box::new(error)))
     }
 
     fn save_prompt_cache(
@@ -573,7 +763,7 @@ where
                 options,
                 &self.stream,
             )
-            .map_err(|error| Error::ArchitectureModel(error.to_string()))
+            .map_err(|error| Error::Other(Box::new(error)))
     }
 
     fn load_prompt_cache_distributed(
@@ -584,7 +774,7 @@ where
     ) -> Result<Option<PromptCacheManifest>, Error> {
         self.session
             .load_prompt_cache_distributed(directory, expected, prefix_token_ids, &self.stream)
-            .map_err(|error| Error::ArchitectureModel(error.to_string()))
+            .map_err(|error| Error::Other(Box::new(error)))
     }
 
     fn load_prompt_cache_for_input_distributed(
@@ -602,7 +792,7 @@ where
                 input_identity,
                 &self.stream,
             )
-            .map_err(|error| Error::ArchitectureModel(error.to_string()))
+            .map_err(|error| Error::Other(Box::new(error)))
     }
 
     fn save_prompt_cache_distributed(
@@ -620,7 +810,7 @@ where
                 options,
                 &self.stream,
             )
-            .map_err(|error| Error::ArchitectureModel(error.to_string()))
+            .map_err(|error| Error::Other(Box::new(error)))
     }
 
     fn save_prompt_cache_for_input_distributed(
@@ -640,51 +830,14 @@ where
                 input_identity,
                 &self.stream,
             )
-            .map_err(|error| Error::ArchitectureModel(error.to_string()))
+            .map_err(|error| Error::Other(Box::new(error)))
     }
 
     fn cache_residency_report(&self) -> Result<Option<CacheResidencyReport>, Exception> {
         self.session
             .report()
             .map(|report| report.state_report().residency.clone())
-            .map_err(|error| Exception::custom(error.to_string()))
-    }
-
-    fn prefill(&mut self, input: input::ModelInput<'_>, stream: &Stream) -> Result<Array, Error> {
-        #[cfg(test)]
-        crate::tests::support::path_instrumentation::forward();
-        let tokens = input::text_token_ids(input, stream).map_err(Error::before_model_mutation)?;
-        let before = self.session.successful_state_restoration_generation();
-        let output = self
-            .session
-            .prefill(&MlxTensor::from_array(tokens), None, stream)
-            .map(MlxTensor::into_array)
-            .map_err(|error| {
-                Error::after_model_call(
-                    error,
-                    before,
-                    self.session.successful_state_restoration_generation(),
-                )
-            })?;
-        Ok(self.published(output))
-    }
-
-    fn decode(&mut self, tokens: &Array, stream: &Stream) -> Result<Array, Error> {
-        #[cfg(test)]
-        crate::tests::support::path_instrumentation::forward();
-        let before = self.session.successful_state_restoration_generation();
-        let output = self
-            .session
-            .decode(&MlxTensor::from_array(tokens.clone()), stream)
-            .map(MlxTensor::into_array)
-            .map_err(|error| {
-                Error::after_model_call(
-                    error,
-                    before,
-                    self.session.successful_state_restoration_generation(),
-                )
-            })?;
-        Ok(self.published(output))
+            .map_err(Exception::from_source)
     }
 
     #[cfg(test)]
@@ -693,7 +846,7 @@ where
         tokens: &Array,
         mask: Option<&Array>,
         stream: &Stream,
-        observer: &mut dyn eredu_runtime::ActivationObserver<Array, Exception>,
+        observer: &mut dyn eredu_runtime::ActivationObserver<Array, Error>,
     ) -> Result<Array, Error> {
         #[cfg(test)]
         crate::tests::support::path_instrumentation::forward();
@@ -706,7 +859,7 @@ where
             .forward_with_observer(&tokens, mask.as_ref(), stream, &mut observer)
             .map(MlxTensor::into_array)
             .map_err(|error| {
-                Error::after_model_call(
+                Error::after_replicated_model_call(
                     error,
                     before,
                     self.session.successful_state_restoration_generation(),
@@ -715,26 +868,52 @@ where
         Ok(self.published(output))
     }
 
-    fn prefill_with_observer(
+    fn prefill_result_with_observer(
         &mut self,
-        input: input::ModelInput<'_>,
+        input: Result<input::ModelInput<'_>, Error>,
         mask: Option<&Array>,
+        capture_geometry: Option<eredu_core::capture::CaptureRequestShape>,
         stream: &Stream,
-        observer: &mut dyn eredu_runtime::ActivationObserver<Array, Exception>,
+        observer: &mut dyn eredu_runtime::ActivationObserver<Array, Error>,
     ) -> Result<Array, Error> {
-        #[cfg(test)]
-        crate::tests::support::path_instrumentation::forward();
-        let tokens = input::text_token_ids(input, stream).map_err(Error::before_model_mutation)?;
-        let tokens = MlxTensor::from_array(tokens.clone());
+        let tokens = input
+            .and_then(|input| input::text_token_ids(input, stream).map_err(Error::from))
+            .and_then(|tokens| {
+                if let Some(request) = capture_geometry {
+                    let shape = tokens.shape();
+                    let [batch, sequence] = shape else {
+                        return Err(Error::ArchitectureModel(
+                            "prepared text input must have batch and sequence axes".into(),
+                        ));
+                    };
+                    let batch =
+                        u64::try_from(*batch).map_err(|error| Error::Other(Box::new(error)))?;
+                    let sequence =
+                        u64::try_from(*sequence).map_err(|error| Error::Other(Box::new(error)))?;
+                    request
+                        .validate_prefill(batch, sequence)
+                        .map_err(eredu_nn::Error::backend_source)?;
+                }
+                Ok(tokens)
+            })
+            .map(MlxTensor::from_array);
         let mask = mask.cloned().map(MlxTensor::from_array);
+        let input = match tokens {
+            Ok(ref tokens) => Ok(A::text_input(tokens, mask.as_ref())),
+            Err(error) => Err(eredu_nn::Error::backend_source(error)),
+        };
+        #[cfg(test)]
+        if input.is_ok() {
+            crate::tests::support::path_instrumentation::forward();
+        }
         let mut observer = crate::composition::NeutralActivationObserver::new(observer);
         let before = self.session.successful_state_restoration_generation();
         let output = self
             .session
-            .prefill_with_observer(&tokens, mask.as_ref(), stream, &mut observer)
+            .prefill_input_result_with_observer(input, None, stream, &mut observer)
             .map(MlxTensor::into_array)
             .map_err(|error| {
-                Error::after_model_call(
+                Error::after_replicated_model_call(
                     error,
                     before,
                     self.session.successful_state_restoration_generation(),
@@ -743,23 +922,29 @@ where
         Ok(self.published(output))
     }
 
-    fn decode_with_observer(
+    fn decode_result_with_observer(
         &mut self,
-        tokens: &Array,
+        tokens: Result<&Array, Error>,
         stream: &Stream,
-        observer: &mut dyn eredu_runtime::ActivationObserver<Array, Exception>,
+        observer: &mut dyn eredu_runtime::ActivationObserver<Array, Error>,
     ) -> Result<Array, Error> {
+        let tokens = tokens.map(|tokens| MlxTensor::from_array(tokens.clone()));
+        let input = match tokens {
+            Ok(ref tokens) => Ok(A::text_input(tokens, None)),
+            Err(error) => Err(eredu_nn::Error::backend_source(error)),
+        };
         #[cfg(test)]
-        crate::tests::support::path_instrumentation::forward();
-        let tokens = MlxTensor::from_array(tokens.clone());
+        if input.is_ok() {
+            crate::tests::support::path_instrumentation::forward();
+        }
         let mut observer = crate::composition::NeutralActivationObserver::new(observer);
         let before = self.session.successful_state_restoration_generation();
         let output = self
             .session
-            .decode_with_observer(&tokens, stream, &mut observer)
+            .decode_input_result_with_observer(input, stream, &mut observer)
             .map(MlxTensor::into_array)
             .map_err(|error| {
-                Error::after_model_call(
+                Error::after_replicated_model_call(
                     error,
                     before,
                     self.session.successful_state_restoration_generation(),

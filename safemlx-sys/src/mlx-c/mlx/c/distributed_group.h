@@ -51,6 +51,11 @@ int mlx_distributed_group_rank(mlx_distributed_group group);
  */
 int mlx_distributed_group_size(mlx_distributed_group group);
 
+/** Get the native communicator's selected transport stream. */
+int mlx_distributed_group_communication_stream(
+    mlx_stream* res,
+    mlx_distributed_group group);
+
 /**
  * Split the group.
  */

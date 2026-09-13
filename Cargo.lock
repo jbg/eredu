@@ -540,6 +540,7 @@ dependencies = [
  "eredu-backend-mlx",
  "eredu-checkpoint",
  "eredu-core",
+ "eredu-evaluation",
  "eredu-gguf",
  "eredu-runtime",
  "eredu-text",

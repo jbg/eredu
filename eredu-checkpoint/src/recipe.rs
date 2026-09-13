@@ -1431,6 +1431,18 @@ fn push_selection<C: RecipeCatalog + ?Sized>(
             {
                 return Ok(DerivedWeightRecipe::source(key.clone(), contiguous));
             }
+            // Keep the leading-axis restriction closest to the physical source.
+            // Later row tiles can then combine with an expert/member restriction
+            // before any independent column selection is applied.
+            let (source_selection, selection) = match (
+                selection_axis(&source_selection),
+                selection_axis(&selection),
+            ) {
+                (Some(existing), Some(requested)) if requested < existing => {
+                    (selection, source_selection)
+                }
+                _ => (source_selection, selection),
+            };
             Ok(DerivedWeightRecipe::Select {
                 input: Box::new(DerivedWeightRecipe::source(key.clone(), source_selection)),
                 selection,
@@ -1450,12 +1462,28 @@ fn push_selection<C: RecipeCatalog + ?Sized>(
                     compose_same_axis_selection(existing, &selection)?,
                 );
             }
-            // Independent axis selections commute. Push the newest selection
-            // toward the source first so a dynamic row tile can combine with
-            // an expert range into one contiguous checkpoint span before the
-            // pre-existing TP column selection is reapplied.
-            let selected_input = push_selection(input, store, selection)?;
-            push_selection(&selected_input, store, existing.clone())
+            // Independent axes commute. Push the lower axis first so member and
+            // row restrictions can form a contiguous span before selecting columns.
+            let (inner, outer) = match (selection_axis(existing), selection_axis(&selection)) {
+                (Some(existing_axis), Some(requested_axis)) if existing_axis < requested_axis => {
+                    (existing.clone(), selection)
+                }
+                _ => (selection, existing.clone()),
+            };
+            let selected_input = push_selection(input, store, inner)?;
+            if matches!(selected_input, DerivedWeightRecipe::Source { .. }) {
+                // Source composition cannot recurse into another Select. Collapse
+                // the outer range too when the inner restriction made it contiguous.
+                push_selection(&selected_input, store, outer)
+            } else {
+                // Do not recurse into the newly produced tree: noncontiguous axes
+                // could otherwise swap indefinitely. Recursive work above always
+                // descends into the original, strictly smaller input recipe.
+                Ok(DerivedWeightRecipe::Select {
+                    input: Box::new(selected_input),
+                    selection: outer,
+                })
+            }
         }
         DerivedWeightRecipe::Concatenate { axis, inputs } => {
             push_concatenate_selection(*axis, inputs, store, selection)
@@ -2178,6 +2206,146 @@ mod tests {
 
     struct Catalog;
     struct Lease;
+
+    #[test]
+    fn independent_member_row_and_column_selections_terminate_and_preserve_values() {
+        struct BankCatalog;
+        impl RecipeCatalog for BankCatalog {
+            fn tensor_metadata(&self, key: &str) -> Result<TensorMetadata, StoreError> {
+                Ok(TensorMetadata {
+                    name: key.into(),
+                    logical_shape: vec![2, 3, 4],
+                    physical_shape: vec![2, 3, 4],
+                    stored_dtype: StoredDtype::F32,
+                    encoded_byte_len: 96,
+                    backing_shard: None,
+                })
+            }
+        }
+        fn select(
+            shape: Vec<usize>,
+            values: Vec<usize>,
+            selection: &TensorSelection,
+        ) -> (Vec<usize>, Vec<usize>) {
+            match selection {
+                TensorSelection::Full => (shape, values),
+                TensorSelection::Range { axis, start, end } => {
+                    let stride: usize = shape[axis + 1..].iter().product();
+                    let output = values
+                        .into_iter()
+                        .enumerate()
+                        .filter_map(|(index, value)| {
+                            let coordinate = index / stride % shape[*axis];
+                            (*start <= coordinate && coordinate < *end).then_some(value)
+                        })
+                        .collect();
+                    let mut shape = shape;
+                    shape[*axis] = end - start;
+                    (shape, output)
+                }
+                TensorSelection::Contiguous {
+                    offset_elements,
+                    shape,
+                } => {
+                    let count: usize = shape.iter().product();
+                    (
+                        shape.clone(),
+                        values[*offset_elements..*offset_elements + count].to_vec(),
+                    )
+                }
+                _ => panic!("unexpected selection in range fixture"),
+            }
+        }
+        fn evaluate(
+            recipe: &DerivedWeightRecipe,
+            source_elements: &mut usize,
+        ) -> (Vec<usize>, Vec<usize>) {
+            match recipe {
+                DerivedWeightRecipe::Source { selection, .. } => {
+                    let result = select(vec![2, 3, 4], (0..24).collect(), selection);
+                    *source_elements += result.1.len();
+                    result
+                }
+                DerivedWeightRecipe::Select { input, selection } => {
+                    let (shape, values) = evaluate(input, source_elements);
+                    select(shape, values, selection)
+                }
+                _ => panic!("unexpected operation in range fixture"),
+            }
+        }
+        for order in [
+            [0, 1, 2],
+            [0, 2, 1],
+            [1, 0, 2],
+            [1, 2, 0],
+            [2, 0, 1],
+            [2, 1, 0],
+        ] {
+            let mut recipe = DerivedWeightRecipe::source("bank", TensorSelection::Full);
+            for axis in order {
+                recipe = recipe
+                    .select_bounded(
+                        &BankCatalog,
+                        TensorSelection::Range {
+                            axis,
+                            start: 1,
+                            end: if axis == 0 { 2 } else { 3 },
+                        },
+                    )
+                    .unwrap();
+            }
+            let mut source_elements = 0;
+            assert_eq!(
+                evaluate(&recipe, &mut source_elements),
+                (vec![1, 2, 2], vec![17, 18, 21, 22]),
+                "{order:?}"
+            );
+            assert!(
+                source_elements <= 8,
+                "row tiles must bound source reads: {order:?}: {recipe:?}"
+            );
+            let mut scalar = DerivedWeightRecipe::source("bank", TensorSelection::Full);
+            for axis in order {
+                scalar = scalar
+                    .select_bounded(
+                        &BankCatalog,
+                        TensorSelection::Range {
+                            axis,
+                            start: 1,
+                            end: 2,
+                        },
+                    )
+                    .unwrap();
+            }
+            let mut source_elements = 0;
+            assert_eq!(
+                evaluate(&scalar, &mut source_elements),
+                (vec![1, 1, 1], vec![17]),
+                "{order:?}"
+            );
+            assert_eq!(
+                source_elements, 1,
+                "a contiguous scalar must read only its source value: {order:?}: {scalar:?}"
+            );
+        }
+        let columns = DerivedWeightRecipe::source(
+            "bank",
+            TensorSelection::Range {
+                axis: 2,
+                start: 1,
+                end: 3,
+            },
+        );
+        let tile = columns
+            .select_bounded_matrix_rows(&BankCatalog, 1, 1, 3)
+            .unwrap();
+        let mut source_elements = 0;
+        assert_eq!(
+            evaluate(&tile, &mut source_elements),
+            (vec![1, 2, 2], vec![17, 18, 21, 22])
+        );
+        assert!(source_elements <= 8);
+    }
 
     #[test]
     fn distinct_recipe_validators_run_once_even_on_failure_and_under_concurrency() {

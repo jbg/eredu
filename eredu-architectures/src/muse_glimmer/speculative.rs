@@ -834,12 +834,21 @@ impl<M: ExternalMechanisms> SpeculativeExecutor for ExternalExecutor<'_, M> {
         cache: &Self::Cache,
         state: &Self::TargetState,
         context: Self::Context<'a>,
-    ) -> Result<Option<(Self::CacheCheckpoint, Self::TargetState)>, Self::Error> {
+    ) -> Result<
+        Option<(Self::CacheCheckpoint, Self::TargetState)>,
+        eredu_core::speculative::SpeculativeControlError,
+    > {
         if self.control_snapshot_estimate(cache, state).is_none() {
             return Ok(None);
         }
-        let state = state.map(|t, placement| M::control_copy_tensor(t, placement, context))?;
-        Ok(Some((M::control_checkpoint(cache, context)?, state)))
+        let state = state
+            .map(|t, placement| M::control_copy_tensor(t, placement, context))
+            .map_err(eredu_core::speculative::SpeculativeControlError::backend)?;
+        Ok(Some((
+            M::control_checkpoint(cache, context)
+                .map_err(eredu_core::speculative::SpeculativeControlError::backend)?,
+            state,
+        )))
     }
     fn restore_control_snapshot<'a>(
         &mut self,
@@ -847,9 +856,12 @@ impl<M: ExternalMechanisms> SpeculativeExecutor for ExternalExecutor<'_, M> {
         saved: &Self::CacheCheckpoint,
         state: &Self::TargetState,
         context: Self::Context<'a>,
-    ) -> Result<Option<Self::TargetState>, Self::Error> {
-        let state = state.map(|t, placement| M::control_copy_tensor(t, placement, context))?;
-        M::control_restore(cache, saved, context)?;
+    ) -> Result<Option<Self::TargetState>, eredu_core::speculative::SpeculativeControlError> {
+        let state = state
+            .map(|t, placement| M::control_copy_tensor(t, placement, context))
+            .map_err(eredu_core::speculative::SpeculativeControlError::backend)?;
+        M::control_restore(cache, saved, context)
+            .map_err(eredu_core::speculative::SpeculativeControlError::backend)?;
         Ok(Some(state))
     }
 

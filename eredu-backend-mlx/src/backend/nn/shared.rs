@@ -34,7 +34,7 @@ use eredu_runtime::{
 };
 use ref_cast::RefCast;
 use safemlx::ops::{
-    arange, argpartition_axis, broadcast_to, clip, concatenate_axis, einsum,
+    arange, argpartition_axis, broadcast_to, concatenate_axis, einsum,
     indexing::{take_along_axis, NewAxis, TryIndexOp},
     matmul, maximum, r#where, sigmoid, softmax_axis, zeros_dtype,
 };

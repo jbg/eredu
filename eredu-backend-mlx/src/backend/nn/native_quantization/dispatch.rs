@@ -1,6 +1,38 @@
 use super::*;
 use super::{decode::*, kernels::*, storage::*};
 
+/// Applies retained GGUF storage or its admitted floating replacement.
+/// The caller supplies the logical bank geometry independently of byte layout.
+pub fn native_grouped_linear_from_array(
+    input: &Array,
+    weight: &Array,
+    shape: &[i32; 3],
+    ty: GgmlType,
+    endian: GgufEndian,
+    group_ids: &Array,
+    stream: &Stream,
+) -> Result<Array, Exception> {
+    if matches!(
+        weight.dtype(),
+        Dtype::Float32 | Dtype::Float16 | Dtype::Bfloat16
+    ) {
+        if weight.shape() != shape {
+            return Err(Exception::custom(
+                "floating GGUF group replacement geometry mismatch",
+            ));
+        }
+        return crate::backend::nn::grouping::grouped_matmul(
+            input,
+            &weight.swap_axes(-1, -2, stream)?,
+            group_ids,
+            true,
+            stream,
+        );
+    }
+    let native = NativeQuantizedTensor::from_iq_array(weight.clone(), shape, ty, endian)?;
+    native_grouped_linear(input, &native, group_ids, stream)
+}
+
 /// Applies an group-major native quantized matrix bank.
 pub fn native_grouped_linear(
     input: &Array,
@@ -22,13 +54,13 @@ pub fn native_grouped_linear(
     }
     if native_execution_backend(stream)? == NativeExecutionBackend::Metal {
         return match weight.format() {
-            NativeQuantizationFormat::GgufQ4K => {
+            NativeQuantizationFormat::GgufQ4K if weight.storage.endian == GgufEndian::Little => {
                 q4k_grouped_metal(input, weight, group_ids, stream)
             }
-            NativeQuantizationFormat::GgufQ5_1 => {
+            NativeQuantizationFormat::GgufQ5_1 if weight.storage.endian == GgufEndian::Little => {
                 q5_1_grouped_metal(input, weight, group_ids, stream)
             }
-            NativeQuantizationFormat::GgufQ8_0 => {
+            NativeQuantizationFormat::GgufQ8_0 if weight.storage.endian == GgufEndian::Little => {
                 q8_0_grouped_metal(input, weight, group_ids, stream)
             }
             _ => iq_grouped_metal(input, weight, group_ids, stream),

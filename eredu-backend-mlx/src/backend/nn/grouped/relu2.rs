@@ -181,18 +181,32 @@ impl PackedRelu2Groups {
         top_k_weights: &Array,
         stream: &Stream,
     ) -> Result<Array, Exception> {
+        self.forward_with_unit_observer(hidden_states, top_k_index, top_k_weights, stream, None)
+    }
+
+    /// Executes with the actual selected ReLU-squared units before down projection.
+    pub(crate) fn forward_with_unit_observer(
+        &mut self,
+        hidden_states: &Array,
+        top_k_index: &Array,
+        top_k_weights: &Array,
+        stream: &Stream,
+        mut observer: Option<&mut dyn NativeGroupedUnitObserver>,
+    ) -> Result<Array, Exception> {
         let num_tokens = hidden_states.dim(0);
         let plan = topk_group_plan(top_k_index, stream)?;
         let hidden = gather_grouped_rows(hidden_states, &plan, stream)?;
         let hidden = if let Some(iquant) = self.up_iquant {
             let (ggml_type, endian) = iquant.gguf_iquant().expect("IQ group format");
-            let native = NativeQuantizedTensor::from_iq_array(
-                self.up_proj.value.clone(),
+            native_grouped_linear_from_array(
+                &hidden,
+                self.up_proj.as_ref(),
                 &[self.group_count, self.intermediate_size, self.hidden_size],
                 ggml_type,
                 endian,
-            )?;
-            native_grouped_linear(&hidden, &native, &plan.sorted_group_ids, stream)?
+                &plan.sorted_group_ids,
+                stream,
+            )?
         } else {
             match self.up_quantization {
                 Some(quantization) => packed_grouped_linear(
@@ -216,16 +230,26 @@ impl PackedRelu2Groups {
                 )?,
             }
         };
-        let hidden = relu2(hidden, stream)?;
+        let hidden = observe_units(
+            relu2(hidden, stream)?,
+            &plan,
+            top_k_weights,
+            0,
+            num_tokens as usize,
+            self.group_count as usize,
+            &mut observer,
+        )?;
         let current = if let Some(iquant) = self.down_iquant {
             let (ggml_type, endian) = iquant.gguf_iquant().expect("IQ group format");
-            let native = NativeQuantizedTensor::from_iq_array(
-                self.down_proj.value.clone(),
+            native_grouped_linear_from_array(
+                &hidden,
+                self.down_proj.as_ref(),
                 &[self.group_count, self.hidden_size, self.intermediate_size],
                 ggml_type,
                 endian,
-            )?;
-            native_grouped_linear(&hidden, &native, &plan.sorted_group_ids, stream)?
+                &plan.sorted_group_ids,
+                stream,
+            )?
         } else {
             match self.down_quantization {
                 Some(quantization) => packed_grouped_linear(
@@ -268,12 +292,32 @@ impl PackedRelu2Groups {
         partitions: usize,
         stream: &Stream,
     ) -> Result<TensorParallelGroupedOutput<Array>, Exception> {
+        self.forward_tensor_parallel_with_unit_observer(
+            hidden_states,
+            top_k_index,
+            top_k_weights,
+            partitions,
+            stream,
+            None,
+        )
+    }
+
+    /// Exposes rank-local ReLU-squared units without changing reduction ownership.
+    pub(crate) fn forward_tensor_parallel_with_unit_observer(
+        &mut self,
+        hidden_states: &Array,
+        top_k_index: &Array,
+        top_k_weights: &Array,
+        partitions: usize,
+        stream: &Stream,
+        observer: Option<&mut dyn NativeGroupedUnitObserver>,
+    ) -> Result<TensorParallelGroupedOutput<Array>, Exception> {
         if partitions == 0 {
             return Err(Exception::custom(
                 "tensor-parallel partition count must be positive",
             ));
         }
-        self.forward(hidden_states, top_k_index, top_k_weights, stream)
+        self.forward_with_unit_observer(hidden_states, top_k_index, top_k_weights, stream, observer)
             .map(|reducible| TensorParallelGroupedOutput::new(reducible, None))
     }
 }

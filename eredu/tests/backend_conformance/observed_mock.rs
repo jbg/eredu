@@ -83,6 +83,78 @@ pub(super) fn validate(plan: &AdmittedCapturePlan) -> Result<(), CaptureError> {
 }
 
 struct Mechanism;
+
+struct SpeculativeProvider;
+impl eredu_runtime::capture::CaptureBackendProvider for SpeculativeProvider {
+    type Tensor = Value;
+    type Error = MockError;
+    type Backend<'a> = Mechanism;
+    fn backend(&mut self) -> Mechanism {
+        Mechanism
+    }
+}
+
+type InternalObserver = eredu_runtime::capture::SpeculativeCaptureObserver<
+    SpeculativeProvider,
+    fn(&eredu_runtime::capture::CaptureExecutionError<MockError>) -> MockError,
+>;
+
+pub(super) struct InternalCapture(InternalObserver);
+impl InternalCapture {
+    pub fn new(
+        plan: &eredu_core::speculative::AdmittedSpeculativeActivations,
+        request: eredu_core::SpeculativeRequestId,
+    ) -> Result<Option<Self>, CaptureError> {
+        fn error(error: &eredu_runtime::capture::CaptureExecutionError<MockError>) -> MockError {
+            MockError::Capture(error.to_string())
+        }
+        Ok(
+            eredu_runtime::capture::SpeculativeCaptureObserver::from_admitted(
+                plan,
+                SpeculativeProvider,
+                error as fn(&eredu_runtime::capture::CaptureExecutionError<MockError>) -> MockError,
+                request,
+                std::sync::Arc::new(Estimates),
+            )?
+            .map(Self),
+        )
+    }
+    pub fn origin(&mut self, origin: Option<eredu_core::speculative::SpeculativeActivationOrigin>) {
+        use eredu_runtime::inspection::SpeculativeActivationObserver;
+        self.0.set_activation_origin(origin);
+    }
+    pub fn take(&mut self) -> Option<eredu_core::speculative::SpeculativeActivationCapture> {
+        use eredu_runtime::inspection::SpeculativeActivationObserver;
+        self.0.take_activation_capture()
+    }
+    pub fn error(&mut self) -> Option<eredu_core::speculative::SpeculativeControlError> {
+        use eredu_runtime::inspection::SpeculativeActivationObserver;
+        self.0.take_activation_error()
+    }
+    pub fn run(
+        &mut self,
+        phase: eredu_core::speculative::SpeculativeActivationPhase,
+        sequence: usize,
+    ) -> Result<f32, MockError> {
+        eredu_runtime::inspection::with_speculative_activation(
+            Some(&mut self.0),
+            phase,
+            sequence,
+            |observer| {
+                let value = Value {
+                    shape: vec![1, sequence as u64, 1],
+                    scale: 1.0,
+                };
+                eredu_runtime::observe_and_intervene(
+                    observer.unwrap(),
+                    eredu_core::MODEL_LOGITS_OBSERVATION_PATH,
+                    &value,
+                )
+                .map(|value| value.scale)
+            },
+        )
+    }
+}
 #[derive(Clone)]
 struct Value {
     shape: Vec<u64>,
@@ -164,6 +236,12 @@ impl State {
 }
 
 impl InterventionBackend for Mechanism {
+    fn mask_components(&mut self, _: &Value, _: &[u32], _: bool) -> Result<Value, MockError> {
+        Err(MockError::Capture(
+            "mock does not advertise component masks".into(),
+        ))
+    }
+
     fn intervention_dtype(&self, _: &Value) -> Result<InterventionDtype, MockError> {
         Ok(InterventionDtype::Float32)
     }
@@ -226,6 +304,33 @@ impl InterventionBackend for Mechanism {
 
 pub(super) struct Estimates;
 impl InterventionEstimator for Estimates {
+    fn activation_usage(
+        &self,
+        source: &[u64],
+        slice: &ResolvedCaptureSlice,
+        _: &InterventionAction,
+    ) -> Result<CaptureUsage, CaptureError> {
+        let elements = |shape: &[u64]| {
+            shape
+                .iter()
+                .try_fold(1u64, |n, d| n.checked_mul(*d).ok_or(CaptureError::Overflow))
+        };
+        let bytes = elements(source)?
+            .checked_add(
+                elements(&slice.shape)?
+                    .checked_mul(3)
+                    .ok_or(CaptureError::Overflow)?,
+            )
+            .and_then(|n| n.checked_mul(8))
+            .ok_or(CaptureError::Overflow)?;
+        Ok(CaptureUsage {
+            captures: 0,
+            retained_bytes: bytes,
+            host_bytes: bytes,
+            encoded_bytes: 0,
+        })
+    }
+
     fn validate_geometry(&self, _: &[u64], _: &ResolvedCaptureSlice) -> Result<(), CaptureError> {
         Ok(())
     }
@@ -265,6 +370,7 @@ pub(super) fn intervention_discovery(session: &str) -> InterventionDiscovery {
             prefill: eredu_core::ObservationSupportStatus::Supported,
             decode: eredu_core::ObservationSupportStatus::Supported,
             conditions: vec![],
+            routed_units: None,
             routing: None,
         }],
     }

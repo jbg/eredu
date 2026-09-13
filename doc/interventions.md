@@ -4,8 +4,11 @@
 returns versioned mutable targets for the actual loaded session. These are separate
 from architecture nodes and read-only observations. Each target joins an existing
 node identity, declares an execution stage, semantic axes, exact supported dtypes,
-operations, and prefill/decode support. Unverified, conditional, and unsupported
-phases cannot be admitted as supported phases.
+operations, and prefill/decode support. Unverified and unsupported phases cannot
+be admitted. Conditional phases may be selected while retaining their stated
+input or execution condition. Every scheduled intervention must execute before
+prediction commitment; an absent conditional target retains a `Missing` outcome
+and fails the attempt through the ordinary state-recovery driver.
 
 Call `prepare_intervened_chat(chat, settings, capture, intervention, trace_limits)`
 and pass its result to the existing `generate_observed_chat`. The returned
@@ -47,7 +50,12 @@ summary cannot stand in for a complete replacement. Float32 payloads use finite
 numbers; float16 and bfloat16 payloads use finite exact 16-bit representations.
 The plan dtype must equal the actual value's dtype; mismatches fail before a
 replacement is constructed. A backend can support several dtypes while the actual
-point dtype remains request-dependent. Scalar scaling uses native dtype rounding;
+point dtype remains request-dependent. Use `CaptureRecord.source_dtype` from the
+relevant parameter version to distinguish actual precision from host export
+precision; BF16 source values can be exported as F32 numbers. A packed-to-F32
+parameter overlay can promote component precision, so refresh that evidence before
+admitting a new exact-dtype action. Unknown precision is not an F32 assumption.
+Scalar scaling uses native dtype rounding;
 its input must be finite and representable. Arithmetic otherwise follows the
 native dtype's ordinary floating-point rules.
 
@@ -57,6 +65,70 @@ constraints, penalties, temperature, top-k/p and other processing. Replacement
 logits are returned to that same sampler. Interventions introduce no sampler or
 random draws. Independent sampler constraints can still reject a distribution
 with no eligible token.
+
+## Sparse expert-unit edits
+
+Loaded targets with `routed_units: Some(...)` use a virtual `[token, component]`
+shape. The component index is `expert * units_per_expert + unit`, checked by
+`RoutedComponentGroup::component_index`. This is a stable global expert/unit
+identity, independent of the current route slots. `MaskComponents` accepts compact
+arbitrary deletion or keep-only sets across this axis. Token slices select explicit
+flattened positions; separate schedules select prefill and decode predictions.
+Use the shorter set or its complement for large masks. An empty deletion set is
+an all-keep no-op and avoids enumerating every expert unit.
+
+Zero, Scale, Mask, Replace and Add use the same native-dtype semantics as ordinary
+activation edits. Region payloads have the exact selected virtual shape, and only
+entries for participating experts are gathered. An absent expert does not acquire
+an activation. Duplicate expert slots each receive the edit. Keep-only survivors
+are recomputed in the current forward, so earlier layer edits can change their
+values and routing. All operations run before expert down projection and route
+weighting, with optional projection input quantization occurring afterward.
+
+The runtime reserves the whole invocation before reading route metadata or
+gathering values. It charges participating storage and copies, not a fictional
+expert-dense tensor. Operations compose in plan order within each native chunk.
+`InterventionRecord.routed_units` reports full and completed token counts and the
+number of actual values addressed; compact masks count removed values.
+`Unmatched` means the invocation completed without an addressed value, including
+all-keep masks. `Missing` and `Failed` never establish successful chunk completion.
+
+Use `InterventionEvidence::None` together with bounded original and effective
+`CaptureTransform::RoutedUnits` selections for attributed evidence. Ordinary dense
+Preview/Summary operation evidence cannot describe sparse expert participation and
+is rejected at these points. Captures use `[token, route, per_expert_component]`,
+which deliberately differs from the edit plan's virtual global component axis.
+The original capture is before all edits at the boundary; the effective capture
+is after all edits. Per-operation sparse evidence is not currently exposed.
+
+Ordinary and controlled execution share this driver, including re-admission,
+replay, snapshots, forks and cumulative accounting. Loaded partitioned execution
+uses the same admitted operation plan when discovery verifies its sparse provider
+hooks, retained ownership and exact native invocation-group transport.
+
+Low-level distributed owners can use `RoutedComponentCoordinateMap` and
+`lower_partition_routed_intervention` to lower current participating rows across
+unit shards and source peers. The recipe preserves selected global token/component
+payload coordinates, including exact half-precision bits, and returns local flat
+indices only. A successful recipe does not prove complete route coverage or grant
+budget, peer, transport or commit authority. `SessionPartitionIntervention` supplies
+that authority through the existing partition session. Preparation reserves native
+work, coordinate copies, source/output completion, two invocation votes and global
+outcome delivery before model work. It validates complete expert/unit ownership;
+replicas execute every edit while logical affected counts are reported once.
+Every received source peer is edited before reverse expert exchange, including
+peers whose rows are not exported in the public capture.
+
+The shared observer applies operations in plan order to the current native chunk.
+Source geometry is agreed before work, and all members must finish their chunks
+before the final vote permits reverse exchange. Idle owners explicitly complete
+the invocation. Global `Applied` or `Unmatched` outcomes publish only when the
+ordinary distributed forward commits. Malformed chunks, missing invocations and
+local failures cannot produce successful receipts. Operations also work without
+sparse captures; separate original/effective captures remain the evidence API.
+Selected pipeline-stage groups include every tensor/expert replica. Their connected
+Ring status reduction uses bounded native completion, including intermediate sends.
+Disconnected native groups still need coordinated relay support.
 
 ## Routing stages and ownership
 
@@ -99,9 +171,12 @@ The initial routing declarations cover ordinary Qwen3-MoE and text-only Qwen hyb
 because they emit routing observations. Partitioned, speculative, media and
 realtime intervention combinations are outside this protocol. Activation coverage
 follows genuine declared activation hooks and their loaded-session support.
-The text entry point requires one token-ID prompt with the admitted batch and
-prompt length; the facade constructs it. Embedded-tensor or multipart prompts
-are rejected before a native submission.
+Controlled capture validates the architecture-admitted decoder batch and prompt
+length before model execution. For a prepared composite prompt, this is the
+assembled sequence after media projection and merging, including its placeholder
+positions. The ordinary architecture and processor admission still validates
+multipart and embedded-tensor inputs. A mismatched capture request fails through
+the same prepared-input result path without advancing model state.
 
 ## Evidence, budgets and state
 
@@ -141,8 +216,10 @@ skips the unused ordinary score transform in that case.
 
 `TraceLimits` additionally bounds the complete serialized facade
 stream. Even a plan with no ordinary captures needs capture budgets for intervention
-metadata and requested evidence. The hard plan limits are 64 operations, 512 KiB of
-payload storage, and 1 MiB of compact JSON. Preview evidence has at most 4096 elements
+metadata and requested evidence. The hard plan limits are 1024 operations, 32 MiB of
+payload storage, and 64 MiB of compact JSON. This admits complete component-index
+sets for 128 layers with 32768 FFN units and 8192 attention channels per layer;
+execution and transport reservations remain independently required. Preview evidence has at most 4096 elements
 per side/field. These are logical accounting limits, not a physical allocator cap.
 
 Plans apply prospectively. They never retroactively recompute cached KV or recurrent
@@ -152,6 +229,13 @@ snapshots are not supported. A failed forward can already have changed state eve
 when the particular failing intervention did not apply. The existing rollback,
 reset, poisoning and retained-native-completion rules govern reuse. Cancellation,
 consumer `Break`, early drop and unwinding keep the ordinary completion owner.
+
+Routed provider failure agreement runs independently of capture and intervention
+selection. Disabling masks or unit observations therefore preserves the same
+execution votes, including participation by idle experts and inactive pipeline
+stages. An agreed provider rejection prevents later model collectives; it does not
+establish native completion or successful intervention evidence. Applied outcomes
+still require the shared forward commit.
 
 LM Inspector should display controls from intervention discovery, join targets to
 node identities, and expose only supported operations/stages/phases. Keep schedule
@@ -194,6 +278,14 @@ and integrates the shared run with its existing submission lifecycle:
    hooks. Supply only native primitives and typed error conversion to the observer.
    Keep opaque prompt inspection, native completion retention, cancellation and
    recovery in the backend's existing owner.
+
+Ordinary MLX capture and intervention observers carry structured backend errors
+through native and neural adapters. Portable admission errors remain typed causes
+of the facade's neutral `BackendFailure`; native exceptions retain their original
+message and creation location. Bounded failure records still contain bounded text,
+and consumed reservations are not refunded by restore. The error source does not
+replace the existing completion and state-recovery checks. See
+[the observation error evidence](component-validation.md#observation-error-causes).
 
 A new model family declares its genuine hooks and ordinary selector policy in
 `eredu-architectures`; these drivers do not require a new action implementation for
@@ -246,3 +338,175 @@ Pass the actual activation dtype (`f32`, `f16`, or `bf16`). Discovery lists nati
 mechanism dtypes; runtime-dependent exact dtype constraints remain checked at the
 hook. The example intentionally changes only prediction zero and its final prompt
 row. It uses the same ordinary sampling settings and seed for both experiments.
+
+
+Component boundaries additionally support `MaskComponents`: a compact list of
+unique indices and a keep-only/deletion flag over the complete final `component`
+axis. Explicit token-row slices are independent of prediction schedules. Surviving
+values are recomputed in the current forward. Activation-edit storage and host
+uploads are now reserved via `InterventionEstimator::activation_usage` before
+native work, in addition to evidence and diagnostic charges. See
+[component analysis](component-analysis.md) for the API and current coverage.
+
+For partition drivers, `intervention::localize_component_mask` translates this
+action through an architecture-derived `ComponentCoordinateMap`. It validates
+global identities before filtering local indices and preserves the explicit token
+region. Empty local keep sets zero every local component; empty delete sets leave
+them unchanged. The helper performs no native work and does not replace admitted
+resource reservations or distributed agreement. The shared partition observer now
+composes these operations with live session authority and global agreement.
+
+Nemotron-H target execution uses this path for dense/shared ReLU² units and attention
+channels, alongside the sparse expert-unit driver. Native deletion, keep-only,
+ordered edits and controlled replay are verified across SafeTensors/GGUF and all
+seven TP/EP/PP combinations in each residency mode. See
+[the family validation](component-validation.md#nemotron-h-partition-component-execution)
+for exact scope and tolerances. Shared-unit edits occur before down projection;
+shared-input edits affect only that branch, and effective shared writes feed the
+sparse sum. The [shared-expert extension](component-validation.md#shared-expert-scalar-extension)
+documents its parameter joins and position-specific keep-only reconstruction.
+
+The preparation layer also exposes `PartitionActivationProjection` and
+`ReservedPartitionActivation`. It preserves global admission, projects arbitrary
+positive-stride selections and payloads through architecture coordinates, charges
+host copies before projection, and reserves native updates before execution. Zero,
+Scale, Mask, Replace, Add and compact component/logit masks use the same activation
+mechanism as ordinary runs. F16/BF16 payload projection preserves bit patterns.
+An empty local overlap acknowledges the invocation without creating a zero tensor;
+nonexporting replicas still apply edits. Dropping or failing prepared work does not
+refund its charges.
+
+`AdmittedInterventionPlan::intent_identity()` lets peers compare exact operations,
+semantic declarations, request geometry and source while retaining distinct local
+session-bound `identity()` values. It is descriptive and grants no execution or
+branch authority. `SessionPartitionIntervention` binds prepared work to the live
+capture owner, exact admission and forward epoch. Pre-forward agreement includes
+intent, ordered coordinate maps, source geometry, invocation membership and all
+prepaid costs. Replicas apply the operation; inactive pipeline ranks do not enter
+its hook collectives. Empty local selections acknowledge without synthetic values.
+
+Every invocation member validates geometry before dependency execution, then
+settles native edits and per-operation evidence before agreeing local success.
+A bounded world receipt after shared forward completion rejects missing members.
+Global `Applied` outcomes and evidence become visible only after final commit.
+Before/after evidence surrounds each ordered operation and uses the ordinary
+partition capture engine under separate operation/evidence keys. The parent's
+capture plan and pre-intervention observation meanings remain unchanged.
+
+The MLX public text adapter selects this path from its retained partition layout
+and native invocation-group facts. Unsupported or unverified observation ownership
+continues to produce an accurate intervention capability result. The portable
+runtime owns agreement, accounting and publication; backend code supplies tensor
+operations, transport and safe completion.
+
+Shared routed Qwen and GPT-OSS attention hooks consume modified channels in their
+output projection. Their normalized FFN input and completed expert contribution
+are separate activation targets. The complete contribution hook follows expert
+reduction and is distinct from provider routing events. Ordinary native control
+uses the same decoder equations in ordinary and partitioned execution.
+
+
+A declared intermediate read stage names the effective value consumed downstream.
+Intervene on its corresponding original observation to change that computation.
+For V3 KV latents, the effective current-position value is inserted into the cache;
+changing a future plan leaves earlier cached rows intact. Pipeline input
+interventions similarly carry the effective embedding in the typed boundary.
+Use a snapshot taken before the tested computation, or exact token-ID replay, to
+compare trials that change those earlier values. Stage slices use their declared
+`hidden` axis; compact FFN/attention masks use the separate `component` axis.
+
+All-dense V3 TP and combined TP/PP use these same latent, channel and gated-unit
+interventions. Native tests compare compact masks and coordinated parameter
+overlays with a local reference, including rejection rollback and restoration.
+The matrix covers F32 SafeTensors/GGUF and SafeTensors load-time affine
+4-bit/group-32; both executions retain the same selected parameter encoding.
+Query rotary positions follow tokens independently of local head count. MLA
+equation revision 2 invalidates earlier V3 cache fingerprints; rebuild those
+prefixes by exact token-ID replay before running new trials.
+
+
+The neutral partition projector supports architecture-declared additive activation
+terms through `as_sum_term(offset_owner)`. Zero, Scale and masks affect each term;
+Add is submitted only by the designated owner; Replace clears the selected region
+on other terms. The owner and sum mode are part of exact geometry agreement.
+Nonowners still validate dtype/shape and participate in completion. Reservations
+charge the projected action, so an Add acknowledgment creates no native update or
+payload copy. Per-term rounding has numerical, not bitwise, equivalence to an edit
+after reduction. Vocabulary sentinel masking is rejected for this contract.
+Target-only mixed V3 TP now invokes these hooks through both resident and provider
+traversals. Native F32 SafeTensors/GGUF and load-time affine acceptance passes all 63 TP/PP/EP and
+residency cases, including Zero, Scale, Add, Replace and strided masks at shared
+write/output seams. The affine cases retain 4-bit/group-32 packed weights before
+overlays; effective F32 edits restore to the original packed sources on removal.
+
+The same mixed V3 matrix passes all 63 independently cached expert cases, including
+atomic edits to both packed expert read halves and write banks, all five additive
+actions and restoration. Exact selected tasks retain generated scale/bias ownership,
+and ordinary/bank affine materialization uses the same source precision. These are
+CPU Ring results with default bank budgets; they do not establish forced-eviction
+coverage. Separate cache-eviction and additional encoding matrices are identified
+explicitly in the component-analysis guide.
+
+A V3 prediction scope's fused residual and pre-head residual are distinct
+intervention targets. Changing the latter changes both returned hidden state and
+its draft scores; the legacy after-head hidden output affects subsequent consumers.
+Scope membership does not enable intervention admission: runtime first requires
+verified prediction hooks in the selected call path. Typed extension hooks preserve
+these timings through public phase-specific speculative admission.
+
+
+The shared embedded strategy now forwards explicit internal observers through
+actual target and V3 prediction operations. Component replacements reach downstream
+equations under their invocation phase; no-op execution retains ordinary values.
+Public phase-specific plans additionally require the loaded activation authority;
+distributed capability comes from the retained producer and transport bindings.
+
+
+`InterventionPlan::admit_invocations` binds the same invocation bounds as its paired
+capture plan. Runtime validates actual shape and active token slices before the
+forward, then uses the ordinary native edit and evidence mechanisms. Original and
+effective evidence carries that physical geometry. Replacement and mask payloads
+still require exact selected shapes; invocation admission introduces no broadcasting.
+Inactive scopes cannot become missing interventions. Restore and child re-admission
+retain accounting and the admission mode. Public speculative plan composition uses
+the same bounds and partition invocation agreement.
+
+The speculative collector uses the ordinary admitted activation operations and
+original/effective evidence. Architecture-projected applicability disables edits
+outside the invoked target/prediction scope before work. Repeated physical phases
+share one cumulative ledger even when their generated prediction coordinate is
+unchanged. Exact masks retain their declared shape; differing invocation widths
+require compatible slices or compact component masks. Typed admission failures and
+original native error sources survive speculative propagation. Public phase-aware
+plans install through the combined activation authority and use selected partition
+producers where loaded discovery reports support.
+
+
+`SpeculativeActivationPlan` combines captures and optional edits into one admitted
+authority bound to the loaded model, effective execution and native session. Public
+installation uses `ControlledSpeculativeOptions.activations`. Ordinary
+`SpeculativeInterventionPlan` retains its existing one-row sampler semantics.
+Internal edits are installed once before forward execution and are removed with
+the borrowed executor scope. Prospective changes use
+`readmit_activation_interventions` at a drained canonical boundary with a plan
+prepared before borrowing the controller. They preserve spent budgets and cannot
+rewrite existing KV or recurrent history; replay from an earlier snapshot or exact
+prefix is required to test a changed earlier forward.
+
+For fused predictors, the admitted speculative scope determines when an edit can
+execute. Context-input edits affect the cache update that consumes them; proposal
+edits affect the temporary proposal computation. DSpark's proposal cache is kept
+through native completion and discarded, while accepted-context state remains
+separate. A dynamic vocabulary addition has its own original/effective input and
+output seams, so an edit to its anchor-dependent projection input remains distinct
+from changing the primary vocabulary head or the final combined score. Schema-2
+speculative activation authority retains these phase bindings across controlled
+execution and re-admission.
+
+Qwen prepared prediction applies component masks to the actual fusion, attention,
+FFN and readout values consumed downstream. Shared parameter identity does not
+merge logical depth identities: a depth-specific activation edit affects that
+invocation, while a shared fusion parameter overlay affects every consumer.
+Neutral dense/MoE fixtures verify exact unit selection, causal score changes and
+failed-observer replay; native TP/PP trials verify global masks and survivor
+recomputation through the public controlled path.

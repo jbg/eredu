@@ -61,9 +61,11 @@ pub use telemetry::{
 };
 
 mod acquisition;
+mod parameters;
 pub use acquisition::{
     AcquiredParameterGroups, AddressableParameterBank, SharedAddressableParameterBank,
 };
+pub(crate) use parameters::publish_bank_parameter_replacements;
 
 mod movement;
 pub use movement::MlxIndexedMovement;

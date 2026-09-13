@@ -31,17 +31,17 @@ pub(super) fn decode_native_row(
         .ok_or_else(|| Exception::custom("native packed row exceeds storage"))?;
     let mut values = Vec::with_capacity(view.columns as usize);
     match view.format() {
-        NativeQuantizationFormat::GgufQ4K => {
+        NativeQuantizationFormat::GgufQ4K if view.storage.endian == GgufEndian::Little => {
             for block in row.as_chunks::<{ Q4_K_BLOCK_BYTES as usize }>().0 {
                 decode_q4k_block(block, &mut values);
             }
         }
-        NativeQuantizationFormat::GgufQ5_1 => {
+        NativeQuantizationFormat::GgufQ5_1 if view.storage.endian == GgufEndian::Little => {
             for block in row.as_chunks::<{ Q5_1_BLOCK_BYTES as usize }>().0 {
                 decode_q5_1_block(block, &mut values);
             }
         }
-        NativeQuantizationFormat::GgufQ8_0 => {
+        NativeQuantizationFormat::GgufQ8_0 if view.storage.endian == GgufEndian::Little => {
             for block in row.as_chunks::<{ Q8_0_BLOCK_BYTES as usize }>().0 {
                 decode_q8_0_block(block, &mut values);
             }

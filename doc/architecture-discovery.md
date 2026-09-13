@@ -27,6 +27,18 @@ with an empty `layer_groups` and absent `shared_with` declarations. Consumers
 must treat that as unknown structure, rather than infer a single pass from the
 number of decoder nodes.
 
+Schema **3** adds component read input-projection chains. Each stage identifies
+effective parameter rows, an optional bias and normalization, and the effective
+observation consumed downstream. An empty chain means a direct read from the
+normalized sublayer input. Check the descriptor version before interpreting these
+equations; ignoring a latent normalization changes the meaning of a read. The
+[component guide](component-analysis.md#topology-and-actual-support) describes
+bounded parameter queries and current-position capture semantics.
+Retained partition layouts derive stage observations from the projection's output
+rows and the invocation's execution owner. The stage's effective and original
+paths share that placement; shared checkpoint aliases do not move the invocation.
+Loaded support still checks the selected executor's hook facts separately.
+
 Each `ArchitectureLayerGroup` declares a `physical_layer_count`, ordered
 `passes`, and `weight_sharing`. Each pass has a zero-based `index` and ordered
 `executions`; an execution identifies its `physical_layer_index` and exact
@@ -105,9 +117,22 @@ interiors, DeepSeek V4 hyper-connections, embedded prediction, and Moshi frame
 execution have explicit partial descriptions. Their catalogs never fabricate
 missing internal measurements. Conditional Qwen adapters currently expose block
 and media boundaries, without normalized routing events. Media projector points
-require media input during prefill and explicitly report decode as unsupported. Partitioned capture
-ownership remains unverified in support reporting; the logical graph remains
-independent of rank placement.
+require media input during prefill and explicitly report decode as unsupported.
+Partitioned support requires both retained invocation placement and callable hooks;
+the logical graph remains independent of rank placement. All-dense V3 target
+execution verifies both for TP, PP and combined TP/PP. Target-only sparse V3 TP now emits the same internal hooks, including additive
+shared-write terms, and passes neutral TP/PP/residency conformance and native
+TP/PP/EP acceptance for F32 SafeTensors/GGUF and load-time affine 4-bit/group-32.
+Embedded prediction interiors remain unverified.
+
+Architecture descriptor schema 4 includes component schema 3's `write_partition`:
+`Complete` or `TensorParallelSum`. The latter declares full-hidden-width native
+terms before an ordinary TP reduction; equal hidden coordinates across TP ranks
+are distinct contributions. Placement requires complete TP groups and retains one
+producer per TP coordinate across replicas. Partition evidence independently
+specifies bounded host assembly arithmetic. The declaration alone does not enable
+loaded hooks. Mixed V3 F32 SafeTensors/GGUF and load-time affine native TP/PP/EP
+acceptance passes all 63 ordinary-residency cases.
 
 Run the portable example:
 
@@ -139,3 +164,86 @@ generation, use `capture_discovery`, `prepare_observed_chat`, and
 `generate_observed_chat`; `CapturePlan::none()` and empty new-plan selections both
 mean capture none. The complete [`observed_generate`](../eredu/examples/observed_generate.rs)
 example includes prompt alignment, ordinary sampling, bounded capture and cancellation.
+
+Mixed V3 independently cached expert variants pass all 63 CPU Ring TP/PP/EP and
+residency cases for F32 SafeTensors/GGUF and affine 4-bit/group-32. Parameter
+discovery reflects the effective source-preserving companion dtype and retained
+generated destinations. An owned expert with no selected routes remains declared;
+zero local cache activity does not mean its parameters or topology are absent.
+
+Architecture descriptor schema 5 adds `component_scopes` (empty when absent in
+older JSON), using component schema 4. Primary `components`, `routed_components`
+and `component_readout` still describe target scores only. Each V3 prediction
+depth has a separate scope joined to its execution group, decoder, routed/shared
+components and its own readout head. Its residual starts with a linear projection
+of separately normalized token embedding and supplied hidden state. Fusion input
+column ranges and effective parameter names are declared; clients need no
+checkpoint-name parsing. The supplied hidden source is the actual invocation
+capture, not an assumption that every invocation consumes a preceding depth.
+
+All prediction-scope observations, including generated projection inputs and
+routed-unit values, require `PredictionExecution`. Selected target-only call paths
+report them unsupported even when their tensor collectors are available. A full
+declaration therefore does not advertise public speculative component support.
+The shared readout equation preserves existing primary JSON fields; Rust struct
+construction now places head fields in `ComponentReadoutEquation`.
+
+
+Internal V3 speculative calls now carry explicit invocation phase, proposal depth
+and physical sequence width through the shared architecture strategy. This does
+not change loaded capture support: a typed hook fact alone cannot supply public
+phase/frontier admission, cumulative collection or record delivery. The existing
+`prediction_inspection` gate remains false in ordinary and cold adapters.
+
+Descriptor schema 7 extends the separately scored component domains with a fused
+prediction scope spanning ordered `execution_groups` and separately declared
+`static_parameter_roles`. Component schema 6 adds direct residual sources with
+explicit expansion and dynamic `score_writes` in vocabulary space. These joins
+preserve DSpark's multiple decoder blocks and anchor-dependent Markov addition
+without treating either block count as proposal capacity or dynamic scores as a
+static bias. `speculative_invocations` declares context-cache roots that execute
+without a component score equation. Descendants inherit the nearest explicit
+invocation binding; ambiguous or unknown roots fail validation. Loaded support
+still requires the corresponding selected executor and native collector facts.
+
+
+Descriptor schema 8 carries component schema 7's optional `output_gate`. This is a
+per-row scalar multiplier after the affine write and any output normalization.
+It declares the gate's effective input, actual projection input, exact read
+parameters, activation and original/effective observations. The gate is measured
+again for every trial. Qwen shared FFN groups retain ordinary gated-unit identities
+and add this separate post-projection relationship. Older groups omit the field.
+
+
+Schema **9** adds `component_transforms`, with an empty default for older
+serialized descriptors. Component schema **8** declares identity normalization
+and exact tensor transformations between observed boundaries: constant or learned
+scaling, normalization, and causal depthwise convolution. Each transform names its
+owning node, actual input, original output, optional effective output and canonical
+parameter identities. Node ownership locates the transform in a target or
+prediction invocation. These records are equations, not extra additive residual
+contributions and not loaded-operation capabilities. For causal kernels, the last
+tap consumes the current input; earlier taps may consume retained state. The
+ordinary capture API admits only the requested current positions. Inkling's
+expanded transform declarations currently supplement its partial component graph;
+complete scalar groups, prediction scopes and native component support remain work
+in progress.
+
+Descriptor schema 11/component schema 10 describes gated-delta recurrence with
+separate projected key-head and recurrent value-head geometry, exact per-head or
+per-key-channel decay, and normalization/gating before scalar output channels.
+Qwen recurrent channels use `.mixer.channels`; Kimi channels use
+`.attention.channels`. Both join the actual pre-projection tensor and effective
+write columns. Fused causal Q/K/V transforms preserve their physical segmentation.
+The L2 normalization kind uses additive epsilon under the square root of the
+sum of squares, while RMS uses the mean. Captured channels already include these
+stateful calculations; discovery does not imply historical state observations.
+
+Descriptor schema 12/component schema 11 adds `scaled_softcap`, projected-head
+`output_scale` (default one), and `token_embedding_normalization` before media
+assembly. The existing `embedding_normalization` describes normalization of the
+assembled tensor; consumers must keep those stages distinct. Muse declares its
+per-channel sigmoid gate and four separate pre/post RMS normalizations, with
+HF centered gains and GGUF full gains. Sparse postnorm applies after summing
+the complete route-weighted write. Loaded support still depends on the selected
+executor and collector mechanisms.

@@ -18,6 +18,14 @@ pub enum ParameterGroupOwner {
     StaticRole(String),
     /// A shared pinned module selected when any declared static consumer is local.
     StaticAnyOf(Vec<String>),
+    /// A pinned module used by explicit logical units. Each partition containing
+    /// a consumer stores one copy, regardless of how many consumers it owns.
+    StaticUnitConsumers {
+        /// Canonical static binding role.
+        role: String,
+        /// Canonical group and unit identities that consume the module.
+        consumers: Vec<(ExecutionGroupId, usize)>,
+    },
     /// One architecture-global unit in a canonical execution group.
     #[non_exhaustive]
     ExecutionUnit {
@@ -39,21 +47,110 @@ impl ParameterGroupOwner {
         Self::StaticAnyOf(roles.into_iter().map(Into::into).collect())
     }
 
+    /// Pins one shared module on each partition executing a declared consumer.
+    pub fn static_unit_consumers(
+        role: impl Into<String>,
+        consumers: impl IntoIterator<Item = (ExecutionGroupId, usize)>,
+    ) -> Self {
+        Self::StaticUnitConsumers {
+            role: role.into(),
+            consumers: consumers.into_iter().collect(),
+        }
+    }
+
+    /// Whether this declaration binds through the given static storage role.
+    pub fn accepts_static_role(&self, expected: &str) -> bool {
+        match self {
+            Self::StaticRole(role) | Self::StaticUnitConsumers { role, .. } => role == expected,
+            Self::StaticAnyOf(roles) => roles.iter().any(|role| role == expected),
+            Self::ExecutionUnit { .. } => false,
+        }
+    }
+
+    /// Compares exact ownership, allowing a constructed consumer declaration
+    /// to refine a selected static binding role.
+    pub fn refines_storage_owner(&self, selected: &Self) -> bool {
+        self == selected
+            || matches!(selected, Self::StaticRole(role) if self.accepts_static_role(role))
+    }
+
     /// Creates execution-unit ownership in the architecture-global index space.
     pub fn execution_unit(group: ExecutionGroupId, global_unit: usize) -> Self {
         Self::ExecutionUnit { group, global_unit }
     }
 
-    fn is_local<G, A>(&self, partition: &ArchitecturePartition<G, A>) -> bool {
+    pub(crate) fn validate(
+        &self,
+        graph: &ExecutionGraph,
+        layout: &ExecutionUnitLayout,
+    ) -> Result<(), ArchitectureParameterError> {
         match self {
-            Self::StaticRole(role) => partition.ownership().owns_static_role(role),
-            Self::StaticAnyOf(roles) => roles
+            ParameterGroupOwner::StaticRole(role) => {
+                if role.trim().is_empty() {
+                    return Err(ArchitectureParameterError::EmptyStaticRole);
+                }
+            }
+            ParameterGroupOwner::StaticAnyOf(roles) => {
+                if roles.is_empty() || roles.iter().any(|role| role.trim().is_empty()) {
+                    return Err(ArchitectureParameterError::EmptyStaticRole);
+                }
+                let unique = roles.iter().collect::<BTreeSet<_>>();
+                if unique.len() != roles.len() {
+                    return Err(ArchitectureParameterError::DuplicateStaticRole);
+                }
+            }
+            ParameterGroupOwner::StaticUnitConsumers { role, consumers } => {
+                if role.trim().is_empty() {
+                    return Err(ArchitectureParameterError::EmptyStaticRole);
+                }
+                if consumers.is_empty() {
+                    return Err(ArchitectureParameterError::EmptyStaticConsumers);
+                }
+                if consumers.iter().collect::<BTreeSet<_>>().len() != consumers.len() {
+                    return Err(ArchitectureParameterError::DuplicateStaticConsumer);
+                }
+            }
+            ParameterGroupOwner::ExecutionUnit { .. } => {}
+        }
+        let consumers = match self {
+            ParameterGroupOwner::StaticUnitConsumers { consumers, .. } => consumers
                 .iter()
-                .any(|role| partition.ownership().owns_static_role(role)),
-            Self::ExecutionUnit { group, global_unit } => {
-                partition.owns_unit(group.as_str(), *global_unit)
+                .map(|(group, unit)| (group, unit))
+                .collect::<Vec<_>>(),
+            ParameterGroupOwner::ExecutionUnit { group, global_unit } => {
+                vec![(group, global_unit)]
+            }
+            _ => Vec::new(),
+        };
+        for (group, global_unit) in consumers {
+            let Some(group_index) = graph
+                .groups()
+                .iter()
+                .position(|candidate| candidate.id() == group.as_str())
+            else {
+                return Err(ArchitectureParameterError::UnknownExecutionGroup(
+                    group.as_str().to_owned(),
+                ));
+            };
+            let available = layout
+                .group_range(group_index)
+                .expect("validated canonical layout contains every group")
+                .len();
+            if *global_unit >= available {
+                return Err(ArchitectureParameterError::UnitOutOfRange {
+                    group: group.as_str().to_owned(),
+                    global_unit: *global_unit,
+                    available,
+                });
             }
         }
+        Ok(())
+    }
+
+    fn is_local<G, A>(&self, partition: &ArchitecturePartition<G, A>) -> bool {
+        self.is_stored_by(partition.ownership(), |group, unit| {
+            partition.owns_unit(group.as_str(), unit)
+        })
     }
 
     fn is_local_partition_parts(
@@ -61,7 +158,7 @@ impl ParameterGroupOwner {
         groups: &[PartitionGroup],
         ownership: &PartitionOwnership,
     ) -> bool {
-        self.is_owned_by(ownership, |group, unit| {
+        self.is_stored_by(ownership, |group, unit| {
             groups
                 .iter()
                 .any(|owned| owned.group() == group && owned.contains(unit))
@@ -77,6 +174,29 @@ impl ParameterGroupOwner {
         match self {
             Self::StaticRole(role) => ownership.owns_static_role(role),
             Self::StaticAnyOf(roles) => roles.iter().any(|role| ownership.owns_static_role(role)),
+            Self::StaticUnitConsumers { consumers, .. } => consumers
+                .iter()
+                .any(|(group, unit)| owns_unit(group, *unit)),
+            Self::ExecutionUnit { group, global_unit } => owns_unit(group, *global_unit),
+        }
+    }
+
+    /// Tests parameter storage, including replicas for auxiliary invocations.
+    /// Use `is_owned_by` for the ordinary model's observation ownership.
+    pub fn is_stored_by(
+        &self,
+        ownership: &PartitionOwnership,
+        owns_unit: impl Fn(&ExecutionGroupId, usize) -> bool,
+    ) -> bool {
+        match self {
+            Self::StaticRole(role) => ownership.stores_static_role(role),
+            Self::StaticAnyOf(roles) => roles.iter().any(|role| ownership.stores_static_role(role)),
+            Self::StaticUnitConsumers { role, consumers } => {
+                ownership.replicated_static_roles().contains(role)
+                    || consumers
+                        .iter()
+                        .any(|(group, unit)| owns_unit(group, *unit))
+            }
             Self::ExecutionUnit { group, global_unit } => owns_unit(group, *global_unit),
         }
     }
@@ -85,6 +205,7 @@ impl ParameterGroupOwner {
         match self {
             Self::StaticRole(role) => Some(role),
             Self::StaticAnyOf(roles) => roles.first().map(String::as_str),
+            Self::StaticUnitConsumers { role, .. } => Some(role),
             Self::ExecutionUnit { .. } => None,
         }
     }
@@ -150,44 +271,7 @@ impl ArchitectureParameterDescription {
         let groups = groups.into_iter().collect::<Vec<_>>();
         let mut actual = BTreeMap::new();
         for tagged in &groups {
-            match tagged.owner() {
-                ParameterGroupOwner::StaticRole(role) => {
-                    if role.trim().is_empty() {
-                        return Err(ArchitectureParameterError::EmptyStaticRole);
-                    }
-                }
-                ParameterGroupOwner::StaticAnyOf(roles) => {
-                    if roles.is_empty() || roles.iter().any(|role| role.trim().is_empty()) {
-                        return Err(ArchitectureParameterError::EmptyStaticRole);
-                    }
-                    let unique = roles.iter().collect::<BTreeSet<_>>();
-                    if unique.len() != roles.len() {
-                        return Err(ArchitectureParameterError::DuplicateStaticRole);
-                    }
-                }
-                ParameterGroupOwner::ExecutionUnit { group, global_unit } => {
-                    let Some(group_index) = graph
-                        .groups()
-                        .iter()
-                        .position(|candidate| candidate.id() == group.as_str())
-                    else {
-                        return Err(ArchitectureParameterError::UnknownExecutionGroup(
-                            group.as_str().to_owned(),
-                        ));
-                    };
-                    let available = layout
-                        .group_range(group_index)
-                        .expect("validated canonical layout contains every group")
-                        .len();
-                    if *global_unit >= available {
-                        return Err(ArchitectureParameterError::UnitOutOfRange {
-                            group: group.as_str().to_owned(),
-                            global_unit: *global_unit,
-                            available,
-                        });
-                    }
-                }
-            }
+            tagged.owner().validate(graph, layout)?;
             for member in tagged.group().members() {
                 if let Some(previous) = actual.insert(member.target().to_owned(), tagged.owner()) {
                     return Err(ArchitectureParameterError::DuplicateOwnership {
@@ -329,6 +413,12 @@ pub enum ArchitectureParameterError {
     /// A shared pinned parameter repeats one consumer role.
     #[error("architecture shared parameter owner repeats a static role")]
     DuplicateStaticRole,
+    /// A unit-consumed static module has no declared invocation.
+    #[error("architecture pinned parameter has no unit consumer")]
+    EmptyStaticConsumers,
+    /// A shared pinned module repeats a logical invocation.
+    #[error("architecture pinned parameter repeats a unit consumer")]
+    DuplicateStaticConsumer,
     /// A unit owner names no canonical graph group.
     #[error("architecture parameter owner names unknown execution group {0:?}")]
     UnknownExecutionGroup(String),
@@ -909,6 +999,7 @@ pub struct PartitionOwnership {
     input: bool,
     output: bool,
     static_roles: Vec<String>,
+    replicated_static_roles: Vec<String>,
 }
 
 impl PartitionOwnership {
@@ -934,7 +1025,32 @@ impl PartitionOwnership {
             input,
             output,
             static_roles,
+            replicated_static_roles: Vec::new(),
         })
+    }
+
+    /// Retains static storage needed by auxiliary invocations on every rank.
+    /// These replicas do not grant ownership of the ordinary input/output hook.
+    pub fn with_replicated_static_roles(
+        mut self,
+        roles: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Result<Self, ArchitecturePartitionError> {
+        self.replicated_static_roles = Self::new(false, false, roles)?.static_roles;
+        Ok(self)
+    }
+
+    /// Auxiliary storage dependencies, distinct from ordinary invocation roles.
+    pub fn replicated_static_roles(&self) -> &[String] {
+        &self.replicated_static_roles
+    }
+
+    /// Whether a static parameter is materialized here, including shared replicas.
+    pub fn stores_static_role(&self, role: &str) -> bool {
+        self.owns_static_role(role)
+            || self
+                .replicated_static_roles
+                .iter()
+                .any(|stored| stored == role)
     }
 
     /// Returns whether this partition owns model input preparation.
@@ -1635,6 +1751,71 @@ impl LayeredPartitionDriver {
         M: PartitionedLayeredArchitecture<B, S>,
         M::Error: std::fmt::Display,
     {
+        self.begin_with_optional_observer(architecture, input, mask, state, parallel, context, None)
+    }
+
+    /// Prepares the partition with internal input observations before group entry.
+    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
+    pub fn begin_observed<'a, B, S, M, O>(
+        &self,
+        architecture: &mut M,
+        input: LayeredPartitionInput<
+            'a,
+            B::Tensor,
+            <M::Boundary as ArchitectureBoundary>::Boundary<B::Tensor>,
+        >,
+        mask: Option<&B::Tensor>,
+        state: &mut S,
+        parallel: Option<&B::ParallelContext>,
+        context: &<B::Tensor as eredu_nn::Tensor>::Context,
+        observer: &mut O,
+    ) -> Result<
+        LayeredForwardState<B::Tensor, M::ForwardContext>,
+        LayeredPartitionBeginError<M::Error>,
+    >
+    where
+        B: eredu_nn::NeuralBackend,
+        S: RuntimeState<B>,
+        M: PartitionedLayeredArchitecture<B, S>,
+        M::Error: std::fmt::Display,
+        O: crate::ActivationObserver<B::Tensor, M::Error> + ?Sized,
+    {
+        let mut observer = crate::BorrowedActivationObserver(observer);
+        self.begin_with_optional_observer(
+            architecture,
+            input,
+            mask,
+            state,
+            parallel,
+            context,
+            Some(&mut observer),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
+    fn begin_with_optional_observer<'a, B, S, M>(
+        &self,
+        architecture: &mut M,
+        input: LayeredPartitionInput<
+            'a,
+            B::Tensor,
+            <M::Boundary as ArchitectureBoundary>::Boundary<B::Tensor>,
+        >,
+        mask: Option<&B::Tensor>,
+        state: &mut S,
+        parallel: Option<&B::ParallelContext>,
+        context: &<B::Tensor as eredu_nn::Tensor>::Context,
+        observer: Option<&mut dyn crate::ActivationObserver<B::Tensor, M::Error>>,
+    ) -> Result<
+        LayeredForwardState<B::Tensor, M::ForwardContext>,
+        LayeredPartitionBeginError<M::Error>,
+    >
+    where
+        B: eredu_nn::NeuralBackend,
+        S: RuntimeState<B>,
+        M: PartitionedLayeredArchitecture<B, S>,
+        M::Error: std::fmt::Display,
+    {
         let expected = self
             .state_layout
             .as_ref()
@@ -1642,10 +1823,15 @@ impl LayeredPartitionDriver {
         // `state` is the partition-local allocation selected by `PartitionState`.
         // Global ownership is carried separately by that partition's offset, so
         // architecture code must index this allocation from local ordinal zero.
-        let mut forward = match parallel {
-            Some(parallel) => architecture
-                .begin_partition_parallel(input, mask, state, expected, 0, parallel, context),
-            None => architecture.begin_partition(input, mask, state, expected, 0, context),
+        let mut forward = match observer {
+            Some(observer) => architecture.begin_partition_observed(
+                input, mask, state, expected, 0, parallel, context, observer,
+            ),
+            None => match parallel {
+                Some(parallel) => architecture
+                    .begin_partition_parallel(input, mask, state, expected, 0, parallel, context),
+                None => architecture.begin_partition(input, mask, state, expected, 0, context),
+            },
         }
         .map_err(LayeredPartitionBeginError::Architecture)?;
         forward.hidden = architecture
@@ -1687,9 +1873,96 @@ impl LayeredPartitionDriver {
         S: RuntimeState<B>,
         M: PartitionedLayeredArchitecture<B, S>,
     {
+        self.finish_with_optional_observer(
+            architecture,
+            hidden,
+            state,
+            forward,
+            parallel,
+            context,
+            None,
+        )
+    }
+
+    /// Completes the group and observes readout only at the selected output owner.
+    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
+    pub fn finish_observed<B, S, M, O>(
+        &self,
+        architecture: &mut M,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &mut M::ForwardContext,
+        parallel: Option<&B::ParallelContext>,
+        context: &<B::Tensor as eredu_nn::Tensor>::Context,
+        observer: &mut O,
+    ) -> Result<
+        LayeredPartitionOutput<
+            B::Tensor,
+            <M::Boundary as ArchitectureBoundary>::Boundary<B::Tensor>,
+        >,
+        M::Error,
+    >
+    where
+        B: eredu_nn::NeuralBackend,
+        S: RuntimeState<B>,
+        M: PartitionedLayeredArchitecture<B, S>,
+        O: crate::ActivationObserver<B::Tensor, M::Error> + ?Sized,
+    {
+        let mut observer = crate::BorrowedActivationObserver(observer);
+        self.finish_with_optional_observer(
+            architecture,
+            hidden,
+            state,
+            forward,
+            parallel,
+            context,
+            Some(&mut observer),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
+    fn finish_with_optional_observer<B, S, M>(
+        &self,
+        architecture: &mut M,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &mut M::ForwardContext,
+        parallel: Option<&B::ParallelContext>,
+        context: &<B::Tensor as eredu_nn::Tensor>::Context,
+        observer: Option<&mut dyn crate::ActivationObserver<B::Tensor, M::Error>>,
+    ) -> Result<
+        LayeredPartitionOutput<
+            B::Tensor,
+            <M::Boundary as ArchitectureBoundary>::Boundary<B::Tensor>,
+        >,
+        M::Error,
+    >
+    where
+        B: eredu_nn::NeuralBackend,
+        S: RuntimeState<B>,
+        M: PartitionedLayeredArchitecture<B, S>,
+    {
         let hidden = architecture
             .leave_partition_group(self.group, hidden, state, forward, parallel, context)?;
-        architecture.finish_partition(&hidden, state, forward, self.owns_output, parallel, context)
+        match observer {
+            Some(observer) => architecture.finish_partition_observed(
+                &hidden,
+                state,
+                forward,
+                self.owns_output,
+                parallel,
+                context,
+                observer,
+            ),
+            None => architecture.finish_partition(
+                &hidden,
+                state,
+                forward,
+                self.owns_output,
+                parallel,
+                context,
+            ),
+        }
     }
 }
 
@@ -2252,6 +2525,79 @@ mod tests {
     }
 
     #[test]
+    fn pinned_unit_consumers_select_one_copy_and_canonical_binding_role() {
+        let primary = ExecutionGroupId::new("primary").unwrap();
+        let shared = parameter("shared", "shared.weight");
+        let owner = ParameterGroupOwner::static_unit_consumers(
+            "projector",
+            [(primary.clone(), 1), (primary.clone(), 2)],
+        );
+        let description = parameter_description(
+            vec![shared.clone()],
+            vec![OwnedParameterGroupSpec::new(owner.clone(), shared.clone())],
+        )
+        .unwrap();
+        let partition = valid_partition();
+        assert!(!partition.ownership().owns_static_role("projector"));
+        assert_eq!(description.select_owned(&partition).len(), 1);
+        assert_eq!(description.select_static_roles(&partition), ["projector"]);
+        assert!(
+            owner.is_owned_by(partition.ownership(), |group, unit| partition
+                .owns_unit(group.as_str(), unit))
+        );
+        assert!(owner.refines_storage_owner(&ParameterGroupOwner::static_role("projector")));
+        assert!(!owner.refines_storage_owner(&ParameterGroupOwner::static_role("embedding")));
+        let replica = PartitionOwnership::new(false, false, Vec::<String>::new())
+            .unwrap()
+            .with_replicated_static_roles(["projector"])
+            .unwrap();
+        assert!(owner.is_stored_by(&replica, |_, _| false));
+        assert!(!owner.is_owned_by(&replica, |_, _| false));
+        let unowned = parameter_description(
+            vec![shared.clone()],
+            vec![OwnedParameterGroupSpec::new(
+                ParameterGroupOwner::static_unit_consumers("embedding", [(primary, 0)]),
+                shared,
+            )],
+        )
+        .unwrap();
+        assert!(partition.ownership().owns_static_role("embedding"));
+        assert!(unowned.select_owned(&partition).is_empty());
+        assert!(unowned.select_static_roles(&partition).is_empty());
+    }
+
+    #[test]
+    fn pinned_unit_consumers_validate_exact_graph_invocations() {
+        let primary = ExecutionGroupId::new("primary").unwrap();
+        let make = |consumers| {
+            let shared = parameter("shared", "shared.weight");
+            parameter_description(
+                vec![shared.clone()],
+                vec![OwnedParameterGroupSpec::new(
+                    ParameterGroupOwner::static_unit_consumers("projector", consumers),
+                    shared,
+                )],
+            )
+        };
+        assert_eq!(
+            make(vec![]).unwrap_err(),
+            ArchitectureParameterError::EmptyStaticConsumers
+        );
+        assert_eq!(
+            make(vec![(primary.clone(), 1), (primary.clone(), 1)]).unwrap_err(),
+            ArchitectureParameterError::DuplicateStaticConsumer
+        );
+        assert!(matches!(
+            make(vec![(primary, usize::MAX)]),
+            Err(ArchitectureParameterError::UnitOutOfRange { .. })
+        ));
+        assert!(matches!(
+            make(vec![(ExecutionGroupId::new("absent").unwrap(), 0)]),
+            Err(ArchitectureParameterError::UnknownExecutionGroup(_))
+        ));
+    }
+
+    #[test]
     fn parameter_description_selects_every_owned_target_for_a_role() {
         let expert = ParameterGroupSpec::new(
             "model.layers.1.expert_intermediate",
@@ -2295,6 +2641,34 @@ mod tests {
                 "model.layers.1.moe.packed.weight".to_owned(),
             ])
         );
+    }
+
+    #[test]
+    fn auxiliary_static_replicas_materialize_without_owning_target_hooks() {
+        let ownership = PartitionOwnership::new(false, true, ["output"])
+            .unwrap()
+            .with_replicated_static_roles(["embedding"])
+            .unwrap();
+        let owner = ParameterGroupOwner::static_role("embedding");
+        assert!(!ownership.owns_input());
+        assert!(!owner.is_owned_by(&ownership, |_, _| false));
+        assert!(owner.is_stored_by(&ownership, |_, _| false));
+        assert!(ParameterGroupOwner::static_any_of(["embedding", "unused"])
+            .is_stored_by(&ownership, |_, _| false));
+        let partition = state_plan_partition(1..4, ownership);
+        let embedding = parameter("embedding", "model.embed_tokens.weight");
+        let description = parameter_description(
+            vec![embedding.clone()],
+            vec![OwnedParameterGroupSpec::new(owner, embedding)],
+        )
+        .unwrap();
+        let selected = description.select_owned(&partition);
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].logical_name(), "embedding");
+        assert!(PartitionOwnership::new(false, false, [] as [&str; 0])
+            .unwrap()
+            .with_replicated_static_roles(["embedding", "embedding"])
+            .is_err());
     }
 
     #[test]

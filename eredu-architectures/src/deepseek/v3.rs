@@ -5,8 +5,8 @@ use std::sync::Arc;
 use eredu_core::{cache::LayerCachePolicy, AttentionPolicy, LayerSchedule};
 use eredu_nn::{
     BlockwiseAttentionBackend, CompressedAttentionCache, EmbeddingLookupPolicy, EmbeddingOperator,
-    Error, GroupedGatedProductOperator, GroupedNeuralBackend, LinearOperator,
-    NormalizationOperator, Parameterized, Tensor,
+    Error, GroupedGatedProductOperator, GroupedNeuralBackend, NormalizationOperator, Parameterized,
+    Tensor,
 };
 use eredu_runtime::{
     LayerRuntimeState, LayeredArchitecture, LayeredForwardState, LayeredPartitionInput,
@@ -94,6 +94,14 @@ where
     S: LayerRuntimeState<B>,
     S::LayerState: CompressedAttentionCache<B::Tensor>,
 {
+    fn routed_unit_observations(&self) -> bool {
+        self.groups.prediction_count() == 0
+    }
+
+    fn routed_sparse_observations(&self) -> bool {
+        self.groups.prediction_count() == 0
+    }
+
     fn forward_unit_with_provider<P>(
         &mut self,
         group: usize,
@@ -147,6 +155,79 @@ where
     S: LayerRuntimeState<B>,
     S::LayerState: CompressedAttentionCache<B::Tensor>,
 {
+    fn parallel_routed_unit_observations(&self) -> bool {
+        self.groups.prediction_count() == 0
+    }
+
+    fn parallel_routed_sparse_observations(&self) -> bool {
+        self.groups.prediction_count() == 0
+    }
+
+    fn forward_unit_parallel_observed_with_provider<P, O>(
+        &mut self,
+        group: usize,
+        index: usize,
+        unit: &mut Self::Unit,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &mut Self::ForwardContext,
+        pass: eredu_runtime::ExpertPass,
+        provider: &mut P,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+        observer: &mut O,
+    ) -> Result<B::Tensor, Self::Error>
+    where
+        P: eredu_runtime::TensorParallelRoutedExpertProvider<B>,
+        P::Error: std::fmt::Display,
+        O: eredu_runtime::ActivationObserver<B::Tensor, Self::Error> + ?Sized,
+    {
+        match unit {
+            Unit::Target(unit) if group == 0 => unit.forward_parallel_observed_with_provider(
+                &format!("model.layers.{index}"),
+                hidden,
+                forward.mask.as_ref(),
+                Some(
+                    state
+                        .layer(self.target_state_ordinal(index)?)
+                        .map_err(Error::backend)?,
+                ),
+                pass,
+                provider,
+                context,
+                observer,
+                |value, context| B::sum_parallel(value, parallel, context),
+            ),
+            Unit::Prediction(unit) if group > 0 => {
+                observer.observe(&format!("mtp.{}.capture", group - 1), hidden)?;
+                let layer = usize::try_from(self.args.num_hidden_layers).map_err(Error::backend)?
+                    + group
+                    - 1;
+                let output = unit.forward_parallel_observed_with_provider(
+                    &format!("model.layers.{layer}"),
+                    hidden,
+                    &forward.embedded,
+                    &forward.tokens,
+                    state.layer(layer).map_err(Error::backend)?,
+                    pass,
+                    provider,
+                    context,
+                    observer,
+                    |value, context| B::sum_parallel(value, parallel, context),
+                )?;
+                forward.draft_logits = Some(output.logits);
+                eredu_runtime::observe_and_intervene(
+                    observer,
+                    &format!("mtp.{}.output", group - 1),
+                    &output.hidden,
+                )
+            }
+            _ => Model::forward_unit_parallel_with_provider(
+                self, group, index, unit, hidden, state, forward, pass, parallel, provider, context,
+            ),
+        }
+    }
+
     fn forward_unit_parallel_with_provider<P>(
         &mut self,
         group: usize,
@@ -716,12 +797,41 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend + BlockwiseAtt
         hidden: &B::Tensor,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
-        let hidden = self.static_modules.norm.forward(hidden, context)?;
-        self.static_modules
+        self.finish_target_instrumented(
+            hidden,
+            None,
+            context,
+            &mut crate::decoder::ComponentInstrumentation::disabled(),
+        )
+    }
+
+    fn finish_target_instrumented(
+        &mut self,
+        hidden: &B::Tensor,
+        parallel: Option<&B::ParallelContext>,
+        context: &<B::Tensor as Tensor>::Context,
+        instrumentation: &mut crate::decoder::ComponentInstrumentation<'_, B::Tensor>,
+    ) -> Result<B::Tensor, Error> {
+        let hidden =
+            instrumentation.normalize_readout(hidden, &mut self.static_modules.norm, context)?;
+        let head = self
+            .static_modules
             .lm_head
             .as_mut()
-            .expect("validated V3 models have an untied output head")
-            .forward(&hidden, context)
+            .expect("validated V3 models have an untied output head");
+        let logits = match parallel {
+            Some(parallel) => instrumentation.project_vocabulary::<B>(
+                "projection_input",
+                head,
+                &hidden,
+                parallel,
+                context,
+            )?,
+            None => {
+                instrumentation.project::<B>("projection_input", head, &hidden, None, context)?
+            }
+        };
+        instrumentation.apply("linear", logits)
     }
 
     /// Applies the final target normalization without projecting vocabulary
@@ -741,15 +851,11 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend + BlockwiseAtt
         parallel: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
-        let hidden = self.pipeline_finish_hidden(hidden, context)?;
-        B::vocabulary_parallel_project(
-            self.static_modules
-                .lm_head
-                .as_mut()
-                .expect("validated V3 models have an untied output head"),
-            &hidden,
-            parallel,
+        self.finish_target_instrumented(
+            hidden,
+            Some(parallel),
             context,
+            &mut crate::decoder::ComponentInstrumentation::disabled(),
         )
     }
 
@@ -901,6 +1007,169 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend + BlockwiseAtt
         }
     }
 
+    /// Observes one typed prediction extension, including its outer invocation
+    /// boundaries. The enclosing executor owns admission, completion and rollback.
+    #[allow(clippy::too_many_arguments)]
+    pub fn pipeline_forward_prediction_observed<C, O>(
+        &mut self,
+        unit: &mut Unit<B>,
+        depth: usize,
+        hidden: &B::Tensor,
+        tokens: &B::Tensor,
+        cache: &mut C,
+        pass: eredu_runtime::ExpertPass,
+        parallel: Option<&B::ParallelContext>,
+        context: &<B::Tensor as Tensor>::Context,
+        observer: &mut O,
+    ) -> Result<super::mtp::PredictionOutput<B::Tensor>, Error>
+    where
+        C: CompressedAttentionCache<B::Tensor>,
+        O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
+    {
+        self.pipeline_prediction_observation(
+            unit,
+            depth,
+            hidden,
+            tokens,
+            parallel,
+            context,
+            observer,
+            |unit, path, hidden, embedded, observer| match parallel {
+                Some(parallel) => unit.forward_parallel_observed(
+                    path,
+                    hidden,
+                    embedded,
+                    tokens,
+                    cache,
+                    context,
+                    observer,
+                    |value, context| B::sum_parallel(value, parallel, context),
+                ),
+                None => unit.forward_observed_with_provider(
+                    path,
+                    hidden,
+                    embedded,
+                    tokens,
+                    cache,
+                    pass,
+                    &mut eredu_runtime::ResidentExpertProvider,
+                    context,
+                    observer,
+                ),
+            },
+        )
+    }
+
+    /// Provider-aware prediction-extension observations use the same ordinary
+    /// embedding, decoder reductions and head equations as unobserved execution.
+    #[allow(clippy::too_many_arguments)]
+    pub fn pipeline_forward_prediction_observed_with_provider<C, P, O>(
+        &mut self,
+        unit: &mut Unit<B>,
+        depth: usize,
+        hidden: &B::Tensor,
+        tokens: &B::Tensor,
+        cache: &mut C,
+        pass: eredu_runtime::ExpertPass,
+        provider: &mut P,
+        parallel: Option<&B::ParallelContext>,
+        context: &<B::Tensor as Tensor>::Context,
+        observer: &mut O,
+    ) -> Result<super::mtp::PredictionOutput<B::Tensor>, Error>
+    where
+        C: CompressedAttentionCache<B::Tensor>,
+        P: eredu_runtime::TensorParallelRoutedExpertProvider<B>,
+        P::Error: std::fmt::Display,
+        O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
+    {
+        self.pipeline_prediction_observation(
+            unit,
+            depth,
+            hidden,
+            tokens,
+            parallel,
+            context,
+            observer,
+            |unit, path, hidden, embedded, observer| match parallel {
+                Some(parallel) => unit.forward_parallel_observed_with_provider(
+                    path,
+                    hidden,
+                    embedded,
+                    tokens,
+                    cache,
+                    pass,
+                    provider,
+                    context,
+                    observer,
+                    |value, context| B::sum_parallel(value, parallel, context),
+                ),
+                None => unit.forward_observed_with_provider(
+                    path, hidden, embedded, tokens, cache, pass, provider, context, observer,
+                ),
+            },
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn pipeline_prediction_observation<O, F>(
+        &mut self,
+        unit: &mut Unit<B>,
+        depth: usize,
+        hidden: &B::Tensor,
+        tokens: &B::Tensor,
+        parallel: Option<&B::ParallelContext>,
+        context: &<B::Tensor as Tensor>::Context,
+        observer: &mut O,
+        forward: F,
+    ) -> Result<super::mtp::PredictionOutput<B::Tensor>, Error>
+    where
+        O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
+        F: FnOnce(
+            &mut super::mtp::V3PredictionLayer<B>,
+            &str,
+            &B::Tensor,
+            &B::Tensor,
+            &mut O,
+        ) -> Result<super::mtp::PredictionOutput<B::Tensor>, Error>,
+    {
+        let Unit::Prediction(unit) = unit else {
+            return Err(Error::backend(
+                "a V3 target unit cannot execute as an embedded predictor",
+            ));
+        };
+        // A prepared target can omit prediction units from its own groups; the
+        // typed extension supplies the admitted depth and prediction module.
+        let layer = (self.args.num_hidden_layers as usize)
+            .checked_add(depth)
+            .ok_or_else(|| Error::backend("V3 prediction invocation index overflow"))?;
+        let path = format!("model.layers.{layer}");
+        let hidden =
+            eredu_runtime::observe_and_intervene(observer, &format!("{path}.input"), hidden)?;
+        observer.observe(&format!("mtp.{depth}.capture"), &hidden)?;
+        let embedded = match parallel {
+            Some(parallel) => B::vocabulary_parallel_lookup(
+                &mut self.static_modules.embeddings,
+                tokens,
+                eredu_nn::EmbeddingLookupPolicy::Strict,
+                parallel,
+                context,
+            )?,
+            None => self.static_modules.embeddings.forward(tokens, context)?,
+        };
+        let mut output = forward(unit, &path, &hidden, &embedded, observer)?;
+        output.hidden = eredu_runtime::observe_and_intervene(
+            observer,
+            &format!("mtp.{depth}.output"),
+            &output.hidden,
+        )?;
+        output.hidden = eredu_runtime::observe_and_intervene(
+            observer,
+            &format!("{path}.output"),
+            &output.hidden,
+        )?;
+        Ok(output)
+    }
+
     /// Executes one target or prediction unit with runtime-supplied experts.
     #[allow(clippy::too_many_arguments)]
     pub fn forward_unit_with_provider<S, P>(
@@ -1038,34 +1307,18 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend + BlockwiseAtt
         S::LayerState: CompressedAttentionCache<B::Tensor>,
         O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
     {
-        match unit {
-            Unit::Target(unit) if group == 0 => unit.forward_observed(
-                &format!("model.layers.{index}"),
-                hidden,
-                forward.mask.as_ref(),
-                Some(
-                    state
-                        .layer(self.target_state_ordinal(index)?)
-                        .map_err(Error::backend)?,
-                ),
-                context,
-                observer,
-            ),
-            Unit::Prediction(_) if group > 0 => {
-                observer.observe(&format!("mtp.{}.capture", group - 1), hidden)?;
-                let output = <Self as LayeredArchitecture<B, S>>::forward_unit(
-                    self, group, index, unit, hidden, state, forward, context,
-                )?;
-                eredu_runtime::observe_and_intervene(
-                    observer,
-                    &format!("mtp.{}.output", group - 1),
-                    &output,
-                )
-            }
-            _ => Err(Error::backend(format!(
-                "V3 observed execution unit does not match group {group}"
-            ))),
-        }
+        self.forward_unit_observed_with_provider(
+            group,
+            index,
+            unit,
+            hidden,
+            state,
+            forward,
+            eredu_runtime::ExpertPass::Decode,
+            &mut eredu_runtime::ResidentExpertProvider,
+            context,
+            observer,
+        )
     }
 
     /// Executes one observed graph unit with runtime-supplied experts.
@@ -1091,7 +1344,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend + BlockwiseAtt
         P::Error: std::fmt::Display,
     {
         match unit {
-            Unit::Target(unit) if group == 0 => unit.forward_observed_with_provider(
+            Unit::Target(unit) if group == 0 => unit.forward_internal_observed_with_provider(
                 &format!("model.layers.{index}"),
                 hidden,
                 forward.mask.as_ref(),
@@ -1110,7 +1363,8 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend + BlockwiseAtt
                 let layer = usize::try_from(self.args.num_hidden_layers).map_err(Error::backend)?
                     + group
                     - 1;
-                let output = unit.forward_with_provider(
+                let output = unit.forward_observed_with_provider(
+                    &format!("model.layers.{layer}"),
                     hidden,
                     &forward.embedded,
                     &forward.tokens,
@@ -1118,6 +1372,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend + BlockwiseAtt
                     pass,
                     provider,
                     context,
+                    observer,
                 )?;
                 forward.draft_logits = Some(output.logits);
                 eredu_runtime::observe_and_intervene(
@@ -1143,10 +1398,18 @@ pub(crate) fn static_spec(args: &V3Args) -> StaticModuleSpec {
         hidden_size: args.hidden_size,
         normalization_epsilon: args.rms_norm_eps,
         normalization_offset: 0.0,
-        embedding_quantization: None,
+        embedding_quantization: args
+            .linear_formats
+            .get("model.embed_tokens.weight")
+            .and_then(|format| format.weight_quantization()),
         // Published V3/R1 checkpoints keep the output head dense, including
-        // otherwise block-FP8 models.
-        head_format: eredu_checkpoint::LinearFormat::Dense,
+        // otherwise block-FP8 models. An explicit selected format also covers
+        // GGUF storage and admitted load-time transformations of the head.
+        head_format: args
+            .linear_formats
+            .get("lm_head.weight")
+            .copied()
+            .unwrap_or(eredu_checkpoint::LinearFormat::Dense),
         tied_head: false,
     }
 }
@@ -1167,6 +1430,15 @@ where
     S: LayerRuntimeState<B>,
     S::LayerState: CompressedAttentionCache<B::Tensor>,
 {
+    fn observation_hooks(&self) -> eredu_runtime::inspection::ObservationHookSupport {
+        let target_only = self.groups.prediction_count() == 0;
+        eredu_runtime::inspection::ObservationHookSupport::internal(
+            target_only,
+            target_only,
+            target_only,
+        )
+    }
+
     type Input<'a> = EmbeddedInput<'a, B::Tensor>;
     type StaticModules = StaticModules<B>;
     type Unit = Unit<B>;
@@ -1323,6 +1595,46 @@ where
         self.groups.begin(group, initial, dependencies)
     }
 
+    fn begin_forward_observed<'a, O>(
+        &mut self,
+        input: Self::Input<'a>,
+        state: &mut S,
+        context: &<B::Tensor as Tensor>::Context,
+        observer: &mut O,
+    ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Error>
+    where
+        O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
+    {
+        let mut forward = self.begin_forward(input, state, context)?;
+        if matches!(forward.context.mode, ForwardMode::Target) {
+            let mut borrowed = eredu_runtime::BorrowedActivationObserver(observer);
+            forward.hidden =
+                crate::decoder::ComponentInstrumentation::new("readout", &mut borrowed)
+                    .apply("embedding", forward.hidden)?;
+            forward.context.embedded = forward.hidden.clone();
+        }
+        Ok(forward)
+    }
+
+    fn forward_unit_observed<O>(
+        &mut self,
+        group: usize,
+        index: usize,
+        unit: &mut Self::Unit,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &mut Self::ForwardContext,
+        context: &<B::Tensor as Tensor>::Context,
+        observer: &mut O,
+    ) -> Result<B::Tensor, Error>
+    where
+        O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
+    {
+        Model::forward_unit_observed(
+            self, group, index, unit, hidden, state, forward, context, observer,
+        )
+    }
+
     fn should_execute_group(&self, group: usize, forward: &Self::ForwardContext) -> bool {
         match forward.mode {
             ForwardMode::Target => group == 0,
@@ -1344,7 +1656,9 @@ where
         self.groups.unit_count(group)?;
         match unit {
             Unit::Target(unit) if group == 0 => {
-                let cache = state.layer(index).map_err(Error::backend)?;
+                let cache = state
+                    .layer(self.target_state_ordinal(index)?)
+                    .map_err(Error::backend)?;
                 unit.forward(hidden, forward.mask.as_ref(), Some(cache), context)
             }
             Unit::Prediction(unit) if group > 0 => {
@@ -1391,14 +1705,7 @@ where
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error> {
         match forward.mode {
-            ForwardMode::Target => {
-                let hidden = self.static_modules.norm.forward(hidden, context)?;
-                self.static_modules
-                    .lm_head
-                    .as_mut()
-                    .expect("validated V3 models have an untied output head")
-                    .forward(&hidden, context)
-            }
+            ForwardMode::Target => self.pipeline_finish(hidden, context),
             ForwardMode::Draft(_) => forward
                 .draft_logits
                 .clone()
@@ -1406,6 +1713,30 @@ where
             ForwardMode::DsparkContext | ForwardMode::DsparkProposal => {
                 Err(Error::backend("DSpark mode reached the V3 output path"))
             }
+        }
+    }
+
+    fn finish_forward_observed<O>(
+        &mut self,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &Self::ForwardContext,
+        context: &<B::Tensor as Tensor>::Context,
+        observer: &mut O,
+    ) -> Result<B::Tensor, Error>
+    where
+        O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
+    {
+        if matches!(forward.mode, ForwardMode::Target) {
+            let mut borrowed = eredu_runtime::BorrowedActivationObserver(observer);
+            self.finish_target_instrumented(
+                hidden,
+                None,
+                context,
+                &mut crate::decoder::ComponentInstrumentation::new("readout", &mut borrowed),
+            )
+        } else {
+            self.finish_forward(hidden, state, forward, context)
         }
     }
 
@@ -1432,6 +1763,119 @@ where
     S: LayerRuntimeState<B>,
     S::LayerState: CompressedAttentionCache<B::Tensor>,
 {
+    fn parallel_observation_hooks(&self) -> eredu_runtime::inspection::ObservationHookSupport {
+        let target_only = self.groups.prediction_count() == 0;
+        eredu_runtime::inspection::ObservationHookSupport::internal(
+            target_only,
+            target_only,
+            target_only,
+        )
+    }
+
+    fn begin_forward_parallel_observed<'a, O>(
+        &mut self,
+        input: Self::Input<'a>,
+        state: &mut S,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+        observer: &mut O,
+    ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Error>
+    where
+        O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
+    {
+        let mut forward = self.begin_forward_parallel(input, state, parallel, context)?;
+        if matches!(forward.context.mode, ForwardMode::Target) {
+            let mut borrowed = eredu_runtime::BorrowedActivationObserver(observer);
+            forward.hidden =
+                crate::decoder::ComponentInstrumentation::new("readout", &mut borrowed)
+                    .apply("embedding", forward.hidden)?;
+            forward.context.embedded = forward.hidden.clone();
+        }
+        Ok(forward)
+    }
+
+    fn forward_unit_parallel_observed<O>(
+        &mut self,
+        group: usize,
+        index: usize,
+        unit: &mut Self::Unit,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &mut Self::ForwardContext,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+        observer: &mut O,
+    ) -> Result<B::Tensor, Error>
+    where
+        O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
+    {
+        match unit {
+            Unit::Target(unit) if group == 0 => unit.forward_parallel_observed(
+                &format!("model.layers.{index}"),
+                hidden,
+                forward.mask.as_ref(),
+                Some(
+                    state
+                        .layer(self.target_state_ordinal(index)?)
+                        .map_err(Error::backend)?,
+                ),
+                context,
+                observer,
+                |value, context| B::sum_parallel(value, parallel, context),
+            ),
+            Unit::Prediction(unit) if group > 0 => {
+                observer.observe(&format!("mtp.{}.capture", group - 1), hidden)?;
+                let layer = usize::try_from(self.args.num_hidden_layers).map_err(Error::backend)?
+                    + group
+                    - 1;
+                let output = unit.forward_parallel_observed(
+                    &format!("model.layers.{layer}"),
+                    hidden,
+                    &forward.embedded,
+                    &forward.tokens,
+                    state.layer(layer).map_err(Error::backend)?,
+                    context,
+                    observer,
+                    |value, context| B::sum_parallel(value, parallel, context),
+                )?;
+                forward.draft_logits = Some(output.logits);
+                eredu_runtime::observe_and_intervene(
+                    observer,
+                    &format!("mtp.{}.output", group - 1),
+                    &output.hidden,
+                )
+            }
+            _ => self.forward_unit_parallel(
+                group, index, unit, hidden, state, forward, parallel, context,
+            ),
+        }
+    }
+
+    fn finish_forward_parallel_observed<O>(
+        &mut self,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &Self::ForwardContext,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+        observer: &mut O,
+    ) -> Result<B::Tensor, Error>
+    where
+        O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
+    {
+        if matches!(forward.mode, ForwardMode::Target) {
+            let mut borrowed = eredu_runtime::BorrowedActivationObserver(observer);
+            self.finish_target_instrumented(
+                hidden,
+                Some(parallel),
+                context,
+                &mut crate::decoder::ComponentInstrumentation::new("readout", &mut borrowed),
+            )
+        } else {
+            self.finish_forward_parallel(hidden, state, forward, parallel, context)
+        }
+    }
+
     fn begin_forward_parallel<'a>(
         &mut self,
         input: Self::Input<'a>,
@@ -1519,7 +1963,11 @@ where
             Unit::Target(unit) if group == 0 => unit.forward_parallel(
                 hidden,
                 forward.mask.as_ref(),
-                Some(state.layer(index).map_err(Error::backend)?),
+                Some(
+                    state
+                        .layer(self.target_state_ordinal(index)?)
+                        .map_err(Error::backend)?,
+                ),
                 context,
                 |value, context| B::sum_parallel(value, parallel, context),
             ),
@@ -1553,18 +2001,7 @@ where
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error> {
         match forward.mode {
-            ForwardMode::Target => {
-                let hidden = self.static_modules.norm.forward(hidden, context)?;
-                B::vocabulary_parallel_project(
-                    self.static_modules
-                        .lm_head
-                        .as_mut()
-                        .expect("validated V3 models have an untied output head"),
-                    &hidden,
-                    parallel,
-                    context,
-                )
-            }
+            ForwardMode::Target => self.pipeline_finish_parallel(hidden, parallel, context),
             ForwardMode::Draft(_) => forward
                 .draft_logits
                 .clone()
@@ -1584,6 +2021,18 @@ where
     S: LayerRuntimeState<B>,
     S::LayerState: CompressedAttentionCache<B::Tensor> + RuntimeStateComponents<B>,
 {
+    fn partition_observation_hooks(
+        &self,
+        _tensor_parallel: bool,
+    ) -> eredu_runtime::inspection::ObservationHookSupport {
+        let target_only = self.groups.prediction_count() == 0;
+        eredu_runtime::inspection::ObservationHookSupport::internal(
+            target_only,
+            target_only,
+            target_only,
+        )
+    }
+
     type Boundary = TargetBoundarySchema;
 
     fn boundary_schema(&self) -> Result<Self::Boundary, Self::Error> {
@@ -1637,6 +2086,76 @@ where
             context,
         )
         .map(|(forward, _)| forward)
+    }
+
+    fn begin_partition_observed<'a, O>(
+        &mut self,
+        input: LayeredPartitionInput<'a, B::Tensor, TargetBoundary<B::Tensor>>,
+        mask: Option<&B::Tensor>,
+        state: &mut S,
+        expected: &StateLayout,
+        first_state_ordinal: usize,
+        parallel: Option<&B::ParallelContext>,
+        context: &<B::Tensor as Tensor>::Context,
+        observer: &mut O,
+    ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Error>
+    where
+        O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
+    {
+        let embedded = matches!(&input, LayeredPartitionInput::Tokens(_));
+        let mut forward = match parallel {
+            Some(parallel) => self.begin_partition_parallel(
+                input,
+                mask,
+                state,
+                expected,
+                first_state_ordinal,
+                parallel,
+                context,
+            ),
+            None => {
+                self.begin_partition(input, mask, state, expected, first_state_ordinal, context)
+            }
+        }?;
+        if embedded {
+            let mut borrowed = eredu_runtime::BorrowedActivationObserver(observer);
+            forward.hidden =
+                crate::decoder::ComponentInstrumentation::new("readout", &mut borrowed)
+                    .apply("embedding", forward.hidden)?;
+            // The effective embedding is part of the typed boundary for later
+            // prediction groups, not a baseline copy retained before intervention.
+            forward.context.embedded = forward.hidden.clone();
+        }
+        Ok(forward)
+    }
+
+    fn finish_partition_observed<O>(
+        &mut self,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &Self::ForwardContext,
+        owns_output: bool,
+        parallel: Option<&B::ParallelContext>,
+        context: &<B::Tensor as Tensor>::Context,
+        observer: &mut O,
+    ) -> Result<LayeredPartitionOutput<B::Tensor, TargetBoundary<B::Tensor>>, Error>
+    where
+        O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
+    {
+        if !owns_output {
+            return self.finish_partition(hidden, state, forward, false, parallel, context);
+        }
+        let mut borrowed = eredu_runtime::BorrowedActivationObserver(observer);
+        let output = self.finish_target_instrumented(
+            hidden,
+            parallel,
+            context,
+            &mut crate::decoder::ComponentInstrumentation::new("readout", &mut borrowed),
+        )?;
+        Ok(LayeredPartitionOutput::Final {
+            output,
+            retained: Some(hidden.clone()),
+        })
     }
 
     fn finish_partition(
@@ -1753,6 +2272,13 @@ fn moe_policy_for_layer(args: &V3Args, layer: usize) -> Result<MoePolicy, Error>
         expert_groups: args.n_group,
         selected_groups: args.topk_group,
         router_weight: format!("{root}.gate.weight"),
+        // Released routers stay dense unless exact selected encoding facts
+        // explicitly request a different realization (including load transforms).
+        router_format: args
+            .linear_formats
+            .get(&format!("{root}.gate.weight"))
+            .copied()
+            .unwrap_or(eredu_checkpoint::LinearFormat::Dense),
         correction_bias: Some(format!("{root}.gate.e_score_correction_bias")),
         expert_gate_up: format!("{root}.experts.gate_up_proj"),
         expert_down: format!("{root}.experts.down_proj"),

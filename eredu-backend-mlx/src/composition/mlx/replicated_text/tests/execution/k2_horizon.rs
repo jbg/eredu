@@ -162,15 +162,15 @@ fn k2_mova_native_control_forks_and_bank_interventions_preserve_state_and_accoun
         decisions: BTreeMap<String, (Vec<u32>, Vec<f32>)>,
         applied: Vec<String>,
     }
-    impl eredu_runtime::ActivationObserver<Array, Exception> for Observer {
-        fn observe(&mut self, _: &str, _: &Array) -> Result<(), Exception> {
+    impl eredu_runtime::ActivationObserver<Array, Error> for Observer {
+        fn observe(&mut self, _: &str, _: &Array) -> Result<(), Error> {
             Ok(())
         }
         fn routing_control(
             &mut self,
             path: &str,
             rows: u64,
-        ) -> Result<Option<GroupSelectionControl>, Exception> {
+        ) -> Result<Option<GroupSelectionControl>, Error> {
             assert_eq!(rows, 1);
             Ok(self
                 .control
@@ -183,7 +183,7 @@ fn k2_mova_native_control_forks_and_bank_interventions_preserve_state_and_accoun
             path: &str,
             original: Option<eredu_runtime::RoutingDecision<'_, Array>>,
             _: eredu_runtime::RoutingDecision<'_, Array>,
-        ) -> Result<(), Exception> {
+        ) -> Result<(), Error> {
             assert!(original.is_some());
             self.applied.push(path.to_owned());
             Ok(())
@@ -191,7 +191,7 @@ fn k2_mova_native_control_forks_and_bank_interventions_preserve_state_and_accoun
         fn observe_routing(
             &mut self,
             routing: eredu_runtime::RoutingObservation<'_, Array>,
-        ) -> Result<(), Exception> {
+        ) -> Result<(), Error> {
             let ids = routing
                 .selected_experts
                 .as_dtype(Dtype::Uint32, &self.stream)?

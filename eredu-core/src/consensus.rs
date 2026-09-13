@@ -1,4 +1,4 @@
-//! Backend-neutral distributed scheduler consensus.
+//! Backend-neutral distributed consensus transport and scheduler protocols.
 //!
 //! Core defines the wire records and validates rank agreement. A backend
 //! adapter supplies only a topology-scoped all-gather of portable words.
@@ -6,11 +6,13 @@
 use crate::scheduler::{CancellationCause, RequestId, WorkId};
 use crate::{BoundedCompletion, BoundedCompletionWait, BoundedSubmissionOutcome, Submission};
 
-/// Topology-scoped transport for scheduler metadata.
+/// Topology-scoped transport for bounded portable host protocols.
 ///
 /// Implementations must return rank-major concatenation of one equally sized
-/// word frame from every participant. The scheduler never sends tensors,
-/// caches, streams, or executable objects through this interface.
+/// word frame from every participant. Protocol owners must admit and account for
+/// their frames before submission. Native tensors, caches, streams, or executable
+/// objects are never serialized through this interface. Scheduler metadata and
+/// explicitly budgeted capture receipts use the same native completion mechanism.
 pub trait ConsensusTransport {
     /// Transport error.
     type Error: std::error::Error;

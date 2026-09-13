@@ -105,9 +105,12 @@ fn grouped_tiled_config(
     out_dim: i32,
     scale_out: i32,
     scale_cols: i32,
+    row_width: i32,
 ) -> CustomKernelConfig {
     linear_tiled_config(routes, in_dim, out_dim, scale_cols)
         .with_template_arg_int("SCALE_OUT", scale_out)
+        .with_template_arg_int("ROW_WIDTH", row_width)
+        .with_template_arg_int("ROW_SCALES", ceil_div(row_width, SCALE_BLOCK))
 }
 
 fn activation_dtype(input: &Array) -> Result<Dtype, Exception> {
@@ -263,12 +266,23 @@ fn activation_reference(
     stream: &Stream,
 ) -> Result<Array, Exception> {
     let quantized = quantize_activations(input, rows, in_dim, stream)?;
-    let scales = Array::repeat_axis::<f32>(quantized.scales, SCALE_BLOCK, 1, stream)?;
+    dequantize_activations(&quantized, input.shape(), stream)
+}
+
+fn dequantize_activations(
+    quantized: &QuantizedActivations,
+    shape: &[i32],
+    stream: &Stream,
+) -> Result<Array, Exception> {
+    let in_dim = *shape
+        .last()
+        .ok_or_else(|| Exception::custom("activation input has no feature axis"))?;
+    let scales = Array::repeat_axis::<f32>(quantized.scales.clone(), SCALE_BLOCK, 1, stream)?;
     quantized
         .values
         .from_fp8(Dtype::Float32, stream)?
         .multiply(scales.try_index_device((.., ..in_dim), stream)?, stream)?
-        .reshape(input.shape(), stream)
+        .reshape(shape, stream)
 }
 
 #[cfg(not(feature = "cuda"))]
@@ -341,15 +355,81 @@ fn activation_quantization_kernel_cuda() -> Result<CudaKernel, Exception> {
     )
 }
 
-/// Expands one rank-2 block-scaled E4M3 matrix to floating point.
+/// Expands one block-scaled E4M3 matrix or rank-3 matrix bank to floating point.
 ///
 /// This is intended for algorithms that must absorb or slice a projection
 /// matrix rather than apply it as a conventional linear operation. Callers
 /// should keep the result transient.
 pub fn dequantize(weight: &Array, scale: &Array, stream: &Stream) -> Result<Array, Exception> {
+    dequantize_with_row_layout(weight, scale, eredu_nn::LinearRowLayout::Contiguous, stream)
+}
+
+/// Decodes architecture-declared independent row blocks without joining their tails.
+pub fn dequantize_with_row_layout(
+    weight: &Array,
+    scale: &Array,
+    layout: eredu_nn::LinearRowLayout,
+    stream: &Stream,
+) -> Result<Array, Exception> {
+    if layout != eredu_nn::LinearRowLayout::Contiguous {
+        if !(2..=3).contains(&weight.ndim())
+            || weight.ndim() != scale.ndim()
+            || weight.shape().iter().any(|n| *n <= 0)
+        {
+            return Err(Exception::custom(
+                "invalid independently blocked FP8 geometry",
+            ));
+        }
+        let rows = weight.dim(-2);
+        let columns = weight.dim(-1);
+        let groups = if weight.ndim() == 3 { weight.dim(0) } else { 1 };
+        let width = layout
+            .rows_per_partition(rows as usize)
+            .map_err(|error| Exception::custom(error.to_string()))?;
+        let scale_rows = layout
+            .scale_rows(rows as usize, SCALE_BLOCK as usize)
+            .map_err(|error| Exception::custom(error.to_string()))?;
+        if scale.dim(-2) as usize != scale_rows
+            || scale.dim(-1) != ceil_div(columns, SCALE_BLOCK)
+            || (weight.ndim() == 3 && scale.dim(0) != groups)
+        {
+            return Err(Exception::custom(
+                "independent FP8 scale rows disagree with declared layout",
+            ));
+        }
+        let count = (groups as usize)
+            .checked_mul(layout.partitions())
+            .and_then(|n| i32::try_from(n).ok())
+            .ok_or_else(|| Exception::custom("independent FP8 partition count overflows"))?;
+        let weight_parts = weight.reshape(&[count, width as i32, columns], stream)?;
+        let scale_parts = scale.reshape(
+            &[
+                count,
+                (scale_rows / layout.partitions()) as i32,
+                scale.dim(-1),
+            ],
+            stream,
+        )?;
+        return dequantize_grouped(&weight_parts, &scale_parts, stream)?
+            .reshape(weight.shape(), stream);
+    }
+    if weight.ndim() == 3 && scale.ndim() == 3 {
+        if weight.dim(0) <= 0
+            || weight.dim(1) <= 0
+            || weight.dim(2) <= 0
+            || scale.dim(0) != weight.dim(0)
+            || scale.dim(1) != ceil_div(weight.dim(1), SCALE_BLOCK)
+            || scale.dim(2) != ceil_div(weight.dim(2), SCALE_BLOCK)
+        {
+            return Err(Exception::custom(
+                "invalid grouped block-FP8 scale geometry",
+            ));
+        }
+        return dequantize_grouped(weight, scale, stream);
+    }
     if weight.ndim() != 2 || scale.ndim() != 2 {
         return Err(Exception::custom(
-            "block-FP8 dequantization expects rank-2 weight and scale arrays",
+            "block-FP8 dequantization expects matching rank-2 or rank-3 weight and scale arrays",
         ));
     }
     let scale = decode_scale(scale, stream)?;
@@ -369,6 +449,16 @@ pub fn linear(
     weight: &Array,
     scale: &Array,
     stream: &Stream,
+) -> Result<Array, Exception> {
+    linear_with_input_observer(input, weight, scale, stream, None)
+}
+
+pub(crate) fn linear_with_input_observer(
+    input: &Array,
+    weight: &Array,
+    scale: &Array,
+    stream: &Stream,
+    observer: Option<&mut dyn super::linear::NativeProjectionInputObserver>,
 ) -> Result<Array, Exception> {
     if input.ndim() < 1 || weight.ndim() != 2 || scale.ndim() != 2 {
         return Err(Exception::custom(
@@ -394,11 +484,29 @@ pub fn linear(
     if is_cpu_stream(stream)? {
         let weight = dequantize(weight, &scale, stream)?;
         let input = activation_reference(input, rows, in_dim, stream)?;
+        if let Some(observer) = observer {
+            observer.observe(&input)?;
+        }
         let output = matmul(&input, &weight.transpose(stream)?, stream)?;
         return restore_activation_dtype(output, output_dtype, stream);
     }
+    let prototype = input;
     let input = input.reshape(&[rows, in_dim], stream)?;
     let input = quantize_activations(&input, rows, in_dim, stream)?;
+    if let Some(observer) = observer {
+        // Repeated scales retain complete blocks even when the feature axis is
+        // narrower than 128. Include that padding before offering the factory.
+        let creation_bytes =
+            projection_input_capture_storage(prototype.size() as u64, rows as u64, in_dim as u64)
+                .ok_or_else(|| Exception::custom("projection-input capture storage overflow"))?;
+        let source = eredu_nn::GeneratedTensorSource {
+            creation_bytes,
+            element_type: Some(eredu_nn::TensorElementType::F32),
+        };
+        observer.observe_generated(prototype, &source, &mut || {
+            dequantize_activations(&input, input_shape, stream)
+        })?;
+    }
     let scale_cols = scale.dim(1);
 
     let out = linear_quantized(
@@ -406,6 +514,18 @@ pub fn linear(
     )?;
 
     finish_linear_output(out, input_shape, output_dtype, out_dim, stream)
+}
+
+/// Logical factory bound shared by live FP8 input capture and cold admission.
+pub(crate) fn projection_input_capture_storage(
+    elements: u64,
+    rows: u64,
+    width: u64,
+) -> Option<u64> {
+    rows.checked_mul(width.div_ceil(SCALE_BLOCK as u64))?
+        .checked_mul(SCALE_BLOCK as u64 * 4)?
+        .checked_add(elements.checked_mul(12)?)?
+        .checked_add(4096)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -668,17 +788,41 @@ pub fn grouped_linear(
     group_ids: &Array,
     stream: &Stream,
 ) -> Result<Array, Exception> {
+    grouped_linear_with_row_layout(
+        input,
+        weight,
+        scale,
+        group_ids,
+        eredu_nn::LinearRowLayout::Contiguous,
+        stream,
+    )
+}
+
+/// Applies a grouped projection with explicit independent row-block origins.
+pub fn grouped_linear_with_row_layout(
+    input: &Array,
+    weight: &Array,
+    scale: &Array,
+    group_ids: &Array,
+    layout: eredu_nn::LinearRowLayout,
+    stream: &Stream,
+) -> Result<Array, Exception> {
     if input.ndim() != 2 || weight.ndim() != 3 || scale.ndim() != 3 || group_ids.ndim() != 1 {
         return Err(Exception::custom(
             "grouped block-FP8 linear expects rank-2 input, rank-3 weight/scale, and rank-1 group ids",
         ));
     }
-    let scale = decode_scale(scale, stream)?;
     let output_dtype = activation_dtype(input)?;
     let routes = input.dim(0);
     let in_dim = input.dim(1);
     let groups = weight.dim(0);
     let out_dim = weight.dim(1);
+    let row_width = layout
+        .rows_per_partition(out_dim.max(0) as usize)
+        .map_err(|error| Exception::custom(error.to_string()))? as i32;
+    let scale_rows = layout
+        .scale_rows(out_dim.max(0) as usize, SCALE_BLOCK as usize)
+        .map_err(|error| Exception::custom(error.to_string()))? as i32;
     if routes != group_ids.dim(0)
         || routes <= 0
         || groups <= 0
@@ -686,7 +830,7 @@ pub fn grouped_linear(
         || in_dim <= 0
         || weight.dim(2) != in_dim
         || scale.dim(0) != groups
-        || scale.dim(1) != ceil_div(out_dim, SCALE_BLOCK)
+        || scale.dim(1) != scale_rows
         || scale.dim(2) != ceil_div(in_dim, SCALE_BLOCK)
     {
         return Err(Exception::custom(
@@ -694,8 +838,23 @@ pub fn grouped_linear(
         ));
     }
     let scale_cols = scale.dim(2);
+    if matches!(
+        weight.dtype(),
+        Dtype::Float32 | Dtype::Float16 | Dtype::Bfloat16
+    ) {
+        // A parameter overlay promotes this complete bank to floating point,
+        // including its projection input arithmetic, as for ordinary linears.
+        return grouped_matmul(
+            input,
+            &weight.swap_axes(-1, -2, stream)?,
+            group_ids,
+            true,
+            stream,
+        );
+    }
+    let scale = decode_scale(scale, stream)?;
     if is_cpu_stream(stream)? {
-        let weight = dequantize_grouped(weight, &scale, stream)?;
+        let weight = dequantize_with_row_layout(weight, &scale, layout, stream)?;
         let input = activation_reference(input, routes, in_dim, stream)?;
         let output = grouped_matmul(
             &input,
@@ -719,6 +878,7 @@ pub fn grouped_linear(
         in_dim,
         out_dim,
         scale_cols,
+        row_width,
         stream,
     )?;
 
@@ -734,6 +894,7 @@ pub fn grouped_linear(
             in_dim,
             out_dim,
             scale_cols,
+            row_width,
             stream,
         )?
     } else {
@@ -747,6 +908,7 @@ pub fn grouped_linear(
             in_dim,
             out_dim,
             scale_cols,
+            row_width,
             stream,
         )?
     };
@@ -766,13 +928,15 @@ fn grouped_linear_tiled_cuda(
     in_dim: i32,
     out_dim: i32,
     scale_cols: i32,
+    row_width: i32,
     stream: &Stream,
 ) -> Result<Array, Exception> {
     GROUPED_LINEAR_KERNEL.with(|cell| -> Result<_, Exception> {
         if cell.borrow().is_none() {
             *cell.borrow_mut() = Some(grouped_linear_kernel_cuda()?);
         }
-        let config = grouped_tiled_config(routes, in_dim, out_dim, scale.dim(1), scale_cols);
+        let config =
+            grouped_tiled_config(routes, in_dim, out_dim, scale.dim(1), scale_cols, row_width);
         cell.borrow()
             .as_ref()
             .expect("CUDA grouped FP8 linear kernel initialized")
@@ -800,7 +964,7 @@ fn grouped_linear_kernel_cuda() -> Result<CudaKernel, Exception> {
             "if (out_col < OUT_DIM) {",
             " for (uint32_t k = lane_k; k < IN_DIM; k += REDUCTION_TILE) {",
             "  uint32_t wi = (group * OUT_DIM + out_col) * IN_DIM + k;",
-            "  uint32_t si = (group * SCALE_OUT + out_col / SCALE_BLOCK) * SCALE_COLS + k / SCALE_BLOCK;",
+            "  uint32_t si = (group * SCALE_OUT + (out_col / ROW_WIDTH) * ROW_SCALES + (out_col % ROW_WIDTH) / SCALE_BLOCK) * SCALE_COLS + k / SCALE_BLOCK;",
             "  float xs = float(input_scale[route * SCALE_COLS + k / SCALE_BLOCK]);",
             "  acc += fp8_e4m3_to_float(input[route * IN_DIM + k]) * fp8_e4m3_to_float(weight[wi]) * xs * float(scale[si]);",
             " }",
@@ -831,13 +995,15 @@ fn grouped_linear_tiled(
     in_dim: i32,
     out_dim: i32,
     scale_cols: i32,
+    row_width: i32,
     stream: &Stream,
 ) -> Result<Array, Exception> {
     GROUPED_LINEAR_KERNEL.with(|cell| -> Result<_, Exception> {
         if cell.borrow().is_none() {
             *cell.borrow_mut() = Some(grouped_linear_kernel()?);
         }
-        let config = grouped_tiled_config(routes, in_dim, out_dim, scale.dim(1), scale_cols);
+        let config =
+            grouped_tiled_config(routes, in_dim, out_dim, scale.dim(1), scale_cols, row_width);
         cell.borrow()
             .as_ref()
             .expect("grouped FP8 linear kernel initialized")
@@ -861,6 +1027,7 @@ fn grouped_linear_scalar(
     in_dim: i32,
     out_dim: i32,
     scale_cols: i32,
+    row_width: i32,
     stream: &Stream,
 ) -> Result<Array, Exception> {
     GROUPED_LINEAR_SCALAR_KERNEL.with(|cell| -> Result<_, Exception> {
@@ -871,6 +1038,8 @@ fn grouped_linear_scalar(
             .with_template_arg_int("IN_DIM", in_dim)
             .with_template_arg_int("OUT_DIM", out_dim)
             .with_template_arg_int("SCALE_OUT", scale.dim(1))
+            .with_template_arg_int("ROW_WIDTH", row_width)
+            .with_template_arg_int("ROW_SCALES", ceil_div(row_width, SCALE_BLOCK))
             .with_template_arg_int("SCALE_BLOCK", SCALE_BLOCK)
             .with_template_arg_int("SCALE_COLS", scale_cols)
             .with_grid([routes * out_dim, 1, 1])
@@ -905,7 +1074,7 @@ fn grouped_linear_kernel() -> Result<MetalKernel, Exception> {
             "if (out_col < OUT_DIM) {",
             " for (uint k = lane_k; k < IN_DIM; k += REDUCTION_TILE) {",
             "  uint wi = (group * OUT_DIM + out_col) * IN_DIM + k;",
-            "  uint si = (group * SCALE_OUT + out_col / SCALE_BLOCK) * SCALE_COLS + k / SCALE_BLOCK;",
+            "  uint si = (group * SCALE_OUT + (out_col / ROW_WIDTH) * ROW_SCALES + (out_col % ROW_WIDTH) / SCALE_BLOCK) * SCALE_COLS + k / SCALE_BLOCK;",
             "  float xs = float(input_scale[route * SCALE_COLS + k / SCALE_BLOCK]);",
             "  acc += fp8_e4m3_to_float(input[input_base + k]) * fp8_e4m3_to_float(weight[wi]) * xs * float(scale[si]);",
             " }",
@@ -938,7 +1107,7 @@ fn grouped_linear_scalar_kernel() -> Result<MetalKernel, Exception> {
             "float acc = 0.0f;",
             "uint weight_base = (group * OUT_DIM + out_col) * IN_DIM;",
             "uint input_base = route * IN_DIM;",
-            "uint scale_base = (group * SCALE_OUT + out_col / SCALE_BLOCK) * SCALE_COLS;",
+            "uint scale_base = (group * SCALE_OUT + (out_col / ROW_WIDTH) * ROW_SCALES + (out_col % ROW_WIDTH) / SCALE_BLOCK) * SCALE_COLS;",
             "for (uint k = 0; k < IN_DIM; ++k) {",
             " float w = fp8_e4m3_to_float(weight[weight_base + k]);",
             " uint scale_col = k / SCALE_BLOCK;",

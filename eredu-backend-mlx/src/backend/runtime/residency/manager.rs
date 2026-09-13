@@ -245,13 +245,28 @@ pub struct ResidencyManager {
     inner: Arc<ManagerInner>,
 }
 
+/// Immutable source identity is retained per physical unit. Transformed modules
+/// may use the same source key with different geometry or values.
+pub(super) struct ResidencySources {
+    primary: eredu_checkpoint::store::SharedCheckpointSource,
+    units: BTreeMap<OffloadUnitId, eredu_checkpoint::store::SharedCheckpointSource>,
+}
+impl ResidencySources {
+    fn source(&self, unit: &OffloadUnitId) -> &dyn eredu_checkpoint::store::CheckpointSource {
+        self.units.get(unit).unwrap_or(&self.primary).as_ref()
+    }
+}
+
 fn preflight_residency_owner_bindings(
-    store: &dyn eredu_checkpoint::store::CheckpointSource,
+    sources: &ResidencySources,
     control: &ResidencyController,
 ) -> Result<(), ResidencyError> {
     for unit in control.units() {
-        eredu_runtime::preflight_bindings::<MlxNeuralBackend>(store, unit.bindings())
-            .map_err(|error| ResidencyError::BindingPreflight(error.to_string()))?;
+        eredu_runtime::preflight_bindings::<MlxNeuralBackend>(
+            sources.source(unit.id()),
+            unit.bindings(),
+        )
+        .map_err(|error| ResidencyError::BindingPreflight(error.to_string()))?;
     }
     Ok(())
 }
@@ -295,9 +310,41 @@ impl ResidencyManager {
         source_stream: Stream,
         device_stream: Stream,
     ) -> Result<Self, ResidencyError> {
+        Self::new_shared_sources(
+            store,
+            BTreeMap::new(),
+            plan,
+            units,
+            source_stream,
+            device_stream,
+        )
+    }
+
+    /// Creates one shared reservation ledger over exact per-unit source stores.
+    /// Units absent from `unit_sources` use the primary source. Sources are
+    /// retained as admitted; no checkpoint is reopened or resolved here.
+    pub fn new_shared_sources(
+        store: eredu_checkpoint::store::SharedCheckpointSource,
+        unit_sources: BTreeMap<OffloadUnitId, eredu_checkpoint::store::SharedCheckpointSource>,
+        plan: OffloadPlan,
+        units: impl IntoIterator<Item = OffloadUnit>,
+        source_stream: Stream,
+        device_stream: Stream,
+    ) -> Result<Self, ResidencyError> {
+        let sources = ResidencySources {
+            primary: store,
+            units: unit_sources,
+        };
         let units = units.into_iter().collect::<Vec<_>>();
-        let control = ResidencyController::new(store.as_ref(), plan, units)?;
-        preflight_residency_owner_bindings(store.as_ref(), &control)?;
+        let control = ResidencyController::new_with_catalogs(|id| sources.source(id), plan, units)?;
+        for id in sources.units.keys() {
+            if control.unit(id).is_none() {
+                return Err(
+                    ResidencyControllerError::UnexpectedUnitDefinition { id: id.clone() }.into(),
+                );
+            }
+        }
+        preflight_residency_owner_bindings(&sources, &control)?;
 
         let source_device = source_stream
             .get_device()
@@ -325,7 +372,7 @@ impl ResidencyManager {
         let failed_transfer = Arc::new(std::sync::atomic::AtomicBool::new(false));
         Ok(Self {
             inner: Arc::new(ManagerInner {
-                store,
+                sources,
                 failed_transfer: Arc::clone(&failed_transfer),
                 state: Mutex::new(ManagerState {
                     failed_transfer,
@@ -364,7 +411,7 @@ impl ResidencyManager {
             .collect::<Vec<_>>();
         for (id, tier) in assignments {
             if tier != MemoryTier::Disk {
-                ensure_resident(&mut state, self.inner.store.as_ref(), &id, tier, true)?;
+                ensure_resident(&mut state, &self.inner.sources, &id, tier, true)?;
             }
         }
         state.control.ledger_mut().mark_initialized();
@@ -390,7 +437,7 @@ impl ResidencyManager {
             }
             state = self.wait_for_transfer(state)?;
         }
-        prefetch_locked(&mut state, self.inner.store.as_ref(), id, tier)
+        prefetch_locked(&mut state, &self.inner.sources, id, tier)
     }
 
     /// Ensures residency and returns an RAII lease protecting the requested copy.
@@ -497,7 +544,7 @@ impl ResidencyManager {
         let started = Instant::now();
         let residency = ensure_many_resident(
             &mut state,
-            self.inner.store.as_ref(),
+            &self.inner.sources,
             &ids,
             tier,
             return_transfer,
@@ -608,7 +655,7 @@ impl ResidencyManager {
         selected
             .into_iter()
             .map(|id| {
-                prefetch_locked(&mut state, self.inner.store.as_ref(), &id, tier)
+                prefetch_locked(&mut state, &self.inner.sources, &id, tier)
                     .map(|outcome| (id, outcome))
             })
             .collect()
@@ -680,7 +727,19 @@ impl ResidencyManager {
             offload,
             units,
             active_window,
-            self.inner.store.source_diagnostics()?,
+            self.inner.sources.primary.source_diagnostics()?,
+        )
+        .with_unit_sources(
+            self.inner
+                .sources
+                .units
+                .iter()
+                .map(|(id, source)| {
+                    source
+                        .source_diagnostics()
+                        .map(|diagnostics| (id.clone(), diagnostics))
+                })
+                .collect::<Result<_, _>>()?,
         ))
     }
 

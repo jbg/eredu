@@ -1,8 +1,6 @@
 //! Shared lifecycle for heterogeneous stateful text decoders.
 
-use eredu_nn::{
-    EmbeddingOperator, Error, LinearOperator, NeuralBackend, NormalizationOperator, Tensor,
-};
+use eredu_nn::{EmbeddingOperator, Error, LinearOperator, NeuralBackend, Tensor};
 
 use crate::decoder::{
     SequentialGroup, SequentialPredictionGroups, StaticModuleSpec, StaticModules,
@@ -14,13 +12,30 @@ enum HybridExecutionGroups {
     TargetAndPrediction(SequentialPredictionGroups),
 }
 
-/// Static modules and one ordinary target execution group shared by hybrid decoders.
-///
-/// Family modules retain their closed operator policies and block equations. This
-/// assembly owns only the common embedding/finalization and stable layered-group
-/// lifecycle used by those blocks.
-pub struct HybridDecoder<B: NeuralBackend> {
-    static_modules: StaticModules<B>,
+/// Pinned decoder modules with architecture-owned shared execution parameters.
+#[derive(Debug, eredu_nn::Parameterized)]
+#[parameterized(tensor = "B::Tensor")]
+pub struct HybridStaticModules<B: NeuralBackend, E> {
+    /// Shared token embedding, normalization, and vocabulary projection.
+    pub base: StaticModules<B>,
+    /// Architecture-owned pinned modules shared by execution units.
+    pub extension: E,
+}
+
+impl<B: NeuralBackend, E: Clone> Clone for HybridStaticModules<B, E> {
+    fn clone(&self) -> Self {
+        Self {
+            base: self.base.clone(),
+            extension: self.extension.clone(),
+        }
+    }
+}
+
+/// Common hybrid execution shell with an optional architecture-owned extension.
+/// Family modules retain their operator policies and block equations; this shell
+/// owns embedding/finalization and the stable target/prediction group lifecycle.
+pub struct HybridDecoder<B: NeuralBackend, E = ()> {
+    static_modules: HybridStaticModules<B, E>,
     groups: HybridExecutionGroups,
 }
 
@@ -33,7 +48,10 @@ impl<B: NeuralBackend> HybridDecoder<B> {
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
         Ok(Self {
-            static_modules: StaticModules::from_spec(static_spec, context)?,
+            static_modules: HybridStaticModules {
+                base: StaticModules::from_spec(static_spec, context)?,
+                extension: (),
+            },
             groups: HybridExecutionGroups::Target(SequentialGroup::new(
                 TARGET_EXECUTION_GROUP,
                 parameter_root,
@@ -54,7 +72,10 @@ impl<B: NeuralBackend> HybridDecoder<B> {
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
         Ok(Self {
-            static_modules: StaticModules::from_spec(static_spec, context)?,
+            static_modules: HybridStaticModules {
+                base: StaticModules::from_spec(static_spec, context)?,
+                extension: (),
+            },
             groups: HybridExecutionGroups::TargetAndPrediction(
                 SequentialPredictionGroups::new_pattern(
                     target_parameter_root,
@@ -67,19 +88,47 @@ impl<B: NeuralBackend> HybridDecoder<B> {
         })
     }
 
+    /// Attaches one pinned extension without reconstructing the decoder modules.
+    pub fn with_static_extension<E>(self, extension: E) -> HybridDecoder<B, E> {
+        HybridDecoder {
+            static_modules: HybridStaticModules {
+                base: self.static_modules.base,
+                extension,
+            },
+            groups: self.groups,
+        }
+    }
+}
+
+impl<B: NeuralBackend, E> HybridDecoder<B, E> {
+    /// Borrows all pinned modules, including the architecture extension.
+    pub const fn extended_static_modules(&self) -> &HybridStaticModules<B, E> {
+        &self.static_modules
+    }
+
+    /// Mutably borrows all pinned modules.
+    pub fn extended_static_modules_mut(&mut self) -> &mut HybridStaticModules<B, E> {
+        &mut self.static_modules
+    }
+
+    /// Consumes the execution shell and returns all pinned modules.
+    pub fn into_extended_static_modules(self) -> HybridStaticModules<B, E> {
+        self.static_modules
+    }
+
     /// Borrows the shared embedding, final normalization, and output head.
     pub const fn static_modules(&self) -> &StaticModules<B> {
-        &self.static_modules
+        &self.static_modules.base
     }
 
     /// Mutably borrows the shared embedding, final normalization, and output head.
     pub fn static_modules_mut(&mut self) -> &mut StaticModules<B> {
-        &mut self.static_modules
+        &mut self.static_modules.base
     }
 
     /// Consumes the graph shell and returns its pinned modules.
     pub fn into_static_modules(self) -> StaticModules<B> {
-        self.static_modules
+        self.static_modules.base
     }
 
     /// Builds the target execution graph.
@@ -145,11 +194,22 @@ impl<B: NeuralBackend> HybridDecoder<B> {
         hidden: &B::Tensor,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
-        let hidden = self.static_modules.norm.forward(hidden, context)?;
-        match &mut self.static_modules.lm_head {
-            Some(head) => head.forward(&hidden, context),
-            None => self.static_modules.embeddings.as_linear(&hidden, context),
-        }
+        self.finish_logits_instrumented(
+            hidden,
+            context,
+            &mut crate::decoder::ComponentInstrumentation::disabled(),
+        )
+    }
+
+    pub(crate) fn finish_logits_instrumented(
+        &mut self,
+        hidden: &B::Tensor,
+        context: &<B::Tensor as Tensor>::Context,
+        instrumentation: &mut crate::decoder::ComponentInstrumentation<'_, B::Tensor>,
+    ) -> Result<B::Tensor, Error> {
+        self.static_modules
+            .base
+            .finish_instrumented(hidden, context, instrumentation)
     }
 
     /// Projects an already normalized hidden state through the shared vocabulary head.
@@ -158,9 +218,13 @@ impl<B: NeuralBackend> HybridDecoder<B> {
         hidden: &B::Tensor,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
-        match &mut self.static_modules.lm_head {
+        match &mut self.static_modules.base.lm_head {
             Some(head) => head.forward(hidden, context),
-            None => self.static_modules.embeddings.as_linear(hidden, context),
+            None => self
+                .static_modules
+                .base
+                .embeddings
+                .as_linear(hidden, context),
         }
     }
 }

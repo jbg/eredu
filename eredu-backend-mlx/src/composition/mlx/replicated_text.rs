@@ -59,11 +59,8 @@ use crate::{
 };
 
 use crate::backend::runtime::execution::{
-    generic::prepare_layerwise_policy_from_bindings,
-    layerwise::{
-        quantize_exact_replicated_text_tasks, shard_addressable_member_bindings,
-        shard_layer_bindings,
-    },
+    generic::prepare_layerwise_policy_with_supplementary_bindings,
+    layerwise::{quantize_exact_replicated_text_tasks, shard_addressable_member_bindings},
 };
 use crate::backend::{
     nn::shared::neutral_parameter_refs,

@@ -356,7 +356,7 @@ pub(crate) fn bind_partitioned_local<A, G, F>(
     additional_claimed_sources: std::collections::BTreeSet<String>,
     stream: &Stream,
     weights_stream: &Stream,
-    finalizer: F,
+    mut finalizer: F,
 ) -> Result<Box<dyn ErasedReplicatedTextExecutable>, Error>
 where
     A: eredu_architectures::partitioned_execution::TextPartitionArchitecture<
@@ -376,6 +376,7 @@ where
     let (prompt_cache_identity, capability_estimate, effective_model_type, selected_residency) =
         text.into_parts();
     let mut mechanisms = MlxReplicatedTextMechanisms::new(store, stream, weights_stream);
+    mechanisms.set_prediction_residency(finalizer.prediction_residency()?);
     mechanisms.set_ignored_checkpoint_sources(additional_claimed_sources);
     let mut distributed = Some(distributed);
     let mut partition_sampling_group = None;
@@ -406,7 +407,7 @@ where
                     &mut mechanisms,
                     context,
                 )
-                .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+                .map_err(Error::from)?;
                 let (architecture, _partition, manifest, execution_policy, bounded_policy, state) =
                     prepared.into_parts();
                 let distributed = distributed.take().ok_or_else(|| {
@@ -440,17 +441,17 @@ where
                     selected_residency.execution_residency(),
                     bounded_policy,
                 )
-                .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+                .map_err(|error| Error::Other(Box::new(error)))?;
                 Ok::<_, Error>((runtime, state))
             },
         )
-        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+        .map_err(Error::from)?;
     let session = eredu_runtime::construct_replicated_text_session_with_runtime(
         binding,
         mechanisms,
         MlxDirectPartitionStrategy::<A>::new(),
     )
-    .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+    .map_err(|error| Error::Other(Box::new(error)))?;
     finalizer.finish(CompletedReplicatedText::from_session(
         session,
         prompt_cache_identity,

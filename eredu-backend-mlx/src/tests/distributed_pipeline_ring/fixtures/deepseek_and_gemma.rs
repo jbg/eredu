@@ -3,6 +3,85 @@ fn write_deepseek_fixture(directory: &Path, layers: i32) {
 }
 
 fn write_deepseek_fixture_with_prediction(directory: &Path, layers: i32, prediction_layers: i32) {
+    write_deepseek_fixture_with_values(directory, layers, prediction_layers, false);
+}
+
+fn write_deepseek_fixture_with_values(
+    directory: &Path,
+    layers: i32,
+    prediction_layers: i32,
+    components: bool,
+) {
+    write_deepseek_fixture_with_schedule(directory, layers, prediction_layers, components, 1);
+}
+
+fn write_deepseek_dense_fixture(directory: &Path) {
+    write_deepseek_fixture_with_schedule(directory, 2, 0, true, 2);
+}
+
+fn write_deepseek_dense_transform_fixture(directory: &Path) {
+    write_deepseek_transform_fixture(directory, 2, 32);
+}
+
+fn write_deepseek_mixed_transform_fixture(directory: &Path) {
+    // Every local TP contraction retains one complete affine group of 32.
+    write_deepseek_transform_fixture(directory, 1, 64);
+}
+
+fn write_deepseek_transform_fixture(directory: &Path, dense_layers: i32, expert_width: i32) {
+    write_deepseek_transform_fixture_with_prediction(directory, dense_layers, expert_width, 0);
+}
+
+fn write_deepseek_transform_fixture_with_prediction(
+    directory: &Path,
+    dense_layers: i32,
+    expert_width: i32,
+    prediction_layers: i32,
+) {
+    write_deepseek_config_fixture(
+        directory,
+        serde_json::json!({
+            "model_type": "deepseek_v3",
+            "hidden_size": 64,
+            "intermediate_size": 128,
+            "moe_intermediate_size": expert_width,
+            "num_hidden_layers": 2,
+            "num_attention_heads": 4,
+            "vocab_size": 32,
+            "rms_norm_eps": 0.000001,
+            "max_position_embeddings": 64,
+            "rope_theta": 10000.0,
+            "q_lora_rank": 32,
+            "kv_lora_rank": 32,
+            "qk_nope_head_dim": 8,
+            "qk_rope_head_dim": 4,
+            "v_head_dim": 16,
+            "first_k_dense_replace": dense_layers,
+            "moe_layer_freq": 1,
+            "n_routed_experts": 4,
+            "n_shared_experts": 1,
+            "num_experts_per_tok": 2,
+            "n_group": 2,
+            "topk_group": 1,
+            "topk_method": "noaux_tc",
+            "scoring_func": "sigmoid",
+            "norm_topk_prob": true,
+            "routed_scaling_factor": 1.0,
+            "num_nextn_predict_layers": prediction_layers,
+            "split_kv_b": false,
+            "tie_word_embeddings": false
+        }),
+        true,
+    );
+}
+
+fn write_deepseek_fixture_with_schedule(
+    directory: &Path,
+    layers: i32,
+    prediction_layers: i32,
+    components: bool,
+    dense_layers: i32,
+) {
     let config = serde_json::json!({
         "model_type": "deepseek_v3",
         "hidden_size": 8,
@@ -14,12 +93,12 @@ fn write_deepseek_fixture_with_prediction(directory: &Path, layers: i32, predict
         "rms_norm_eps": 0.000001,
         "max_position_embeddings": 64,
         "rope_theta": 10000.0,
-        "q_lora_rank": null,
+        "q_lora_rank": if components { Some(4) } else { None },
         "kv_lora_rank": 4,
         "qk_nope_head_dim": 2,
         "qk_rope_head_dim": 2,
         "v_head_dim": 2,
-        "first_k_dense_replace": 1,
+        "first_k_dense_replace": dense_layers,
         "moe_layer_freq": 1,
         "n_routed_experts": 4,
         "n_shared_experts": 1,
@@ -34,18 +113,42 @@ fn write_deepseek_fixture_with_prediction(directory: &Path, layers: i32, predict
         "split_kv_b": false,
         "tie_word_embeddings": false
     });
+    write_deepseek_config_fixture(directory, config, components);
+}
+
+fn write_deepseek_config_fixture(directory: &Path, config: serde_json::Value, components: bool) {
     let context = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
     let stream = context.stream();
     let args = eredu_architectures::deepseek::parse_v3_config(&config).unwrap();
     struct Collector<'a> {
         stream: &'a Stream,
+        components: bool,
         arrays: Vec<(String, Array)>,
     }
     impl<'tensor> ParameterVisitor<'tensor, MlxTensor> for Collector<'_> {
         fn visit(&mut self, metadata: ParameterMetadata, parameter: &'tensor MlxTensor) {
             let name = metadata.id.to_string();
             let shape = parameter.as_array().shape().to_vec();
-            let value = if name.ends_with("norm.weight") {
+            let value = if self.components {
+                let seed = name.bytes().fold(2166136261u32, |seed, byte| {
+                    (seed ^ u32::from(byte)).wrapping_mul(16777619)
+                });
+                let values = (0..shape.iter().product::<i32>() as usize)
+                    .map(|index| {
+                        let mut bits = seed.wrapping_add((index as u32).wrapping_mul(0x9e3779b9));
+                        bits = (bits ^ (bits >> 16)).wrapping_mul(0x85ebca6b);
+                        bits = (bits ^ (bits >> 13)).wrapping_mul(0xc2b2ae35);
+                        bits ^= bits >> 16;
+                        let unit = (bits % 2001) as f32 / 1000.0 - 1.0;
+                        if name.ends_with("norm.weight") {
+                            0.95 + 0.05 * unit
+                        } else {
+                            0.2 * unit
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                Array::from_slice(&values, &shape)
+            } else if name.ends_with("norm.weight") {
                 Array::ones::<f32>(&shape, self.stream).unwrap()
             } else {
                 Array::full::<f32>(&shape, Array::from_f32(0.01), self.stream).unwrap()
@@ -58,17 +161,18 @@ fn write_deepseek_fixture_with_prediction(directory: &Path, layers: i32, predict
         eredu_architectures::deepseek::v3::Model::<Backend>::new(args.clone(), stream).unwrap();
     let mut collector = Collector {
         stream,
+        components,
         arrays: Vec::new(),
     };
     architecture
         .static_modules()
         .visit_parameters(&mut collector);
-    for layer in 0..usize::try_from(layers).unwrap() {
+    for layer in 0..usize::try_from(args.num_hidden_layers).unwrap() {
         eredu_architectures::deepseek::block::V3Block::<Backend>::new(&args, layer, stream)
             .unwrap()
             .visit_parameters(&mut collector);
     }
-    for depth in 0..usize::try_from(prediction_layers).unwrap() {
+    for depth in 0..usize::try_from(args.num_nextn_predict_layers).unwrap() {
         eredu_architectures::deepseek::mtp::V3PredictionLayer::<Backend>::new(&args, depth, stream)
             .unwrap()
             .visit_parameters(&mut collector);
@@ -127,19 +231,34 @@ fn write_deepseek_fixture_with_prediction(directory: &Path, layers: i32, predict
 }
 
 pub(crate) fn write_deepseek_v4_fixture(directory: &Path, prediction_layers: u64) {
-    write_deepseek_v4_fixture_kind(directory, prediction_layers, false)
+    write_deepseek_v4_fixture_kind(directory, prediction_layers, false, false, false)
 }
 
-pub(crate) fn write_deepseek_v4_dspark_fixture(directory: &Path) {
-    write_deepseek_v4_fixture_kind(directory, 1, true)
+pub(crate) fn write_deepseek_v4_dspark_fixture(directory: &Path, transform: bool) {
+    write_deepseek_v4_fixture_kind(directory, 2, true, true, transform)
 }
 
-fn write_deepseek_v4_fixture_kind(directory: &Path, prediction_layers: u64, dspark: bool) {
-    let compress_ratios = if prediction_layers == 0 {
-        vec![0, 4]
-    } else {
-        vec![0, 4, 0]
-    };
+pub(crate) fn write_deepseek_v4_component_fixture(directory: &Path) {
+    write_deepseek_v4_fixture_kind(directory, 1, false, true, false)
+}
+
+pub(crate) fn write_deepseek_v4_transform_fixture(directory: &Path) {
+    write_deepseek_v4_fixture_kind(directory, 1, false, true, true)
+}
+
+pub(crate) fn write_deepseek_v4_target_component_fixture(directory: &Path, transform: bool) {
+    write_deepseek_v4_fixture_kind(directory, 0, false, true, transform)
+}
+
+fn write_deepseek_v4_fixture_kind(
+    directory: &Path,
+    prediction_layers: u64,
+    dspark: bool,
+    components: bool,
+    transform: bool,
+) {
+    let mut compress_ratios = vec![0, 4];
+    compress_ratios.extend(std::iter::repeat_n(0, prediction_layers as usize));
     let mut config = serde_json::json!({
         "model_type": "deepseek_v4",
         "hidden_size": 16,
@@ -171,11 +290,27 @@ fn write_deepseek_v4_fixture_kind(directory: &Path, prediction_layers: u64, dspa
         "routed_scaling_factor": 1.0,
         "num_nextn_predict_layers": prediction_layers
     });
+    if transform {
+        // Every selected multiplication retains at least 32 input channels on
+        // each TP rank, including both grouped attention factors and expert down projections.
+        for (name, value) in [
+            ("hidden_size", 64),
+            ("moe_intermediate_size", 64),
+            ("vocab_size", 64),
+            ("head_dim", 32),
+            ("qk_rope_head_dim", 16),
+            ("q_lora_rank", 64),
+            ("o_lora_rank", 32),
+            ("index_head_dim", 32),
+        ] {
+            config[name] = value.into();
+        }
+    }
     if dspark {
         config["dspark_block_size"] = 2.into();
         config["dspark_noise_token_id"] = 0.into();
         config["dspark_target_layer_ids"] = serde_json::json!([0, 1]);
-        config["dspark_markov_rank"] = 4.into();
+        config["dspark_markov_rank"] = if transform { 32 } else { 4 }.into();
     }
     let args = eredu_architectures::deepseek::parse_v4_config(&config).unwrap();
     let plan = eredu_architectures::deepseek::v4_safetensors_plan(&args).unwrap();
@@ -196,9 +331,31 @@ fn write_deepseek_v4_fixture_kind(directory: &Path, prediction_layers: u64, dspa
                     eredu_checkpoint::StoredDtype::I32
                 )
             ) {
-                Array::zeros::<i32>(&shape, stream).unwrap()
+                if components {
+                    let values: Vec<i32> =
+                        (0..shape.iter().product::<i32>()).map(|i| i % 4).collect();
+                    Array::from_slice(&values, &shape)
+                } else {
+                    Array::zeros::<i32>(&shape, stream).unwrap()
+                }
             } else if tensor.key.ends_with("norm.weight") {
-                Array::ones::<f32>(&shape, stream).unwrap()
+                if components {
+                    let values: Vec<f32> = (0..shape.iter().product::<i32>())
+                        .map(|i| 1.0 + (i % 7) as f32 * 0.02)
+                        .collect();
+                    Array::from_slice(&values, &shape)
+                } else {
+                    Array::ones::<f32>(&shape, stream).unwrap()
+                }
+            } else if components {
+                let seed = tensor
+                    .key
+                    .bytes()
+                    .fold(0usize, |n, b| (n * 17 + b as usize) % 101);
+                let values: Vec<f32> = (0..shape.iter().product::<i32>() as usize)
+                    .map(|i| ((i * 37 + seed) % 101) as f32 * 0.001 - 0.05)
+                    .collect();
+                Array::from_slice(&values, &shape)
             } else {
                 Array::full::<f32>(&shape, Array::from_f32(0.01), stream).unwrap()
             };

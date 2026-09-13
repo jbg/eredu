@@ -585,6 +585,18 @@ impl eredu_nn::HyperHeadOperator<ReferenceTensor> for ReferenceHyperHead {
         let shape = residual.shape();
         Ok(ReferenceTensor(vec![shape[0], shape[1], shape[3]]))
     }
+    fn forward_with_coefficients_observer(
+        &mut self,
+        residual: &ReferenceTensor,
+        context: &(),
+        observer: Option<&mut dyn eredu_nn::TensorValueObserver<ReferenceTensor>>,
+    ) -> Result<ReferenceTensor, Error> {
+        if let Some(observer) = observer {
+            let shape = residual.shape();
+            observer.observe(&ReferenceTensor(vec![shape[0], shape[1], shape[2]]))?;
+        }
+        self.forward(residual, context)
+    }
 }
 
 impl eredu_nn::HyperNeuralBackend for ReferenceBackend {
@@ -1497,8 +1509,8 @@ impl eredu_nn::PoolingAttentionCache<ReferenceTensor> for ReferenceCache {
         Ok(None)
     }
 
-    fn checkpoint(&self) -> Self::Checkpoint {
-        self.clone()
+    fn checkpoint(&self) -> Result<Self::Checkpoint, Error> {
+        Ok(self.clone())
     }
 
     fn restore(&mut self, checkpoint: &Self::Checkpoint, _: &()) -> Result<(), Error> {

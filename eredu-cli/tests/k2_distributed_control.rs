@@ -299,5 +299,217 @@ fn k2_distributed_facade_worker() {
         );
         drop(run);
         model.reset().unwrap();
+        for controlled in [false, true] {
+            let prepared = model
+                .prepare_observed_chat(&chat, settings, CapturePlan::none(), trace)
+                .unwrap();
+            let before = model.text_preparation_usage().unwrap();
+            let cancelled = if controlled {
+                let mut run = model
+                    .start_controlled_text(prepared, &[], Default::default(), emit)
+                    .unwrap();
+                run.run(|record| {
+                    if rank == 0
+                        && matches!(
+                            record.generation.event,
+                            ObservedGenerationEvent::Token { .. }
+                        )
+                    {
+                        ControlFlow::Break(())
+                    } else {
+                        ControlFlow::Continue(())
+                    }
+                })
+                .unwrap();
+                assert_eq!(run.status(), GenerationStatus::Cancelled);
+                run.token_ids().to_vec()
+            } else {
+                model
+                    .generate_observed_text(prepared, &[], Default::default(), |record| {
+                        if rank == 0
+                            && matches!(record.event, ObservedGenerationEvent::Token { .. })
+                        {
+                            ControlFlow::Break(())
+                        } else {
+                            ControlFlow::Continue(())
+                        }
+                    })
+                    .unwrap()
+                    .token_ids
+            };
+            assert_eq!(
+                cancelled,
+                baseline[..1],
+                "peer cancellation must retain the same committed prefix"
+            );
+            let after = model.text_preparation_usage().unwrap();
+            assert!(after.attempts > before.attempts);
+            model.reset().unwrap();
+            assert_eq!(model.text_preparation_usage().unwrap(), after);
+
+            if controlled {
+                let prepared = model
+                    .prepare_observed_chat(&chat, settings, CapturePlan::none(), trace)
+                    .unwrap();
+                let mut run = model
+                    .start_controlled_text(prepared, &[], Default::default(), emit)
+                    .unwrap();
+                run.run(|record| {
+                    if rank == 0
+                        && matches!(
+                            record.generation.event,
+                            ObservedGenerationEvent::Lifecycle {
+                                next_prediction: 1,
+                                ..
+                            }
+                        )
+                    {
+                        ControlFlow::Break(())
+                    } else {
+                        ControlFlow::Continue(())
+                    }
+                })
+                .unwrap();
+                assert_eq!(run.status(), GenerationStatus::Cancelled);
+                assert_eq!(run.token_ids(), &baseline[..1]);
+                drop(run);
+                model.reset().unwrap();
+            }
+
+            for boundary_record in [false, true] {
+                // Reject rank zero's first token or its following lifecycle/terminal
+                // record. Other participants retain their ordinary quota.
+                let trial_settings = if boundary_record && !controlled {
+                    let mut trial = settings;
+                    trial.overrides.max_new_tokens = Some(1);
+                    trial
+                } else {
+                    settings
+                };
+                let prepared = model
+                    .prepare_observed_chat(&chat, trial_settings, CapturePlan::none(), trace)
+                    .unwrap();
+                let mut initial_bytes = 0;
+                if controlled {
+                    let mut run = model
+                        .start_controlled_text(prepared, &[], Default::default(), |record| {
+                            initial_bytes += serde_json::to_vec(&record).unwrap().len() as u64;
+                            ControlFlow::Continue(())
+                        })
+                        .unwrap();
+                    if boundary_record {
+                        run.step(|record| {
+                            if !matches!(
+                                record.generation.event,
+                                ObservedGenerationEvent::Lifecycle { .. }
+                            ) {
+                                initial_bytes += serde_json::to_vec(&record).unwrap().len() as u64;
+                            }
+                            ControlFlow::Continue(())
+                        })
+                        .unwrap();
+                    }
+                    drop(run);
+                } else {
+                    model
+                        .generate_observed_text(prepared, &[], Default::default(), |record| {
+                            if (boundary_record
+                                && !matches!(
+                                    record.event,
+                                    ObservedGenerationEvent::Completed { .. }
+                                ))
+                                || (!boundary_record
+                                    && matches!(
+                                        record.event,
+                                        ObservedGenerationEvent::Started { .. }
+                                    ))
+                            {
+                                initial_bytes += serde_json::to_vec(&record).unwrap().len() as u64;
+                            }
+                            ControlFlow::Continue(())
+                        })
+                        .unwrap();
+                }
+                model.reset().unwrap();
+                let limits = if rank == 0 {
+                    TraceLimits {
+                        total_bytes: initial_bytes + 64,
+                        ..trace
+                    }
+                } else {
+                    trace
+                };
+                let prepared = model
+                    .prepare_observed_chat(&chat, trial_settings, CapturePlan::none(), limits)
+                    .unwrap();
+                let before = model.text_preparation_usage().unwrap();
+                let (local_limit, error): (bool, Box<dyn std::error::Error>) = if controlled {
+                    let mut run = model
+                        .start_controlled_text(prepared, &[], Default::default(), emit)
+                        .unwrap();
+                    let error = run.run(emit).unwrap_err();
+                    let local = matches!(
+                        error,
+                        ControlledGenerationError::Capture(CaptureError::Limit {
+                            budget: CaptureBudget::Encoded,
+                            cumulative: true
+                        })
+                    );
+                    (local, Box::new(error))
+                } else {
+                    let error = model
+                        .generate_observed_text(prepared, &[], Default::default(), |_| {
+                            ControlFlow::Continue(())
+                        })
+                        .unwrap_err();
+                    let local = matches!(
+                        error,
+                        PreparedChatError::Capture(CaptureError::Limit {
+                            budget: CaptureBudget::Encoded,
+                            cumulative: true
+                        })
+                    );
+                    (local, Box::new(error))
+                };
+                if rank == 0 {
+                    assert!(
+                        local_limit,
+                        "rank zero lost its original delivery budget error: {error}"
+                    );
+                } else {
+                    let mut cause: Option<&(dyn std::error::Error + 'static)> =
+                        Some(error.as_ref());
+                    let mut rejected = false;
+                    while let Some(error) = cause {
+                        rejected |= error
+                            .downcast_ref::<eredu_core::run_preparation::TextPreparationRejected>()
+                            .is_some_and(|error| {
+                                error.rank == 0
+                                && error.stage
+                                    == eredu_core::run_preparation::TextPreparationStage::Delivery
+                            });
+                        cause = error.source();
+                    }
+                    assert!(rejected, "peer lost its typed delivery rejection: {error}");
+                }
+                let after = model.text_preparation_usage().unwrap();
+                assert!(after.attempts > before.attempts);
+                model.reset().unwrap();
+                assert_eq!(model.text_preparation_usage().unwrap(), after);
+                let prepared = model
+                    .prepare_observed_chat(&chat, settings, CapturePlan::none(), trace)
+                    .unwrap();
+                let retry = model
+                    .generate_observed_text(prepared, &[], Default::default(), |_| {
+                        ControlFlow::Continue(())
+                    })
+                    .unwrap();
+                assert_eq!(
+                    retry.token_ids, baseline,
+                    "corrected delivery must reproduce the baseline after reset"
+                );
+                model.reset().unwrap();
+            }
+        }
     }
 }

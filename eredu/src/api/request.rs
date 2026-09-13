@@ -50,6 +50,14 @@ pub struct PreparedChatGenerationSettings {
 pub enum PreparedChatInput<'a, B: eredu_core::TextGenerationBackend> {
     /// Tokenize and prefill the rendered prompt stored in the prepared chat.
     RenderedPrompt(&'a PreparedChat),
+    /// Prefill exact token IDs with the chat's semantic and termination policy.
+    /// Native prompt construction occurs inside coordinated run preparation.
+    TokenIds {
+        /// Prepared chat supplying generation policy.
+        prepared_chat: &'a PreparedChat,
+        /// Exact prefix; generation never forces the tested prediction.
+        token_ids: Vec<u32>,
+    },
     /// Prefill an already-tokenized and backend-prepared model input.
     ///
     /// The caller must ensure that `model_input` represents the same rendered
@@ -77,10 +85,19 @@ impl<'a, B: eredu_core::TextGenerationBackend> PreparedChatInput<'a, B> {
         }
     }
 
+    /// Binds an exact token-ID prefix without creating native values early.
+    pub fn token_ids(prepared_chat: &'a PreparedChat, token_ids: Vec<u32>) -> Self {
+        Self::TokenIds {
+            prepared_chat,
+            token_ids,
+        }
+    }
+
     /// Returns the prepared chat that owns generation semantics.
     pub const fn prepared_chat(&self) -> &'a PreparedChat {
         match self {
             Self::RenderedPrompt(prepared_chat)
+            | Self::TokenIds { prepared_chat, .. }
             | Self::PreparedBackendInput { prepared_chat, .. } => prepared_chat,
         }
     }
@@ -88,7 +105,7 @@ impl<'a, B: eredu_core::TextGenerationBackend> PreparedChatInput<'a, B> {
     /// Returns the explicitly prepared backend prompt, when present.
     pub const fn backend_prompt(&self) -> Option<&B::Prompt> {
         match self {
-            Self::RenderedPrompt(_) => None,
+            Self::RenderedPrompt(_) | Self::TokenIds { .. } => None,
             Self::PreparedBackendInput { prompt, .. } => Some(prompt),
         }
     }
@@ -145,6 +162,19 @@ pub enum PreparedChatError {
     /// The backend ended its stream without a terminal token.
     #[error("backend generation ended without a terminal token")]
     MissingTerminalToken,
+}
+
+impl From<eredu_core::run_preparation::TextCaptureSetupError> for PreparedChatError {
+    fn from(error: eredu_core::run_preparation::TextCaptureSetupError) -> Self {
+        match error {
+            eredu_core::run_preparation::TextCaptureSetupError::Capture(error) => {
+                Self::Capture(error)
+            }
+            eredu_core::run_preparation::TextCaptureSetupError::Preparation(error) => {
+                Self::Backend(error)
+            }
+        }
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -514,6 +544,7 @@ where
     pub(super) generator: eredu_core::ControlledTextGeneration<'a, B, ConstraintController>,
     pub(super) on_token:
         Option<&'a mut dyn FnMut(Option<u32>, Option<eredu_core::capture::CapturedStep>, f64)>,
+    pub(super) delivery_failure: Option<&'a dyn Fn() -> Option<eredu_core::capture::CaptureError>>,
     pub(super) capture_enabled: bool,
     pub(super) generation_started: std::time::Instant,
     pub(super) time_to_first_token: Option<std::time::Duration>,
@@ -524,6 +555,27 @@ where
     B: eredu_core::TextGenerationBackend,
 {
     type Error = eredu_core::ControlledTextGenerationError<B::Error, ConstraintError>;
+
+    fn finish_step<T, E>(
+        &mut self,
+        local: Result<T, E>,
+        cancelled: bool,
+        map_source: impl FnOnce(Self::Error) -> E,
+    ) -> Result<Option<T>, E> {
+        self.generator.finish_text_preparation_cancellable(
+            eredu_core::run_preparation::TextPreparationStage::Delivery,
+            local.map(|value| (!cancelled).then_some(value)),
+            |error| {
+                map_source(eredu_core::ControlledTextGenerationError::Preparation(
+                    error,
+                ))
+            },
+        )
+    }
+
+    fn delivery_failure(&self) -> Option<eredu_core::capture::CaptureError> {
+        self.delivery_failure.and_then(|failure| failure())
+    }
 
     fn next_token(&mut self) -> Result<Option<u32>, Self::Error> {
         let started = self.on_token.as_ref().map(|_| std::time::Instant::now());
@@ -552,14 +604,13 @@ where
         if token.is_some() && self.time_to_first_token.is_none() {
             self.time_to_first_token = Some(self.generation_started.elapsed());
         }
+        // Readiness agreement requires a completed native boundary even when
+        // this run has no capture plan. Empty capture draining allocates none.
+        let capture = self
+            .generator
+            .take_captured_step()
+            .map_err(eredu_core::ControlledTextGenerationError::Backend)?;
         if let (Some(token), Some(callback)) = (token, &mut self.on_token) {
-            let capture = if self.capture_enabled {
-                self.generator
-                    .take_captured_step()
-                    .map_err(eredu_core::ControlledTextGenerationError::Backend)?
-            } else {
-                None
-            };
             callback(
                 Some(token),
                 capture,

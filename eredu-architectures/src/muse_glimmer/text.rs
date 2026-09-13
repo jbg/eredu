@@ -2,16 +2,16 @@
 
 use eredu_nn::{
     AttentionCache, AttentionRequest, EmbeddingOperator, EmbeddingSpec, Error,
-    GatedProductGroupLayout, GroupScoring, GroupSelectionOperator, GroupedGatedProductOperator,
-    GroupedGatedProductSpec, GroupedNeuralBackend, LinearOperator, LinearSpec,
-    NormalizationConstructionSpec, NormalizationOperator, Parameter, ParameterSpec, Parameterized,
-    RotaryOperator, RotaryPosition, RotarySpec, Tensor, TopKGroupSelectionSpec,
-    TopKGroupSelectorSpec,
+    GatedProductGroupLayout, GroupScoring, GroupSelectionOperator, GroupedGatedProductSpec,
+    GroupedNeuralBackend, LinearOperator, LinearSpec, NormalizationConstructionSpec,
+    NormalizationOperator, Parameter, ParameterSpec, Parameterized, RotaryOperator, RotaryPosition,
+    RotarySpec, Tensor, TopKGroupSelectionSpec, TopKGroupSelectorSpec,
 };
 use eredu_runtime::{
     ExpertPass, RoutedExpertProvider, RoutedExpertRequest, TensorParallelRoutedExpertProvider,
 };
 
+use crate::decoder::ComponentInstrumentation;
 use crate::linear_format::standard_expert_projection;
 
 use super::{DecoderConfig, LocalGeometry, WeightConvention};
@@ -26,8 +26,6 @@ pub struct CenteredRmsNorm<B: GroupedNeuralBackend + eredu_nn::DistributedNeural
     epsilon: f32,
     #[parameter(skip)]
     centered: bool,
-    #[parameter(skip)]
-    effective_scale: Option<B::Tensor>,
 }
 
 impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> CenteredRmsNorm<B> {
@@ -46,7 +44,6 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> CenteredRmsNo
             )?,
             epsilon,
             centered,
-            effective_scale: None,
         })
     }
 
@@ -55,19 +52,20 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> CenteredRmsNo
         input: &B::Tensor,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
-        if self.centered && self.effective_scale.is_none() {
-            self.effective_scale = Some(self.weight.as_ref().add(
+        // Derive the gain from the current authoritative slot. Keeping it on
+        // the module would retain derived parameter storage after unloading and
+        // reuse stale values after a parameter overlay or replacement.
+        let effective_scale = if self.centered {
+            Some(self.weight.as_ref().add(
                 &B::Tensor::full_f32(1.0, self.weight.as_ref().shape(), context)?,
                 context,
-            )?);
-        }
-        let scale = if self.centered {
-            self.effective_scale
-                .as_ref()
-                .expect("centered normalization scale initialized")
+            )?)
         } else {
-            self.weight.as_ref()
+            None
         };
+        let scale = effective_scale
+            .as_ref()
+            .unwrap_or_else(|| self.weight.as_ref());
         B::rms_norm_with_weight(input, scale, self.epsilon, context)
     }
 }
@@ -305,8 +303,14 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> Attention<B> 
         cache: Option<&mut C>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
-        let attended = self.attend(hidden, explicit_mask, cache, context)?;
-        self.output.forward(&attended, context)
+        self.forward_instrumented(
+            hidden,
+            explicit_mask,
+            cache,
+            None,
+            context,
+            &mut ComponentInstrumentation::disabled(),
+        )
     }
 
     /// Runs rank-local gated attention and reduces the output projection.
@@ -318,8 +322,34 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> Attention<B> 
         parallel: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
+        self.forward_instrumented(
+            hidden,
+            explicit_mask,
+            cache,
+            Some(parallel),
+            context,
+            &mut ComponentInstrumentation::disabled(),
+        )
+    }
+
+    fn forward_instrumented<C: AttentionCache<B::Tensor>>(
+        &mut self,
+        hidden: &B::Tensor,
+        explicit_mask: Option<&B::Tensor>,
+        cache: Option<&mut C>,
+        parallel: Option<&B::ParallelContext>,
+        context: &<B::Tensor as Tensor>::Context,
+        instrumentation: &mut ComponentInstrumentation<'_, B::Tensor>,
+    ) -> Result<B::Tensor, Error> {
         let attended = self.attend(hidden, explicit_mask, cache, context)?;
-        B::row_parallel_linear(&mut self.output, &attended, parallel, context)
+        let attended = instrumentation.apply("attention.channels", attended)?;
+        instrumentation.project::<B>(
+            "attention.write_input",
+            &mut self.output,
+            &attended,
+            parallel,
+            context,
+        )
     }
 }
 
@@ -365,27 +395,24 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> Mlp<B> {
         })
     }
 
-    fn forward(
+    fn forward_instrumented(
         &mut self,
         hidden: &B::Tensor,
+        parallel: Option<&B::ParallelContext>,
         context: &<B::Tensor as Tensor>::Context,
+        instrumentation: &mut ComponentInstrumentation<'_, B::Tensor>,
     ) -> Result<B::Tensor, Error> {
         let gate = self.gate.forward(hidden, context)?;
         let up = self.up.forward(hidden, context)?;
         let hidden = B::gated_product(gate, up, eredu_nn::GatedProductPolicy::default(), context)?;
-        self.down.forward(&hidden, context)
-    }
-
-    fn forward_parallel(
-        &mut self,
-        hidden: &B::Tensor,
-        parallel: &B::ParallelContext,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<B::Tensor, Error> {
-        let gate = self.gate.forward(hidden, context)?;
-        let up = self.up.forward(hidden, context)?;
-        let hidden = B::gated_product(gate, up, eredu_nn::GatedProductPolicy::default(), context)?;
-        B::row_parallel_linear(&mut self.down, &hidden, parallel, context)
+        let hidden = instrumentation.apply("feed_forward.units", hidden)?;
+        instrumentation.project::<B>(
+            "feed_forward.write_input",
+            &mut self.down,
+            &hidden,
+            parallel,
+            context,
+        )
     }
 }
 
@@ -441,51 +468,6 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> SparseMoe<B> 
         })
     }
 
-    fn forward(
-        &mut self,
-        hidden: &B::Tensor,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<B::Tensor, Error> {
-        if hidden.shape().len() != 3 || hidden.dim(2) != self.hidden_size {
-            return Err(Error::backend("invalid Muse-Glimmer MoE hidden geometry"));
-        }
-        let shape = hidden.shape().to_vec();
-        let flat = hidden.reshape(&[-1, self.hidden_size], context)?;
-        let routes = self.router.select(&flat, context)?;
-        self.experts
-            .forward_grouped(&flat, &routes, context)?
-            .reshape(&shape, context)
-    }
-
-    fn forward_parallel(
-        &mut self,
-        hidden: &B::Tensor,
-        parallel: &B::ParallelContext,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<B::Tensor, Error>
-    where
-        B: eredu_nn::TensorParallelGroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
-    {
-        if hidden.shape().len() != 3 || hidden.dim(2) != self.hidden_size {
-            return Err(Error::backend("invalid Muse-Glimmer MoE hidden geometry"));
-        }
-        let shape = hidden.shape().to_vec();
-        let flat = hidden.reshape(&[-1, self.hidden_size], context)?;
-        let routes = self.router.select(&flat, context)?;
-        eredu_runtime::reduce_tensor_parallel_expert_output::<B>(
-            B::gated_product_groups_tensor_parallel(
-                &mut self.experts,
-                &flat,
-                &routes,
-                B::parallel_size(parallel),
-                context,
-            )?,
-            parallel,
-            context,
-        )?
-        .reshape(&shape, context)
-    }
-
     fn forward_with_provider<P>(
         &mut self,
         hidden: &B::Tensor,
@@ -493,6 +475,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> SparseMoe<B> 
         pass: ExpertPass,
         provider: &mut P,
         context: &<B::Tensor as Tensor>::Context,
+        instrumentation: &mut ComponentInstrumentation<'_, B::Tensor>,
     ) -> Result<B::Tensor, Error>
     where
         P: RoutedExpertProvider<B>,
@@ -504,19 +487,19 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> SparseMoe<B> 
         let shape = hidden.shape().to_vec();
         let flat = hidden.reshape(&[-1, self.hidden_size], context)?;
         let routes = self.router.select(&flat, context)?;
-        provider
-            .forward_grouped(
-                &mut self.experts,
+        instrumentation
+            .routed(
+                "routing",
                 RoutedExpertRequest {
+                    unit_observer: None,
                     bank: eredu_runtime::RoutedBankId::new(0),
                     layer,
                     input: &flat,
                     routes: &routes,
                     pass,
                 },
-                context,
-            )
-            .map_err(Error::backend)?
+                |request| provider.forward_grouped(&mut self.experts, request, context),
+            )?
             .reshape(&shape, context)
     }
 
@@ -528,6 +511,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> SparseMoe<B> 
         provider: &mut P,
         parallel: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
+        instrumentation: &mut ComponentInstrumentation<'_, B::Tensor>,
     ) -> Result<B::Tensor, Error>
     where
         P: TensorParallelRoutedExpertProvider<B>,
@@ -539,20 +523,25 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> SparseMoe<B> 
         let shape = hidden.shape().to_vec();
         let flat = hidden.reshape(&[-1, self.hidden_size], context)?;
         let routes = self.router.select(&flat, context)?;
-        let output = provider
-            .forward_grouped_tensor_parallel(
-                &mut self.experts,
-                RoutedExpertRequest {
-                    bank: eredu_runtime::RoutedBankId::new(0),
-                    layer,
-                    input: &flat,
-                    routes: &routes,
-                    pass,
-                },
-                B::parallel_size(parallel),
-                context,
-            )
-            .map_err(Error::backend)?;
+        let output = instrumentation.routed(
+            "routing",
+            RoutedExpertRequest {
+                unit_observer: None,
+                bank: eredu_runtime::RoutedBankId::new(0),
+                layer,
+                input: &flat,
+                routes: &routes,
+                pass,
+            },
+            |request| {
+                provider.forward_grouped_tensor_parallel(
+                    &mut self.experts,
+                    request,
+                    B::parallel_size(parallel),
+                    context,
+                )
+            },
+        )?;
         let output =
             eredu_runtime::reduce_routed_expert_tensor_parallel::<B>(output, parallel, context)?;
         output.reshape(&shape, context)
@@ -617,32 +606,6 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> FeedForward<B
         }
     }
 
-    fn forward(
-        &mut self,
-        hidden: &B::Tensor,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<B::Tensor, Error> {
-        match self {
-            Self::Dense(dense) => dense.forward(hidden, context),
-            Self::Sparse(sparse) => sparse.forward(hidden, context),
-        }
-    }
-
-    fn forward_parallel(
-        &mut self,
-        hidden: &B::Tensor,
-        parallel: &B::ParallelContext,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<B::Tensor, Error>
-    where
-        B: eredu_nn::TensorParallelGroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
-    {
-        match self {
-            Self::Dense(dense) => dense.forward_parallel(hidden, parallel, context),
-            Self::Sparse(sparse) => sparse.forward_parallel(hidden, parallel, context),
-        }
-    }
-
     fn forward_with_provider<P>(
         &mut self,
         hidden: &B::Tensor,
@@ -650,16 +613,24 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> FeedForward<B
         pass: ExpertPass,
         provider: &mut P,
         context: &<B::Tensor as Tensor>::Context,
+        instrumentation: &mut ComponentInstrumentation<'_, B::Tensor>,
     ) -> Result<B::Tensor, Error>
     where
         P: RoutedExpertProvider<B>,
         P::Error: std::fmt::Display,
     {
         match self {
-            Self::Dense(dense) => dense.forward(hidden, context),
-            Self::Sparse(sparse) => {
-                sparse.forward_with_provider(hidden, layer, pass, provider, context)
+            Self::Dense(dense) => {
+                dense.forward_instrumented(hidden, None, context, instrumentation)
             }
+            Self::Sparse(sparse) => sparse.forward_with_provider(
+                hidden,
+                layer,
+                pass,
+                provider,
+                context,
+                instrumentation,
+            ),
         }
     }
 
@@ -671,15 +642,25 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> FeedForward<B
         provider: &mut P,
         parallel: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
+        instrumentation: &mut ComponentInstrumentation<'_, B::Tensor>,
     ) -> Result<B::Tensor, Error>
     where
         P: TensorParallelRoutedExpertProvider<B>,
         P::Error: std::fmt::Display,
     {
         match self {
-            Self::Dense(dense) => dense.forward_parallel(hidden, parallel, context),
-            Self::Sparse(sparse) => sparse
-                .forward_parallel_with_provider(hidden, layer, pass, provider, parallel, context),
+            Self::Dense(dense) => {
+                dense.forward_instrumented(hidden, Some(parallel), context, instrumentation)
+            }
+            Self::Sparse(sparse) => sparse.forward_parallel_with_provider(
+                hidden,
+                layer,
+                pass,
+                provider,
+                parallel,
+                context,
+                instrumentation,
+            ),
         }
     }
 }
@@ -750,16 +731,38 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> TransformerBl
         cache: Option<&mut C>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
-        let normalized = self.input_norm.forward(hidden, context)?;
-        let attention = self.attention.forward(&normalized, mask, cache, context)?;
-        let attention = self.post_attention_norm.forward(&attention, context)?;
-        let hidden = hidden.add(&attention, context)?;
-        let normalized = self.pre_feed_forward_norm.forward(&hidden, context)?;
-        let feed_forward = self.feed_forward.forward(&normalized, context)?;
-        let feed_forward = self
-            .post_feed_forward_norm
-            .forward(&feed_forward, context)?;
-        hidden.add(&feed_forward, context)
+        self.forward_observed(
+            hidden,
+            mask,
+            cache,
+            context,
+            &mut ComponentInstrumentation::disabled(),
+        )
+    }
+
+    /// Executes the same block with component observations and interventions.
+    pub fn forward_observed<C: AttentionCache<B::Tensor>>(
+        &mut self,
+        hidden: &B::Tensor,
+        mask: Option<&B::Tensor>,
+        cache: Option<&mut C>,
+        context: &<B::Tensor as Tensor>::Context,
+        instrumentation: &mut ComponentInstrumentation<'_, B::Tensor>,
+    ) -> Result<B::Tensor, Error> {
+        let pass = if hidden.dim(1) > 1 {
+            ExpertPass::Prefill
+        } else {
+            ExpertPass::Decode
+        };
+        self.forward_with_provider_observed(
+            hidden,
+            mask,
+            cache,
+            pass,
+            &mut eredu_runtime::ResidentExpertProvider,
+            context,
+            instrumentation,
+        )
     }
 
     /// Executes the canonical block while runtime policy owns routed experts.
@@ -777,22 +780,52 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> TransformerBl
         P: RoutedExpertProvider<B>,
         P::Error: std::fmt::Display,
     {
-        let normalized = self.input_norm.forward(hidden, context)?;
-        let attention = self.attention.forward(&normalized, mask, cache, context)?;
-        let attention = self.post_attention_norm.forward(&attention, context)?;
-        let hidden = hidden.add(&attention, context)?;
-        let normalized = self.pre_feed_forward_norm.forward(&hidden, context)?;
-        let feed_forward = self.feed_forward.forward_with_provider(
-            &normalized,
-            self.layer,
+        self.forward_with_provider_observed(
+            hidden,
+            mask,
+            cache,
             pass,
             provider,
             context,
-        )?;
-        let feed_forward = self
-            .post_feed_forward_norm
-            .forward(&feed_forward, context)?;
-        hidden.add(&feed_forward, context)
+            &mut ComponentInstrumentation::disabled(),
+        )
+    }
+
+    /// Observes the exact routed request and consumed sublayer values.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_with_provider_observed<C, P>(
+        &mut self,
+        hidden: &B::Tensor,
+        mask: Option<&B::Tensor>,
+        cache: Option<&mut C>,
+        pass: ExpertPass,
+        provider: &mut P,
+        context: &<B::Tensor as Tensor>::Context,
+        instrumentation: &mut ComponentInstrumentation<'_, B::Tensor>,
+    ) -> Result<B::Tensor, Error>
+    where
+        C: AttentionCache<B::Tensor>,
+        P: RoutedExpertProvider<B>,
+        P::Error: std::fmt::Display,
+    {
+        self.forward_inner(
+            hidden,
+            mask,
+            cache,
+            None,
+            context,
+            instrumentation,
+            |feed_forward, hidden, layer, instrumentation| {
+                feed_forward.forward_with_provider(
+                    hidden,
+                    layer,
+                    pass,
+                    provider,
+                    context,
+                    instrumentation,
+                )
+            },
+        )
     }
 
     /// Executes the canonical block with rank-local projections and resident experts.
@@ -805,22 +838,46 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> TransformerBl
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error>
     where
-        B: eredu_nn::TensorParallelGroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
+        B: eredu_nn::TensorParallelGroupedNeuralBackend,
     {
-        let normalized = self.input_norm.forward(hidden, context)?;
-        let attention =
-            self.attention
-                .forward_parallel(&normalized, mask, cache, parallel, context)?;
-        let attention = self.post_attention_norm.forward(&attention, context)?;
-        let hidden = hidden.add(&attention, context)?;
-        let normalized = self.pre_feed_forward_norm.forward(&hidden, context)?;
-        let feed_forward = self
-            .feed_forward
-            .forward_parallel(&normalized, parallel, context)?;
-        let feed_forward = self
-            .post_feed_forward_norm
-            .forward(&feed_forward, context)?;
-        hidden.add(&feed_forward, context)
+        self.forward_parallel_observed(
+            hidden,
+            mask,
+            cache,
+            parallel,
+            context,
+            &mut ComponentInstrumentation::disabled(),
+        )
+    }
+
+    /// Executes the same TP block with local component evidence.
+    pub fn forward_parallel_observed<C: AttentionCache<B::Tensor>>(
+        &mut self,
+        hidden: &B::Tensor,
+        mask: Option<&B::Tensor>,
+        cache: Option<&mut C>,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+        instrumentation: &mut ComponentInstrumentation<'_, B::Tensor>,
+    ) -> Result<B::Tensor, Error>
+    where
+        B: eredu_nn::TensorParallelGroupedNeuralBackend,
+    {
+        let pass = if hidden.dim(1) > 1 {
+            ExpertPass::Prefill
+        } else {
+            ExpertPass::Decode
+        };
+        self.forward_parallel_with_provider_observed(
+            hidden,
+            mask,
+            cache,
+            pass,
+            &mut eredu_runtime::ResidentExpertProvider,
+            parallel,
+            context,
+            instrumentation,
+        )
     }
 
     /// Executes the canonical TP block while runtime owns routed experts.
@@ -840,25 +897,114 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> TransformerBl
         P: TensorParallelRoutedExpertProvider<B>,
         P::Error: std::fmt::Display,
     {
-        let normalized = self.input_norm.forward(hidden, context)?;
-        let attention =
-            self.attention
-                .forward_parallel(&normalized, mask, cache, parallel, context)?;
-        let attention = self.post_attention_norm.forward(&attention, context)?;
-        let hidden = hidden.add(&attention, context)?;
-        let normalized = self.pre_feed_forward_norm.forward(&hidden, context)?;
-        let feed_forward = self.feed_forward.forward_parallel_with_provider(
-            &normalized,
-            self.layer,
+        self.forward_parallel_with_provider_observed(
+            hidden,
+            mask,
+            cache,
             pass,
             provider,
             parallel,
             context,
+            &mut ComponentInstrumentation::disabled(),
+        )
+    }
+
+    /// Observes and intervenes in the same TP/provider block driver.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_parallel_with_provider_observed<C, P>(
+        &mut self,
+        hidden: &B::Tensor,
+        mask: Option<&B::Tensor>,
+        cache: Option<&mut C>,
+        pass: ExpertPass,
+        provider: &mut P,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+        instrumentation: &mut ComponentInstrumentation<'_, B::Tensor>,
+    ) -> Result<B::Tensor, Error>
+    where
+        C: AttentionCache<B::Tensor>,
+        P: TensorParallelRoutedExpertProvider<B>,
+        P::Error: std::fmt::Display,
+    {
+        self.forward_inner(
+            hidden,
+            mask,
+            cache,
+            Some(parallel),
+            context,
+            instrumentation,
+            |feed_forward, hidden, layer, instrumentation| {
+                feed_forward.forward_parallel_with_provider(
+                    hidden,
+                    layer,
+                    pass,
+                    provider,
+                    parallel,
+                    context,
+                    instrumentation,
+                )
+            },
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn forward_inner<C, F>(
+        &mut self,
+        hidden: &B::Tensor,
+        mask: Option<&B::Tensor>,
+        cache: Option<&mut C>,
+        parallel: Option<&B::ParallelContext>,
+        context: &<B::Tensor as Tensor>::Context,
+        instrumentation: &mut ComponentInstrumentation<'_, B::Tensor>,
+        feed_forward: F,
+    ) -> Result<B::Tensor, Error>
+    where
+        C: AttentionCache<B::Tensor>,
+        F: FnOnce(
+            &mut FeedForward<B>,
+            &B::Tensor,
+            usize,
+            &mut ComponentInstrumentation<'_, B::Tensor>,
+        ) -> Result<B::Tensor, Error>,
+    {
+        let observed_input = if instrumentation.enabled() {
+            Some(instrumentation.apply("input", hidden.clone())?)
+        } else {
+            None
+        };
+        let hidden = observed_input.as_ref().unwrap_or(hidden);
+        let normalized = self.input_norm.forward(hidden, context)?;
+        let normalized = instrumentation.apply("attention.input", normalized)?;
+        let attention = self.attention.forward_instrumented(
+            &normalized,
+            mask,
+            cache,
+            parallel,
+            context,
+            instrumentation,
         )?;
+        let attention = instrumentation.apply("attention.write", attention)?;
+        let attention = self.post_attention_norm.forward(&attention, context)?;
+        let attention = instrumentation.apply("attention.output", attention)?;
+        let hidden = hidden.add(&attention, context)?;
+        let hidden = instrumentation.apply("attention.residual", hidden)?;
+        let normalized = self.pre_feed_forward_norm.forward(&hidden, context)?;
+        let normalized = instrumentation.apply("feed_forward.input", normalized)?;
+        let feed_forward = feed_forward(
+            &mut self.feed_forward,
+            &normalized,
+            self.layer,
+            instrumentation,
+        )?;
+        let feed_forward = instrumentation.apply("feed_forward.write", feed_forward)?;
         let feed_forward = self
             .post_feed_forward_norm
             .forward(&feed_forward, context)?;
-        hidden.add(&feed_forward, context)
+        let feed_forward = instrumentation.apply("feed_forward.output", feed_forward)?;
+        let hidden = hidden.add(&feed_forward, context)?;
+        let hidden = instrumentation.apply("feed_forward.residual", hidden)?;
+        instrumentation.apply("output", hidden)
     }
 }
 
@@ -1035,15 +1181,50 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> StaticModules
         hidden: &B::Tensor,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
-        let hidden = self.final_norm.forward(hidden, context)?;
-        let logits = match self.head.as_mut() {
-            Some(head) => head.forward(&hidden, context)?,
-            None => self.embeddings.as_linear(&hidden, context)?,
+        self.logits_instrumented(
+            hidden,
+            None,
+            context,
+            &mut ComponentInstrumentation::disabled(),
+        )
+    }
+
+    /// Applies the same readout with evidence from the actual projection input.
+    pub(crate) fn logits_instrumented(
+        &mut self,
+        hidden: &B::Tensor,
+        parallel: Option<&B::ParallelContext>,
+        context: &<B::Tensor as Tensor>::Context,
+        instrumentation: &mut ComponentInstrumentation<'_, B::Tensor>,
+    ) -> Result<B::Tensor, Error> {
+        let hidden = instrumentation.normalize_readout(hidden, &mut self.final_norm, context)?;
+        let logits = match (parallel, self.head.as_mut()) {
+            (Some(parallel), Some(head)) => instrumentation.project_vocabulary::<B>(
+                "projection_input",
+                head,
+                &hidden,
+                parallel,
+                context,
+            )?,
+            (Some(parallel), None) => instrumentation.project_vocabulary_embedding::<B>(
+                "projection_input",
+                &mut self.embeddings,
+                &hidden,
+                parallel,
+                context,
+            )?,
+            (None, Some(head)) => {
+                instrumentation.project::<B>("projection_input", head, &hidden, None, context)?
+            }
+            (None, None) => instrumentation.project_embedding(
+                "projection_input",
+                &mut self.embeddings,
+                &hidden,
+                context,
+            )?,
         };
-        logits
-            .multiply_scalar(self.output_multiplier / self.logit_cap, context)?
-            .tanh(context)?
-            .multiply_scalar(self.logit_cap, context)
+        let logits = instrumentation.apply("linear", logits)?;
+        self.finish_logits(logits, context)
     }
 }
 

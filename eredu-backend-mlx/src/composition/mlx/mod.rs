@@ -13,6 +13,10 @@ mod processor;
 pub mod realtime;
 pub(crate) mod replicated_text;
 mod session;
+#[cfg(test)]
+pub(crate) use session::{
+    bounded_capture as fixture_bounded_capture, intervention as fixture_intervention,
+};
 pub mod speculative;
 pub mod structural;
 

@@ -45,6 +45,46 @@ impl CompressedLatentCache {
         Self::default()
     }
 
+    /// Bounds retained token storage after an admitted continuation, including
+    /// resident allocation chunks and the paged tail's full input span.
+    pub(crate) fn continuation_capacity_bound(&self, additional: u64) -> Option<u64> {
+        if let Some(paged) = self.paged.as_deref() {
+            return u64::try_from(paged.offset).ok()?.checked_add(additional);
+        }
+        let required = u64::try_from(self.length).ok()?.checked_add(additional)?;
+        let step = u64::try_from(self.step).ok().filter(|step| *step > 0)?;
+        let padded = required
+            .checked_add(step - 1)?
+            .checked_div(step)?
+            .checked_mul(step)?;
+        Some(padded.max(u64::try_from(self.capacity).ok()?))
+    }
+
+    /// Copies logical state into independent compact buffers. Resident padding
+    /// is discarded so snapshot storage matches the retained logical arrays;
+    /// continuation accounting separately includes future chunk allocation.
+    /// Paged callers must bind the copied tail to an independently copied manager.
+    pub(crate) fn isolated_snapshot(&self, stream: &Stream) -> Result<Self, Exception> {
+        let copy = |array: &Option<Array>| {
+            array
+                .as_ref()
+                .map(|array| array.contiguous(false, stream)?.deep_clone())
+                .transpose()
+        };
+        let mut snapshot = self.clone();
+        if let Some(paged) = snapshot.paged.as_deref_mut() {
+            paged.tail_latent = copy(&paged.tail_latent)?;
+            paged.tail_rotary = copy(&paged.tail_rotary)?;
+        } else {
+            snapshot.latent_storage = copy(&self.latent)?;
+            snapshot.rotary_key_storage = copy(&self.rotary_key)?;
+            snapshot.latent = snapshot.latent_storage.clone();
+            snapshot.rotary_key = snapshot.rotary_key_storage.clone();
+            snapshot.capacity = snapshot.length;
+        }
+        Ok(snapshot)
+    }
+
     /// Forks mutable cache state while retaining the immutable paging catalog.
     ///
     /// Resident storage and a paged mutable tail receive independent MLX

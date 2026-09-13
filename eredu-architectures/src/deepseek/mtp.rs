@@ -9,6 +9,8 @@ use eredu_nn::{
 };
 use eredu_runtime::{ExpertPass, RoutedExpertProvider};
 
+use crate::decoder::ComponentInstrumentation;
+
 use super::{block::V3Block, block::V4Block, V3Args, V4Args};
 
 /// Borrowed input selecting target execution or one embedded prediction depth.
@@ -208,19 +210,14 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend + BlockwiseAtt
         cache: &mut C,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<PredictionOutput<B::Tensor>, Error> {
-        let embedded = self.embedding_norm.forward(embedded, context)?;
-        let hidden = self.hidden_norm.forward(hidden, context)?;
-        let fused = B::Tensor::concatenate(&[embedded, hidden], -1, context)?;
-        let fused = self.fusion.forward(&fused, context)?;
-        let hidden = self.decoder.forward(&fused, None, Some(cache), context)?;
-        let logits = self
-            .output_head
-            .forward(&self.output_norm.forward(&hidden, context)?, context)?;
-        Ok(PredictionOutput {
-            logits,
+        self.forward_with_decoder(
             hidden,
-            tokens: tokens.clone(),
-        })
+            embedded,
+            tokens,
+            context,
+            &mut ComponentInstrumentation::disabled(),
+            |decoder, fused, context, _| decoder.forward(fused, None, Some(cache), context),
+        )
     }
 
     /// Executes one V3 prediction depth with runtime-supplied routed experts.
@@ -240,26 +237,16 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend + BlockwiseAtt
         P: RoutedExpertProvider<B>,
         P::Error: std::fmt::Display,
     {
-        let embedded = self.embedding_norm.forward(embedded, context)?;
-        let hidden = self.hidden_norm.forward(hidden, context)?;
-        let fused = B::Tensor::concatenate(&[embedded, hidden], -1, context)?;
-        let fused = self.fusion.forward(&fused, context)?;
-        let hidden = self.decoder.forward_with_provider(
-            &fused,
-            None,
-            Some(cache),
-            pass,
-            provider,
-            context,
-        )?;
-        let logits = self
-            .output_head
-            .forward(&self.output_norm.forward(&hidden, context)?, context)?;
-        Ok(PredictionOutput {
-            logits,
+        self.forward_with_decoder(
             hidden,
-            tokens: tokens.clone(),
-        })
+            embedded,
+            tokens,
+            context,
+            &mut ComponentInstrumentation::disabled(),
+            |decoder, fused, context, _| {
+                decoder.forward_with_provider(fused, None, Some(cache), pass, provider, context)
+            },
+        )
     }
 
     /// Executes a tensor-partitioned V3 prediction block while retaining its
@@ -277,21 +264,16 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend + BlockwiseAtt
         C: CompressedAttentionCache<B::Tensor>,
         F: FnMut(B::Tensor, &<B::Tensor as Tensor>::Context) -> Result<B::Tensor, Error>,
     {
-        let embedded = self.embedding_norm.forward(embedded, context)?;
-        let hidden = self.hidden_norm.forward(hidden, context)?;
-        let fused = B::Tensor::concatenate(&[embedded, hidden], -1, context)?;
-        let fused = self.fusion.forward(&fused, context)?;
-        let hidden = self
-            .decoder
-            .forward_parallel(&fused, None, Some(cache), context, reduce)?;
-        let logits = self
-            .output_head
-            .forward(&self.output_norm.forward(&hidden, context)?, context)?;
-        Ok(PredictionOutput {
-            logits,
+        self.forward_with_decoder(
             hidden,
-            tokens: tokens.clone(),
-        })
+            embedded,
+            tokens,
+            context,
+            &mut ComponentInstrumentation::disabled(),
+            |decoder, fused, context, _| {
+                decoder.forward_parallel(fused, None, Some(cache), context, reduce)
+            },
+        )
     }
 
     /// Tensor-partitioned V3 prediction with runtime-supplied experts.
@@ -313,22 +295,208 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend + BlockwiseAtt
         P::Error: std::fmt::Display,
         F: FnMut(B::Tensor, &<B::Tensor as Tensor>::Context) -> Result<B::Tensor, Error>,
     {
-        let embedded = self.embedding_norm.forward(embedded, context)?;
-        let hidden = self.hidden_norm.forward(hidden, context)?;
+        self.forward_with_decoder(
+            hidden,
+            embedded,
+            tokens,
+            context,
+            &mut ComponentInstrumentation::disabled(),
+            |decoder, fused, context, _| {
+                decoder.forward_parallel_with_provider(
+                    fused,
+                    None,
+                    Some(cache),
+                    pass,
+                    provider,
+                    context,
+                    reduce,
+                )
+            },
+        )
+    }
+
+    /// Observes actual prediction fusion, decoder and head values. The caller
+    /// supplies the canonical unit path and owns speculative phase attribution.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_observed_with_provider<C, P, O>(
+        &mut self,
+        path: &str,
+        hidden: &B::Tensor,
+        embedded: &B::Tensor,
+        tokens: &B::Tensor,
+        cache: &mut C,
+        pass: ExpertPass,
+        provider: &mut P,
+        context: &<B::Tensor as Tensor>::Context,
+        observer: &mut O,
+    ) -> Result<PredictionOutput<B::Tensor>, Error>
+    where
+        C: CompressedAttentionCache<B::Tensor>,
+        P: RoutedExpertProvider<B>,
+        P::Error: std::fmt::Display,
+        O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
+    {
+        let mut borrowed = eredu_runtime::BorrowedActivationObserver(observer);
+        self.forward_with_decoder(
+            hidden,
+            embedded,
+            tokens,
+            context,
+            &mut ComponentInstrumentation::new(path, &mut borrowed),
+            |decoder, fused, context, instrumentation| {
+                decoder.forward_internal_observed_with_provider(
+                    path,
+                    fused,
+                    None,
+                    Some(cache),
+                    pass,
+                    provider,
+                    context,
+                    instrumentation
+                        .observer()
+                        .expect("observed prediction retains observer"),
+                )
+            },
+        )
+    }
+
+    /// Observes the existing resident TP decoder with a replicated prediction head.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_parallel_observed<C, O, F>(
+        &mut self,
+        path: &str,
+        hidden: &B::Tensor,
+        embedded: &B::Tensor,
+        tokens: &B::Tensor,
+        cache: &mut C,
+        context: &<B::Tensor as Tensor>::Context,
+        observer: &mut O,
+        reduce: F,
+    ) -> Result<PredictionOutput<B::Tensor>, Error>
+    where
+        C: CompressedAttentionCache<B::Tensor>,
+        O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
+        F: FnMut(B::Tensor, &<B::Tensor as Tensor>::Context) -> Result<B::Tensor, Error>,
+    {
+        let mut borrowed = eredu_runtime::BorrowedActivationObserver(observer);
+        self.forward_with_decoder(
+            hidden,
+            embedded,
+            tokens,
+            context,
+            &mut ComponentInstrumentation::new(path, &mut borrowed),
+            |decoder, fused, context, instrumentation| {
+                decoder.forward_parallel_observed(
+                    path,
+                    fused,
+                    None,
+                    Some(cache),
+                    context,
+                    instrumentation
+                        .observer()
+                        .expect("observed prediction retains observer"),
+                    reduce,
+                )
+            },
+        )
+    }
+
+    /// Provider-aware TP prediction hooks reuse the target block's ordinary
+    /// reductions and routed expert observations.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_parallel_observed_with_provider<C, P, O, F>(
+        &mut self,
+        path: &str,
+        hidden: &B::Tensor,
+        embedded: &B::Tensor,
+        tokens: &B::Tensor,
+        cache: &mut C,
+        pass: ExpertPass,
+        provider: &mut P,
+        context: &<B::Tensor as Tensor>::Context,
+        observer: &mut O,
+        reduce: F,
+    ) -> Result<PredictionOutput<B::Tensor>, Error>
+    where
+        C: CompressedAttentionCache<B::Tensor>,
+        P: eredu_runtime::TensorParallelRoutedExpertProvider<B>,
+        P::Error: std::fmt::Display,
+        O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
+        F: FnMut(B::Tensor, &<B::Tensor as Tensor>::Context) -> Result<B::Tensor, Error>,
+    {
+        let mut borrowed = eredu_runtime::BorrowedActivationObserver(observer);
+        self.forward_with_decoder(
+            hidden,
+            embedded,
+            tokens,
+            context,
+            &mut ComponentInstrumentation::new(path, &mut borrowed),
+            |decoder, fused, context, instrumentation| {
+                decoder.forward_parallel_observed_with_provider(
+                    path,
+                    fused,
+                    None,
+                    Some(cache),
+                    pass,
+                    provider,
+                    context,
+                    instrumentation
+                        .observer()
+                        .expect("observed prediction retains observer"),
+                    reduce,
+                )
+            },
+        )
+    }
+
+    fn forward_with_decoder<F>(
+        &mut self,
+        hidden: &B::Tensor,
+        embedded: &B::Tensor,
+        tokens: &B::Tensor,
+        context: &<B::Tensor as Tensor>::Context,
+        instrumentation: &mut ComponentInstrumentation<'_, B::Tensor>,
+        decoder: F,
+    ) -> Result<PredictionOutput<B::Tensor>, Error>
+    where
+        F: FnOnce(
+            &mut V3Block<B>,
+            &B::Tensor,
+            &<B::Tensor as Tensor>::Context,
+            &mut ComponentInstrumentation<'_, B::Tensor>,
+        ) -> Result<B::Tensor, Error>,
+    {
+        let embedded = instrumentation.apply(
+            "prediction.embedding.normalized",
+            self.embedding_norm.forward(embedded, context)?,
+        )?;
+        let hidden = instrumentation.apply(
+            "prediction.hidden.normalized",
+            self.hidden_norm.forward(hidden, context)?,
+        )?;
         let fused = B::Tensor::concatenate(&[embedded, hidden], -1, context)?;
-        let fused = self.fusion.forward(&fused, context)?;
-        let hidden = self.decoder.forward_parallel_with_provider(
+        let fused = instrumentation.project::<B>(
+            "prediction.fusion.input",
+            &mut self.fusion,
             &fused,
             None,
-            Some(cache),
-            pass,
-            provider,
             context,
-            reduce,
         )?;
-        let logits = self
-            .output_head
-            .forward(&self.output_norm.forward(&hidden, context)?, context)?;
+        let fused = instrumentation.apply("prediction.fusion.output", fused)?;
+        let hidden = decoder(&mut self.decoder, &fused, context, instrumentation)?;
+        let hidden = instrumentation.apply("prediction.readout.residual", hidden)?;
+        let normalized = instrumentation.apply(
+            "prediction.readout.normalized",
+            self.output_norm.forward(&hidden, context)?,
+        )?;
+        let logits = instrumentation.project::<B>(
+            "prediction.readout.projection_input",
+            &mut self.output_head,
+            &normalized,
+            None,
+            context,
+        )?;
+        let logits = instrumentation.apply("prediction.readout.linear", logits)?;
         Ok(PredictionOutput {
             logits,
             hidden,
@@ -432,26 +600,15 @@ where
         output_head: &mut B::Linear,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<PredictionOutput<B::Tensor>, Error> {
-        let embedded = self.embedding_norm.forward(embedded, context)?;
-        let hidden = self.hidden_norm.forward(hidden, context)?;
-        let embedded = self
-            .embedding_projection
-            .forward(&embedded, context)?
-            .expand_dims(2, context)?
-            .broadcast_to(hidden.shape(), context)?;
-        let hidden = self.hidden_projection.forward(&hidden, context)?;
-        let fused = embedded.add(&hidden, context)?;
-        let hidden = self
-            .decoder
-            .forward(&fused, tokens, None, Some(cache), context)?;
-        let collapsed = self.hyper_head.forward(&hidden, context)?;
-        let normalized = self.output_norm.forward(&collapsed, context)?;
-        let logits = output_head.forward(&normalized, context)?;
-        Ok(PredictionOutput {
-            logits,
+        self.forward_with_execution(
             hidden,
-            tokens: tokens.clone(),
-        })
+            embedded,
+            tokens,
+            context,
+            &mut ComponentInstrumentation::disabled(),
+            |decoder, fused, context, _| decoder.forward(fused, tokens, None, Some(cache), context),
+            |normalized, context, _| output_head.forward(normalized, context),
+        )
     }
 
     /// Executes one V4 prediction depth with runtime-supplied routed experts.
@@ -472,32 +629,25 @@ where
         P: RoutedExpertProvider<B>,
         P::Error: std::fmt::Display,
     {
-        let embedded = self.embedding_norm.forward(embedded, context)?;
-        let hidden = self.hidden_norm.forward(hidden, context)?;
-        let embedded = self
-            .embedding_projection
-            .forward(&embedded, context)?
-            .expand_dims(2, context)?
-            .broadcast_to(hidden.shape(), context)?;
-        let hidden = self.hidden_projection.forward(&hidden, context)?;
-        let fused = embedded.add(&hidden, context)?;
-        let hidden = self.decoder.forward_with_provider(
-            &fused,
-            tokens,
-            None,
-            Some(cache),
-            pass,
-            provider,
-            context,
-        )?;
-        let collapsed = self.hyper_head.forward(&hidden, context)?;
-        let normalized = self.output_norm.forward(&collapsed, context)?;
-        let logits = output_head.forward(&normalized, context)?;
-        Ok(PredictionOutput {
-            logits,
+        self.forward_with_execution(
             hidden,
-            tokens: tokens.clone(),
-        })
+            embedded,
+            tokens,
+            context,
+            &mut ComponentInstrumentation::disabled(),
+            |decoder, fused, context, _| {
+                decoder.forward_with_provider(
+                    &fused,
+                    tokens,
+                    None,
+                    Some(cache),
+                    pass,
+                    provider,
+                    context,
+                )
+            },
+            |normalized, context, _| output_head.forward(normalized, context),
+        )
     }
 
     /// Executes a tensor-partitioned sequential predictor and delegates the
@@ -518,26 +668,17 @@ where
         R: FnMut(B::Tensor, &<B::Tensor as Tensor>::Context) -> Result<B::Tensor, Error>,
         H: FnMut(&B::Tensor, &<B::Tensor as Tensor>::Context) -> Result<B::Tensor, Error>,
     {
-        let embedded = self.embedding_norm.forward(embedded, context)?;
-        let hidden = self.hidden_norm.forward(hidden, context)?;
-        let embedded = self
-            .embedding_projection
-            .forward(&embedded, context)?
-            .expand_dims(2, context)?
-            .broadcast_to(hidden.shape(), context)?;
-        let hidden = self.hidden_projection.forward(&hidden, context)?;
-        let fused = embedded.add(&hidden, context)?;
-        let hidden =
-            self.decoder
-                .forward_parallel(&fused, tokens, None, Some(cache), context, reduce)?;
-        let collapsed = self.hyper_head.forward(&hidden, context)?;
-        let normalized = self.output_norm.forward(&collapsed, context)?;
-        let logits = project(&normalized, context)?;
-        Ok(PredictionOutput {
-            logits,
+        self.forward_with_execution(
             hidden,
-            tokens: tokens.clone(),
-        })
+            embedded,
+            tokens,
+            context,
+            &mut ComponentInstrumentation::disabled(),
+            |decoder, fused, context, _| {
+                decoder.forward_parallel(fused, tokens, None, Some(cache), context, reduce)
+            },
+            |normalized, context, _| project(normalized, context),
+        )
     }
 
     /// Tensor-partitioned sequential predictor with supplied routed experts.
@@ -561,31 +702,317 @@ where
         R: FnMut(B::Tensor, &<B::Tensor as Tensor>::Context) -> Result<B::Tensor, Error>,
         H: FnMut(&B::Tensor, &<B::Tensor as Tensor>::Context) -> Result<B::Tensor, Error>,
     {
-        let embedded = self.embedding_norm.forward(embedded, context)?;
-        let hidden = self.hidden_norm.forward(hidden, context)?;
-        let embedded = self
-            .embedding_projection
-            .forward(&embedded, context)?
+        self.forward_with_execution(
+            hidden,
+            embedded,
+            tokens,
+            context,
+            &mut ComponentInstrumentation::disabled(),
+            |decoder, fused, context, _| {
+                decoder.forward_parallel_with_provider(
+                    &fused,
+                    tokens,
+                    None,
+                    Some(cache),
+                    pass,
+                    provider,
+                    context,
+                    reduce,
+                )
+            },
+            |normalized, context, _| project(normalized, context),
+        )
+    }
+    /// Observes the separate prediction projections, decoder streams and actual head input.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_observed<C, O>(
+        &mut self,
+        path: &str,
+        hidden: &B::Tensor,
+        embedded: &B::Tensor,
+        tokens: &B::Tensor,
+        cache: &mut C,
+        output_head: &mut B::Linear,
+        context: &<B::Tensor as Tensor>::Context,
+        observer: &mut O,
+    ) -> Result<PredictionOutput<B::Tensor>, Error>
+    where
+        C: PoolingAttentionCache<B::Tensor>,
+        O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
+    {
+        let mut borrowed = eredu_runtime::BorrowedActivationObserver(observer);
+        self.forward_with_execution(
+            hidden,
+            embedded,
+            tokens,
+            context,
+            &mut ComponentInstrumentation::new(path, &mut borrowed),
+            |decoder, fused, context, instrumentation| {
+                decoder.forward_observed(
+                    &format!("{path}.decoder"),
+                    fused,
+                    tokens,
+                    None,
+                    Some(cache),
+                    context,
+                    instrumentation.observer().expect("observed V4 prediction"),
+                )
+            },
+            |normalized, context, instrumentation| {
+                instrumentation.project::<B>(
+                    "projection_input",
+                    output_head,
+                    normalized,
+                    None,
+                    context,
+                )
+            },
+        )
+    }
+
+    /// Observes the separate prediction projections, decoder streams and actual head input.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_observed_with_provider<C, O, P>(
+        &mut self,
+        path: &str,
+        hidden: &B::Tensor,
+        embedded: &B::Tensor,
+        tokens: &B::Tensor,
+        cache: &mut C,
+        output_head: &mut B::Linear,
+        pass: ExpertPass,
+        provider: &mut P,
+        context: &<B::Tensor as Tensor>::Context,
+        observer: &mut O,
+    ) -> Result<PredictionOutput<B::Tensor>, Error>
+    where
+        C: PoolingAttentionCache<B::Tensor>,
+        O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
+        P: RoutedExpertProvider<B>,
+        P::Error: std::fmt::Display,
+    {
+        let mut borrowed = eredu_runtime::BorrowedActivationObserver(observer);
+        self.forward_with_execution(
+            hidden,
+            embedded,
+            tokens,
+            context,
+            &mut ComponentInstrumentation::new(path, &mut borrowed),
+            |decoder, fused, context, instrumentation| {
+                decoder.forward_observed_with_provider(
+                    &format!("{path}.decoder"),
+                    fused,
+                    tokens,
+                    None,
+                    Some(cache),
+                    pass,
+                    provider,
+                    context,
+                    instrumentation.observer().expect("observed V4 prediction"),
+                )
+            },
+            |normalized, context, instrumentation| {
+                instrumentation.project::<B>(
+                    "projection_input",
+                    output_head,
+                    normalized,
+                    None,
+                    context,
+                )
+            },
+        )
+    }
+
+    /// Observes the separate prediction projections, decoder streams and actual head input.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_parallel_observed<C, O, R>(
+        &mut self,
+        path: &str,
+        hidden: &B::Tensor,
+        embedded: &B::Tensor,
+        tokens: &B::Tensor,
+        cache: &mut C,
+        output_head: &mut B::Linear,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+        observer: &mut O,
+        reduce: R,
+    ) -> Result<PredictionOutput<B::Tensor>, Error>
+    where
+        C: PoolingAttentionCache<B::Tensor>,
+        O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
+        R: FnMut(B::Tensor, &<B::Tensor as Tensor>::Context) -> Result<B::Tensor, Error>,
+    {
+        let mut borrowed = eredu_runtime::BorrowedActivationObserver(observer);
+        self.forward_with_execution(
+            hidden,
+            embedded,
+            tokens,
+            context,
+            &mut ComponentInstrumentation::new(path, &mut borrowed),
+            |decoder, fused, context, instrumentation| {
+                decoder.forward_parallel_observed(
+                    &format!("{path}.decoder"),
+                    fused,
+                    tokens,
+                    None,
+                    Some(cache),
+                    context,
+                    instrumentation.observer().expect("observed V4 prediction"),
+                    reduce,
+                )
+            },
+            |normalized, context, instrumentation| {
+                instrumentation.project_vocabulary::<B>(
+                    "projection_input",
+                    output_head,
+                    normalized,
+                    parallel,
+                    context,
+                )
+            },
+        )
+    }
+
+    /// Observes the separate prediction projections, decoder streams and actual head input.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_parallel_observed_with_provider<C, O, P, R>(
+        &mut self,
+        path: &str,
+        hidden: &B::Tensor,
+        embedded: &B::Tensor,
+        tokens: &B::Tensor,
+        cache: &mut C,
+        output_head: &mut B::Linear,
+        pass: ExpertPass,
+        provider: &mut P,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+        observer: &mut O,
+        reduce: R,
+    ) -> Result<PredictionOutput<B::Tensor>, Error>
+    where
+        C: PoolingAttentionCache<B::Tensor>,
+        O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
+        P: eredu_runtime::TensorParallelRoutedExpertProvider<B>,
+        P::Error: std::fmt::Display,
+        R: FnMut(B::Tensor, &<B::Tensor as Tensor>::Context) -> Result<B::Tensor, Error>,
+    {
+        let mut borrowed = eredu_runtime::BorrowedActivationObserver(observer);
+        self.forward_with_execution(
+            hidden,
+            embedded,
+            tokens,
+            context,
+            &mut ComponentInstrumentation::new(path, &mut borrowed),
+            |decoder, fused, context, instrumentation| {
+                decoder.forward_parallel_observed_with_provider(
+                    &format!("{path}.decoder"),
+                    fused,
+                    tokens,
+                    None,
+                    Some(cache),
+                    pass,
+                    provider,
+                    context,
+                    instrumentation.observer().expect("observed V4 prediction"),
+                    reduce,
+                )
+            },
+            |normalized, context, instrumentation| {
+                instrumentation.project_vocabulary::<B>(
+                    "projection_input",
+                    output_head,
+                    normalized,
+                    parallel,
+                    context,
+                )
+            },
+        )
+    }
+
+    fn forward_with_execution<D, H>(
+        &mut self,
+        hidden: &B::Tensor,
+        embedded: &B::Tensor,
+        tokens: &B::Tensor,
+        context: &<B::Tensor as Tensor>::Context,
+        instrumentation: &mut ComponentInstrumentation<'_, B::Tensor>,
+        execute: D,
+        project: H,
+    ) -> Result<PredictionOutput<B::Tensor>, Error>
+    where
+        D: FnOnce(
+            &mut V4Block<B>,
+            &B::Tensor,
+            &<B::Tensor as Tensor>::Context,
+            &mut ComponentInstrumentation<'_, B::Tensor>,
+        ) -> Result<B::Tensor, Error>,
+        H: FnOnce(
+            &B::Tensor,
+            &<B::Tensor as Tensor>::Context,
+            &mut ComponentInstrumentation<'_, B::Tensor>,
+        ) -> Result<B::Tensor, Error>,
+    {
+        let effective_input = if instrumentation.enabled() {
+            Some(instrumentation.apply("input", hidden.clone())?)
+        } else {
+            None
+        };
+        let hidden = effective_input.as_ref().unwrap_or(hidden);
+        instrumentation.observe("capture", hidden)?;
+        instrumentation.observe("prediction.embedding", embedded)?;
+        instrumentation.observe("prediction.hidden", hidden)?;
+        let embedded = instrumentation.apply(
+            "prediction.embedding.normalized",
+            self.embedding_norm.forward(embedded, context)?,
+        )?;
+        let hidden = instrumentation.apply(
+            "prediction.hidden.normalized",
+            self.hidden_norm.forward(hidden, context)?,
+        )?;
+        let embedded = instrumentation.project::<B>(
+            "prediction.embedding.projection_input",
+            &mut self.embedding_projection,
+            &embedded,
+            None,
+            context,
+        )?;
+        let embedded = instrumentation
+            .apply("prediction.embedding.projected", embedded)?
             .expand_dims(2, context)?
             .broadcast_to(hidden.shape(), context)?;
-        let hidden = self.hidden_projection.forward(&hidden, context)?;
-        let fused = embedded.add(&hidden, context)?;
-        let hidden = self.decoder.forward_parallel_with_provider(
-            &fused,
-            tokens,
+        let hidden = instrumentation.project::<B>(
+            "prediction.hidden.projection_input",
+            &mut self.hidden_projection,
+            &hidden,
             None,
-            Some(cache),
-            pass,
-            provider,
             context,
-            reduce,
         )?;
-        let collapsed = self.hyper_head.forward(&hidden, context)?;
-        let normalized = self.output_norm.forward(&collapsed, context)?;
-        let logits = project(&normalized, context)?;
+        let hidden = instrumentation.apply("prediction.hidden.projected", hidden)?;
+        let fused =
+            instrumentation.apply("prediction.fusion.output", embedded.add(&hidden, context)?)?;
+        let hidden = execute(&mut self.decoder, &fused, context, instrumentation)?;
+        let logits = instrumentation.with_scope("prediction.readout", |instrumentation| {
+            let effective = if instrumentation.enabled() {
+                Some(instrumentation.apply("streams", hidden.clone())?)
+            } else {
+                None
+            };
+            let collapsed = instrumentation.collapse_streams::<B>(
+                "stream_coefficients",
+                &mut self.hyper_head,
+                effective.as_ref().unwrap_or(&hidden),
+                context,
+            )?;
+            let normalized =
+                instrumentation.normalize_readout(&collapsed, &mut self.output_norm, context)?;
+            let logits = project(&normalized, context, instrumentation)?;
+            instrumentation.apply("linear", logits)
+        })?;
         Ok(PredictionOutput {
             logits,
-            hidden,
+            hidden: instrumentation.apply("output", hidden)?,
             tokens: tokens.clone(),
         })
     }

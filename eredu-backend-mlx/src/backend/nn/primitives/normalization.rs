@@ -36,6 +36,11 @@ impl Module<&Array> for RmsNorm {
     type Output = Array;
 
     fn forward(&mut self, input: &Array, stream: &Stream) -> Result<Array, Exception> {
-        safemlx::fast::rms_norm(input, self.weight.as_ref(), self.eps, stream)
+        crate::backend::nn::normalization::input_precision_rms(
+            input,
+            self.weight.as_ref(),
+            self.eps,
+            stream,
+        )
     }
 }

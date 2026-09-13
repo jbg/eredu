@@ -1281,6 +1281,59 @@ where
 }
 
 impl<B: TextGenerationBackend> ModelRuntime<B> {
+    /// Completes fallible local preparation without stranding successful peers.
+    /// Local failures retain their original type. Agreement errors independently
+    /// fence native authority; an original local error never proves safe reuse.
+    pub fn finish_text_preparation<T, E>(
+        &self,
+        stage: crate::run_preparation::TextPreparationStage,
+        local: Result<T, E>,
+        map_backend: impl FnOnce(BackendFailure) -> E,
+    ) -> Result<T, E> {
+        crate::run_preparation::finish_preparation(
+            stage,
+            local,
+            |status| self.agree_text_preparation(stage, status),
+            map_backend,
+        )
+    }
+
+    /// As above, with `Ok(None)` representing cancellation before model work.
+    /// Every successful participant receives cancellation when any peer cancels;
+    /// a reported failure takes precedence over cancellation.
+    pub fn finish_text_preparation_cancellable<T, E>(
+        &self,
+        stage: crate::run_preparation::TextPreparationStage,
+        local: Result<Option<T>, E>,
+        map_backend: impl FnOnce(BackendFailure) -> E,
+    ) -> Result<Option<T>, E> {
+        crate::run_preparation::finish_preparation_cancellable(
+            stage,
+            local,
+            |status| self.agree_text_preparation(stage, status),
+            map_backend,
+        )
+    }
+
+    /// Agrees readiness at a cold run boundary without entering model execution.
+    /// Every participant uses the same stage order, including failed/cancelled
+    /// preparation. A completed rejection is distinct from transport failure.
+    pub fn agree_text_preparation(
+        &self,
+        stage: crate::run_preparation::TextPreparationStage,
+        status: crate::run_preparation::TextPreparationStatus,
+    ) -> Result<crate::run_preparation::TextPreparationOutcome, BackendFailure> {
+        self.admission.validate(self.session.capabilities())?;
+        B::agree_text_preparation(self, stage, status)
+    }
+
+    /// Reports session lifetime preparation reservations, unaffected by restore.
+    pub fn text_preparation_usage(
+        &self,
+    ) -> Result<crate::run_preparation::TextPreparationUsage, BackendFailure> {
+        B::text_preparation_usage(self)
+    }
+
     /// Settles prior work and clears request state while retaining the loaded model.
     ///
     /// Success establishes a fresh session for the next request. Model identity,
@@ -1675,6 +1728,11 @@ pub trait TextGenerationBackend: BackendProvider {
         }
     }
 
+    /// Active parameter-edit provenance for ordinary and controlled generation.
+    fn active_parameter_overlay(_runtime: &ModelRuntime<Self>) -> Option<&str> {
+        None
+    }
+
     /// Returns genuine mutable points for this exact loaded session.
     fn intervention_discovery(
         _runtime: &ModelRuntime<Self>,
@@ -1763,6 +1821,33 @@ pub trait TextGenerationBackend: BackendProvider {
         backend: &Self,
         config: TextGenerationConfig,
     ) -> Result<Self::TextGenerationState, Self::Error>;
+
+    /// Completes a cold preparation stage using this session's actual authority.
+    /// Distributed implementations must agree exact setup, monotone attempt,
+    /// stage and disposition under bounded completion before returning readiness.
+    /// Failed/indeterminate exchanges fence the shared execution owner. The
+    /// default is for single-participant backends and submits no native work.
+    fn agree_text_preparation(
+        _runtime: &ModelRuntime<Self>,
+        _stage: crate::run_preparation::TextPreparationStage,
+        status: crate::run_preparation::TextPreparationStatus,
+    ) -> Result<crate::run_preparation::TextPreparationOutcome, BackendFailure> {
+        use crate::run_preparation::{
+            TextPreparationOutcome as Outcome, TextPreparationStatus as Status,
+        };
+        Ok(match status {
+            Status::Ready => Outcome::Ready,
+            Status::Cancelled => Outcome::Cancelled,
+            Status::Failed => Outcome::Rejected { rank: 0 },
+        })
+    }
+
+    /// Cumulative logical agreement costs of the actual session, not model state.
+    fn text_preparation_usage(
+        _runtime: &ModelRuntime<Self>,
+    ) -> Result<crate::run_preparation::TextPreparationUsage, BackendFailure> {
+        Ok(Default::default())
+    }
 
     /// Converts portable tokenizer ids into a backend-owned text prompt.
     fn prepare_text_prompt(
@@ -1896,6 +1981,9 @@ where
     B: std::error::Error + 'static,
     C: std::error::Error + 'static,
 {
+    /// Cold preparation failed across the selected session's participants.
+    #[error("text preparation failed: {0}")]
+    Preparation(#[source] BackendFailure),
     /// Backend preparation, execution, sampling, or completion failed.
     #[error("backend text generation failed: {0}")]
     Backend(#[source] B),
@@ -1971,7 +2059,12 @@ where
         controller: C,
     ) -> Result<Self, ControlledTextGenerationError<B::Error, C::Error>> {
         let prompt = B::prepare_text_prompt(runtime.backend(), prompt_token_ids)
-            .map_err(ControlledTextGenerationError::Backend)?;
+            .map_err(ControlledTextGenerationError::Backend);
+        let prompt = runtime.finish_text_preparation(
+            crate::run_preparation::TextPreparationStage::Prompt,
+            prompt,
+            ControlledTextGenerationError::Preparation,
+        )?;
         Self::from_prompt(runtime, prompt, config, controller)
     }
 
@@ -1991,17 +2084,45 @@ where
         &mut self.inner.controller
     }
 
+    /// Completes additional fallible host preparation before advancing this run.
+    pub fn finish_text_preparation<T, E>(
+        &self,
+        stage: crate::run_preparation::TextPreparationStage,
+        local: Result<T, E>,
+        map_backend: impl FnOnce(BackendFailure) -> E,
+    ) -> Result<T, E> {
+        self.runtime
+            .finish_text_preparation(stage, local, map_backend)
+    }
+
+    /// Agrees initial cancellation/delivery without advancing this run.
+    pub fn finish_text_preparation_cancellable<T, E>(
+        &self,
+        stage: crate::run_preparation::TextPreparationStage,
+        local: Result<Option<T>, E>,
+        map_backend: impl FnOnce(BackendFailure) -> E,
+    ) -> Result<Option<T>, E> {
+        self.runtime
+            .finish_text_preparation_cancellable(stage, local, map_backend)
+    }
+
     /// Installs capture while preserving the existing sampling/controller state.
     pub fn enable_capture(
         &mut self,
         plan: crate::capture::AdmittedCapturePlan,
-    ) -> Result<(), crate::capture::CaptureError> {
-        if !matches!(self.inner.step, Some(PendingTextInput::Prefill(_))) {
-            return Err(crate::capture::CaptureError::Invalid(
+    ) -> Result<(), crate::run_preparation::TextCaptureSetupError> {
+        let local = if !matches!(self.inner.step, Some(PendingTextInput::Prefill(_))) {
+            Err(crate::capture::CaptureError::Invalid(
                 "capture must be configured before generation".into(),
-            ));
-        }
-        B::configure_text_capture(self.runtime, &mut self.inner.backend_state, plan)
+            ))
+        } else {
+            B::configure_text_capture(self.runtime, &mut self.inner.backend_state, plan)
+        };
+        self.runtime.finish_text_preparation(
+            crate::run_preparation::TextPreparationStage::Instrumentation,
+            local.map_err(crate::run_preparation::TextCaptureSetupError::Capture),
+            crate::run_preparation::TextCaptureSetupError::Preparation,
+        )
     }
 
     /// Installs admitted interventions and captures before ordinary generation.
@@ -2009,13 +2130,24 @@ where
         &mut self,
         capture: crate::capture::AdmittedCapturePlan,
         plan: crate::intervention::AdmittedInterventionPlan,
-    ) -> Result<(), crate::capture::CaptureError> {
-        if !matches!(self.inner.step, Some(PendingTextInput::Prefill(_))) {
-            return Err(crate::capture::CaptureError::Invalid(
+    ) -> Result<(), crate::run_preparation::TextCaptureSetupError> {
+        let local = if !matches!(self.inner.step, Some(PendingTextInput::Prefill(_))) {
+            Err(crate::capture::CaptureError::Invalid(
                 "interventions must be configured before generation".into(),
-            ));
-        }
-        B::configure_text_interventions(self.runtime, &mut self.inner.backend_state, capture, plan)
+            ))
+        } else {
+            B::configure_text_interventions(
+                self.runtime,
+                &mut self.inner.backend_state,
+                capture,
+                plan,
+            )
+        };
+        self.runtime.finish_text_preparation(
+            crate::run_preparation::TextPreparationStage::Instrumentation,
+            local.map_err(crate::run_preparation::TextCaptureSetupError::Capture),
+            crate::run_preparation::TextCaptureSetupError::Preparation,
+        )
     }
 
     /// Establishes exact completion before delivering this step's host captures.
@@ -2038,7 +2170,12 @@ where
         controller: C,
     ) -> Result<Self, ControlledTextGenerationError<B::Error, C::Error>> {
         let backend_state = B::start_text_generation(runtime.backend(), config)
-            .map_err(ControlledTextGenerationError::Backend)?;
+            .map_err(ControlledTextGenerationError::Backend);
+        let backend_state = runtime.finish_text_preparation(
+            crate::run_preparation::TextPreparationStage::Sampling,
+            backend_state,
+            ControlledTextGenerationError::Preparation,
+        )?;
         Ok(Self {
             backend_state,
             controller,
@@ -2206,7 +2343,7 @@ impl<'a, B: TextGenerationBackend> TextGeneration<'a, B> {
         runtime: &'a mut ModelRuntime<B>,
         prompt_token_ids: Vec<u32>,
         config: TextGenerationConfig,
-    ) -> Result<Self, B::Error> {
+    ) -> Result<Self, BackendFailure> {
         Self::with_token_filter(runtime, prompt_token_ids, config, TokenFilter::All)
     }
 
@@ -2218,8 +2355,14 @@ impl<'a, B: TextGenerationBackend> TextGeneration<'a, B> {
         prompt_token_ids: Vec<u32>,
         config: TextGenerationConfig,
         filter: TokenFilter,
-    ) -> Result<Self, B::Error> {
-        let prompt = B::prepare_text_prompt(runtime.backend(), prompt_token_ids)?;
+    ) -> Result<Self, BackendFailure> {
+        let prompt = B::prepare_text_prompt(runtime.backend(), prompt_token_ids)
+            .map_err(BackendFailure::from_error);
+        let prompt = runtime.finish_text_preparation(
+            crate::run_preparation::TextPreparationStage::Prompt,
+            prompt,
+            std::convert::identity,
+        )?;
         let inner = TextGenerationMachine::new(runtime, prompt, config, FixedTokenFilter(filter))
             .map_err(unreachable_unconstrained_error)?;
         Ok(Self { runtime, inner })
@@ -2230,7 +2373,7 @@ impl<'a, B: TextGenerationBackend> TextGeneration<'a, B> {
         runtime: &'a mut ModelRuntime<B>,
         prompt: B::Prompt,
         config: TextGenerationConfig,
-    ) -> Result<Self, B::Error> {
+    ) -> Result<Self, BackendFailure> {
         let inner =
             TextGenerationMachine::new(runtime, prompt, config, FixedTokenFilter(TokenFilter::All))
                 .map_err(unreachable_unconstrained_error)?;
@@ -2240,18 +2383,19 @@ impl<'a, B: TextGenerationBackend> TextGeneration<'a, B> {
 
 fn unreachable_unconstrained_error<B>(
     error: ControlledTextGenerationError<B, std::convert::Infallible>,
-) -> B
+) -> BackendFailure
 where
-    B: std::error::Error + 'static,
+    B: std::error::Error + Send + Sync + 'static,
 {
     match error {
-        ControlledTextGenerationError::Backend(error) => error,
+        ControlledTextGenerationError::Backend(error) => BackendFailure::from_error(error),
+        ControlledTextGenerationError::Preparation(error) => error,
         ControlledTextGenerationError::Controller(error) => match error {},
     }
 }
 
 impl<B: TextGenerationBackend> Iterator for TextGeneration<'_, B> {
-    type Item = Result<B::Token, B::Error>;
+    type Item = Result<B::Token, BackendFailure>;
 
     fn next(&mut self) -> Option<Self::Item> {
         self.inner

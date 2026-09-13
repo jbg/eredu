@@ -24,6 +24,26 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> ModalityProjector<B>
         epsilon: f32,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
+        let weight = format!("model.{component}.embedding_projection.weight");
+        Self::new_with_format(
+            args,
+            component,
+            input_size,
+            epsilon,
+            args.linear_format_for(&weight),
+            context,
+        )
+    }
+
+    /// Builds a projector with the family's exact aligned media format.
+    pub fn new_with_format(
+        args: &ModelArgs,
+        component: &str,
+        input_size: i32,
+        epsilon: f32,
+        format: eredu_checkpoint::LinearFormat,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Self, Error> {
         if input_size <= 0 || !epsilon.is_finite() || epsilon <= 0.0 {
             return Err(Error::backend(
                 "invalid Gemma 4 modality projector geometry",
@@ -37,10 +57,7 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> ModalityProjector<B>
                     output: args.hidden_size,
                     weight: ParameterSpec::trainable(&weight).map_err(Error::backend)?,
                     bias: None,
-                    format: crate::linear_format::standard_linear_format(
-                        &weight,
-                        args.linear_format_for(&weight),
-                    )?,
+                    format: crate::linear_format::standard_linear_format(&weight, format)?,
                 },
                 context,
             )?,

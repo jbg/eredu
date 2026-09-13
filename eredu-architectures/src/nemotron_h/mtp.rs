@@ -1,10 +1,12 @@
 //! Graph-visible embedded multi-token prediction units.
 
 use eredu_nn::{
-    AttentionCache, Error, GroupedNeuralBackend, LinearOperator, LinearSpec,
-    NormalizationConstructionSpec, NormalizationOperator, ParameterSpec, Parameterized, Tensor,
+    AttentionCache, Error, GroupedNeuralBackend, LinearSpec, NormalizationConstructionSpec,
+    NormalizationOperator, ParameterSpec, Parameterized, Tensor,
 };
 use eredu_runtime::{RoutedExpertProvider, RuntimeStateComponents};
+
+use crate::decoder::ComponentInstrumentation;
 
 use super::{Block, LayerGeometry, LayerPolicy, ModelArgs};
 
@@ -67,6 +69,8 @@ pub struct PredictionUnit<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralB
     pub block: Block<B>,
     /// Last-unit normalization before the shared vocabulary projection.
     pub final_norm: Option<B::Normalization>,
+    #[parameter(skip)]
+    experts: i32,
 }
 
 impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> PredictionUnit<B> {
@@ -164,6 +168,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> PredictionUni
         let last = relative + 1 == pattern_len;
         let fusion_name = format!("{root}.eh_proj.weight");
         Ok(Self {
+            experts: args.n_routed_experts,
             embedding_norm: first
                 .then(|| norm(format!("{root}.enorm.weight")))
                 .transpose()?,
@@ -192,6 +197,11 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> PredictionUni
                 .then(|| norm(format!("{root}.final_layernorm.weight")))
                 .transpose()?,
         })
+    }
+
+    /// Admitted global expert count for routed observation geometry.
+    pub(crate) fn expert_count(&self) -> i32 {
+        self.experts
     }
 
     /// Executes one physical prediction unit with resident experts.
@@ -231,27 +241,56 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> PredictionUni
         P: RoutedExpertProvider<B>,
         P::Error: std::fmt::Display,
     {
-        let hidden = match (
-            &mut self.embedding_norm,
-            &mut self.hidden_norm,
-            &mut self.fusion,
-        ) {
-            (Some(embedding_norm), Some(hidden_norm), Some(fusion)) => {
-                let embedded = embedding_norm.forward(embedded, context)?;
-                let hidden = hidden_norm.forward(hidden, context)?;
-                let fused = B::Tensor::concatenate(&[embedded, hidden], -1, context)?;
-                fusion.forward(&fused, context)?
-            }
-            (None, None, None) => hidden.clone(),
-            _ => return Err(Error::backend("incomplete Nemotron-H MTP fusion unit")),
-        };
-        let hidden = self
-            .block
-            .forward_with_provider(&hidden, mask, state, context, provider)?;
-        match &mut self.final_norm {
-            Some(norm) => norm.forward(&hidden, context),
-            None => Ok(hidden),
-        }
+        self.forward_with_decoder(
+            hidden,
+            embedded,
+            context,
+            &mut ComponentInstrumentation::disabled(),
+            |block, fused, context, _| {
+                block.forward_with_provider(fused, mask, state, context, provider)
+            },
+        )
+    }
+
+    /// Observes the actual fusion, scheduled operator and final normalization.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_observed_with_provider<S, P, O>(
+        &mut self,
+        path: &str,
+        expert_count: i32,
+        hidden: &B::Tensor,
+        embedded: &B::Tensor,
+        mask: Option<&B::Tensor>,
+        state: &mut S,
+        context: &<B::Tensor as Tensor>::Context,
+        provider: &mut P,
+        observer: &mut O,
+    ) -> Result<B::Tensor, Error>
+    where
+        S: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
+        P: RoutedExpertProvider<B>,
+        P::Error: std::fmt::Display,
+        O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
+    {
+        let mut borrowed = eredu_runtime::BorrowedActivationObserver(observer);
+        self.forward_with_decoder(
+            hidden,
+            embedded,
+            context,
+            &mut ComponentInstrumentation::new(path, &mut borrowed),
+            |block, fused, context, instrumentation| {
+                block.forward_observed_with_provider(
+                    path,
+                    expert_count,
+                    fused,
+                    mask,
+                    state,
+                    context,
+                    instrumentation.observer().expect("observed prediction"),
+                    provider,
+                )
+            },
+        )
     }
 
     /// Executes one physical prediction unit with tensor collectives.
@@ -271,25 +310,114 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> PredictionUni
         P: eredu_runtime::TensorParallelRoutedExpertProvider<B>,
         P::Error: std::fmt::Display,
     {
+        self.forward_with_decoder(
+            hidden,
+            embedded,
+            context,
+            &mut ComponentInstrumentation::disabled(),
+            |block, fused, context, _| {
+                block.forward_parallel(fused, mask, state, parallel, context, provider)
+            },
+        )
+    }
+
+    /// Observes the same prediction graph with the ordinary TP reduction order.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_parallel_observed_with_provider<S, P, O>(
+        &mut self,
+        path: &str,
+        expert_count: i32,
+        hidden: &B::Tensor,
+        embedded: &B::Tensor,
+        mask: Option<&B::Tensor>,
+        state: &mut S,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+        provider: &mut P,
+        observer: &mut O,
+    ) -> Result<B::Tensor, Error>
+    where
+        S: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
+        P: eredu_runtime::TensorParallelRoutedExpertProvider<B>,
+        P::Error: std::fmt::Display,
+        O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
+    {
+        let mut borrowed = eredu_runtime::BorrowedActivationObserver(observer);
+        self.forward_with_decoder(
+            hidden,
+            embedded,
+            context,
+            &mut ComponentInstrumentation::new(path, &mut borrowed),
+            |block, fused, context, instrumentation| {
+                block.forward_parallel_observed_with_provider(
+                    path,
+                    expert_count,
+                    fused,
+                    mask,
+                    state,
+                    parallel,
+                    context,
+                    instrumentation.observer().expect("observed prediction"),
+                    provider,
+                )
+            },
+        )
+    }
+
+    fn forward_with_decoder<F>(
+        &mut self,
+        hidden: &B::Tensor,
+        embedded: &B::Tensor,
+        context: &<B::Tensor as Tensor>::Context,
+        instrumentation: &mut ComponentInstrumentation<'_, B::Tensor>,
+        decoder: F,
+    ) -> Result<B::Tensor, Error>
+    where
+        F: FnOnce(
+            &mut Block<B>,
+            &B::Tensor,
+            &<B::Tensor as Tensor>::Context,
+            &mut ComponentInstrumentation<'_, B::Tensor>,
+        ) -> Result<B::Tensor, Error>,
+    {
         let hidden = match (
             &mut self.embedding_norm,
             &mut self.hidden_norm,
             &mut self.fusion,
         ) {
             (Some(embedding_norm), Some(hidden_norm), Some(fusion)) => {
-                let embedded = embedding_norm.forward(embedded, context)?;
-                let hidden = hidden_norm.forward(hidden, context)?;
-                let fused = B::Tensor::concatenate(&[embedded, hidden], -1, context)?;
-                fusion.forward(&fused, context)?
+                instrumentation.observe("prediction.hidden", hidden)?;
+                instrumentation.observe("prediction.embedding", embedded)?;
+                let embedded = instrumentation.apply(
+                    "prediction.embedding.normalized",
+                    embedding_norm.forward(embedded, context)?,
+                )?;
+                let hidden = instrumentation.apply(
+                    "prediction.hidden.normalized",
+                    hidden_norm.forward(hidden, context)?,
+                )?;
+                let joined = B::Tensor::concatenate(&[embedded, hidden], -1, context)?;
+                let fused = instrumentation.project::<B>(
+                    "prediction.fusion.input",
+                    fusion,
+                    &joined,
+                    None,
+                    context,
+                )?;
+                instrumentation.apply("prediction.fusion.output", fused)?
             }
             (None, None, None) => hidden.clone(),
             _ => return Err(Error::backend("incomplete Nemotron-H MTP fusion unit")),
         };
-        let hidden = self
-            .block
-            .forward_parallel(&hidden, mask, state, parallel, context, provider)?;
+        let hidden = decoder(&mut self.block, &hidden, context, instrumentation)?;
         match &mut self.final_norm {
-            Some(norm) => norm.forward(&hidden, context),
+            Some(norm) => {
+                let hidden = instrumentation.apply("prediction.readout.residual", hidden)?;
+                instrumentation.apply(
+                    "prediction.readout.normalized",
+                    norm.forward(&hidden, context)?,
+                )
+            }
             None => Ok(hidden),
         }
     }

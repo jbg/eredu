@@ -36,10 +36,24 @@ pub fn silu(x: Array, stream: &Stream) -> Result<Array, Exception> {
 
 /// Applies sigmoid with FP32 exponential and quotient rounding.
 pub fn sigmoid(input: Array, stream: &Stream) -> Result<Array, Exception> {
-    match super::arithmetic::f32_pointwise(&input, super::arithmetic::Pointwise::Sigmoid, stream)? {
-        Some(output) => Ok(output),
-        None => safemlx::ops::sigmoid(input, stream),
-    }
+    let dtype = input.dtype();
+    // Sigmoid is one pointwise operation. Reduced-precision exp/add/divide
+    // intermediates would introduce additional rounding before its result.
+    let work = match dtype {
+        safemlx::Dtype::Bfloat16 | safemlx::Dtype::Float16 => {
+            input.as_dtype(safemlx::Dtype::Float32, stream)?
+        }
+        _ => input,
+    };
+    let output = match super::arithmetic::f32_pointwise(
+        &work,
+        super::arithmetic::Pointwise::Sigmoid,
+        stream,
+    )? {
+        Some(output) => output,
+        None => safemlx::ops::sigmoid(work, stream)?,
+    };
+    output.as_dtype(dtype, stream)
 }
 
 /// Applies the squared rectified-linear activation.

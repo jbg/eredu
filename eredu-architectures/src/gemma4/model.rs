@@ -1,5 +1,7 @@
 //! Backend-neutral Gemma 4 multimodal model and layered runtime lifecycle.
 
+mod observation;
+
 use std::collections::HashMap;
 
 use eredu_nn::{
@@ -99,6 +101,35 @@ where
     S: LayerRuntimeState<B>,
     S::LayerState: AttentionCache<B::Tensor>,
 {
+    fn partition_observation_hooks(
+        &self,
+        _tensor_parallel: bool,
+    ) -> eredu_runtime::inspection::ObservationHookSupport {
+        eredu_runtime::inspection::ObservationHookSupport::internal(true, true, true)
+            .with_routed_units(true)
+    }
+    fn finish_partition_observed<O>(
+        &mut self,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &Self::ForwardContext,
+        owns_output: bool,
+        parallel: Option<&B::ParallelContext>,
+        context: &<B::Tensor as Tensor>::Context,
+        observer: &mut O,
+    ) -> Result<LayeredPartitionOutput<B::Tensor, TextBoundary<B::Tensor>>, Error>
+    where
+        O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
+    {
+        if !owns_output {
+            return self.finish_partition(hidden, state, forward, false, parallel, context);
+        }
+        Ok(LayeredPartitionOutput::Final {
+            output: self.finish_components(hidden, parallel, context, observer)?,
+            retained: None,
+        })
+    }
+
     type Boundary = TextBoundarySchema;
 
     fn boundary_schema(&self) -> Result<Self::Boundary, Self::Error> {
@@ -127,13 +158,14 @@ where
                 None,
                 context,
             ),
-            LayeredPartitionInput::Hidden { hidden, auxiliary } => self.resume_pipeline_text(
+            LayeredPartitionInput::Hidden { hidden, auxiliary } => self.resume_pipeline_boundary(
                 hidden,
                 mask.cloned(),
-                auxiliary.per_layer_input,
+                auxiliary,
                 state,
                 expected,
                 first_state_ordinal,
+                context,
             ),
         }
     }
@@ -158,13 +190,14 @@ where
                 Some(parallel),
                 context,
             ),
-            LayeredPartitionInput::Hidden { hidden, auxiliary } => self.resume_pipeline_text(
+            LayeredPartitionInput::Hidden { hidden, auxiliary } => self.resume_pipeline_boundary(
                 hidden,
                 mask.cloned(),
-                auxiliary.per_layer_input,
+                auxiliary,
                 state,
                 expected,
                 first_state_ordinal,
+                context,
             ),
         }
     }
@@ -178,6 +211,7 @@ where
         parallel: Option<&B::ParallelContext>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error> {
+        self.install_pipeline_shared(state, forward, context)?;
         if forward.parts.is_empty() {
             return Ok(initial.clone());
         }
@@ -218,7 +252,7 @@ where
         } else {
             Ok(LayeredPartitionOutput::Boundary {
                 hidden: hidden.clone(),
-                auxiliary: TextBoundary::new(forward.pipeline_per_layer_inputs().cloned()),
+                auxiliary: self.pipeline_boundary(hidden, forward, context)?,
             })
         }
     }
@@ -234,6 +268,7 @@ mod ownership_tests {
         let present = TextBoundarySchema {
             hidden_size: 16,
             per_layer_geometry: Some((4, 8)),
+            shared_geometry: Vec::new(),
         };
         let tensors = present.wire_schema().unwrap().resolve(2, 3).unwrap();
         assert_eq!(tensors.primary().shape(), [2, 3, 16]);
@@ -248,6 +283,7 @@ mod ownership_tests {
         let absent = TextBoundarySchema {
             hidden_size: 16,
             per_layer_geometry: None,
+            shared_geometry: Vec::new(),
         };
         assert!(absent.wire_schema().unwrap().auxiliary().is_empty());
     }
@@ -703,6 +739,220 @@ where
         }
     }
 
+    fn prepared_group_boundary_sequence(
+        &self,
+        group: usize,
+        input: PreparedCompositeInput<'_, B::Tensor, Self::InputPartPlan>,
+    ) -> Result<i32, String> {
+        let positions = if group < 2 {
+            input
+                .admitted()
+                .parts()
+                .iter()
+                .filter_map(|part| match (group, part) {
+                    (0, Gemma4InputPartPlan::Vision { shape, .. })
+                    | (1, Gemma4InputPartPlan::Audio { shape, .. }) => {
+                        Some(shape.decoder_positions)
+                    }
+                    _ => None,
+                })
+                .try_fold(0_u64, |total, count| total.checked_add(count))
+                .ok_or_else(|| "Gemma media boundary positions overflowed".to_owned())?
+        } else {
+            input.admitted().decoder_positions()
+        };
+        i32::try_from(positions).map_err(|_| "Gemma boundary sequence exceeds i32".into())
+    }
+
+    fn prepared_group_continuation_geometry(
+        &self,
+        group: usize,
+        input: PreparedCompositeInput<'_, B::Tensor, Self::InputPartPlan>,
+    ) -> Result<Option<(i32, i32)>, String> {
+        let extents = input
+            .admitted()
+            .parts()
+            .iter()
+            .filter_map(|part| match (group, part) {
+                (0, Gemma4InputPartPlan::Vision { ingress, .. }) => Some(ingress.padded_patches),
+                (1, Gemma4InputPartPlan::Audio { ingress, .. }) => {
+                    Some((ingress.padded_frames / 2 + ingress.padded_frames % 2 + 1) / 2)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let extent = extents
+            .iter()
+            .copied()
+            .max()
+            .map(|maximum| {
+                i32::try_from(extents.len())
+                    .ok()
+                    .and_then(|count| maximum.checked_mul(count))
+                    .ok_or_else(|| "Gemma batched continuation extent exceeds i32".to_owned())
+            })
+            .transpose()?;
+        let width = match group {
+            0 => self.args.vision.as_ref().map(|config| config.hidden_size),
+            1 => self.args.audio.as_ref().map(|config| config.hidden_size),
+            _ => None,
+        };
+        Ok(extent.zip(width))
+    }
+
+    fn prepared_group_continuation_batched(&self, _group: usize) -> bool {
+        // Gemma's encoder activations already retain their batch dimension.
+        false
+    }
+
+    fn encode_group_continuation(
+        &self,
+        group: usize,
+        hidden: B::Tensor,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Self::Error> {
+        if group >= 2 {
+            return Ok(hidden);
+        }
+        hidden.reshape(&[1, -1, hidden.dim(2)], context)
+    }
+
+    fn decode_group_continuation(
+        &self,
+        group: usize,
+        hidden: B::Tensor,
+        forward: &Self::ForwardContext,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Self::Error> {
+        let initial = match group {
+            0 => forward.vision_initial.as_ref(),
+            1 => forward.audio_initial.as_ref(),
+            _ => return Ok(hidden),
+        }
+        .ok_or_else(|| Error::backend("Gemma media continuation has no admitted batch geometry"))?;
+        hidden.reshape(initial.shape(), context)
+    }
+
+    fn prepared_group_collective_waves(
+        &self,
+        group: usize,
+        input: PreparedCompositeInput<'_, B::Tensor, Self::InputPartPlan>,
+        tensor_partitions: usize,
+        pipeline_stages: usize,
+    ) -> Result<Option<Vec<Vec<crate::composite_execution::CompositeTensorCollective>>>, String>
+    {
+        if group >= 2 || tensor_partitions <= 1 || pipeline_stages <= 1 {
+            return Ok(None);
+        }
+        // Encoder equations/projectors are replicated. Eager text embedding
+        // lookups run when each stage first creates its composite context.
+        let first_active = (0..2).find(|group| {
+            <Self as CompositeArchitecture<B, S>>::should_execute_prepared_group(
+                self, *group, input,
+            )
+        });
+        let mut ingress = Vec::new();
+        if first_active == Some(group) {
+            for (part, plan) in input
+                .prepared()
+                .parts()
+                .iter()
+                .zip(input.admitted().parts())
+            {
+                if let Gemma4InputPartPlan::TextTokens { positions } = plan {
+                    ingress.push(crate::composite_execution::CompositeTensorCollective::Sum {
+                        shape: vec![
+                            part.payload().value().dim(0),
+                            i32::try_from(*positions)
+                                .map_err(|_| "Gemma text extent exceeds i32")?,
+                            self.args.text.hidden_size,
+                        ],
+                    });
+                }
+            }
+        }
+        let mut waves = vec![Vec::new(); pipeline_stages];
+        waves[0] = ingress;
+        Ok(Some(waves))
+    }
+
+    fn prepared_primary_ingress_collectives(
+        &self,
+        input: PreparedCompositeInput<'_, B::Tensor, Self::InputPartPlan>,
+        tensor_partitions: usize,
+    ) -> Result<Option<Vec<crate::composite_execution::CompositeTensorCollective>>, String> {
+        crate::composite_execution::segmented_token_ingress_collectives(
+            input
+                .admitted()
+                .parts()
+                .iter()
+                .filter_map(|part| match part {
+                    Gemma4InputPartPlan::TextTokens { positions } => Some(*positions),
+                    _ => None,
+                }),
+            self.args.text.hidden_size,
+            tensor_partitions,
+        )
+    }
+
+    fn routed_tensor_reductions(
+        &self,
+        unit: usize,
+        routed: bool,
+    ) -> Result<(usize, usize), Self::Error> {
+        self.args
+            .text
+            .layer_policy(unit)
+            .ok_or_else(|| Error::backend("Gemma collective plan references an unknown layer"))?;
+        let per_layer = usize::from(self.args.text.hidden_size_per_layer_input > 0);
+        // Attention and the always-present dense branch reduce before routing;
+        // the routed write and optional per-layer write reduce afterward.
+        Ok(if routed {
+            (2, 1 + per_layer)
+        } else {
+            (1, 1 + per_layer)
+        })
+    }
+
+    fn accept_partition_boundary(
+        &mut self,
+        source_group: usize,
+        destination_group: usize,
+        schema: &eredu_runtime::ResolvedBoundaryWireSchema,
+        values: Vec<B::Tensor>,
+        forward: &mut Self::ForwardContext,
+    ) -> Result<Option<B::Tensor>, Self::Error> {
+        if values.len() != 1 + schema.auxiliary().len() {
+            return Err(Error::backend(
+                "Gemma boundary has incomplete typed context",
+            ));
+        }
+        let mut values = values.into_iter();
+        let hidden = values.next().expect("validated boundary primary");
+        match (source_group, destination_group) {
+            (0, 2) => forward.vision_output = Some(hidden.clone()),
+            (1, 2) => forward.audio_output = Some(hidden.clone()),
+            (0, 0) | (1, 1) => {}
+            (2, 2) => {
+                let geometry = self.parallel_geometry().ok_or_else(|| {
+                    Error::backend("Gemma decoder boundary requires parallel geometry")
+                })?;
+                let boundary = eredu_runtime::ArchitectureBoundary::decode(
+                    &TextBoundarySchema::from_args(&self.args.text, geometry),
+                    values.collect(),
+                )
+                .map_err(Error::backend)?;
+                forward.per_layer_inputs = boundary.per_layer_input;
+                forward.shared = boundary.shared;
+                forward.shared_pending = true;
+                // The incoming activation has already passed decoder assembly.
+                forward.parts.clear();
+            }
+            _ => return Ok(None),
+        }
+        Ok(Some(hidden))
+    }
+
     fn external_prediction_capture_paths(
         request: &ExternalPredictionCaptureRequest,
     ) -> Result<Option<Vec<String>>, Self::Error> {
@@ -829,6 +1079,35 @@ where
     S: LayerRuntimeState<B>,
     S::LayerState: AttentionCache<B::Tensor>,
 {
+    fn routed_unit_observations(&self) -> bool {
+        true
+    }
+    fn routed_sparse_observations(&self) -> bool {
+        true
+    }
+    fn forward_unit_observed_with_provider<P, O>(
+        &mut self,
+        group: usize,
+        index: usize,
+        unit: &mut Self::Unit,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &mut Self::ForwardContext,
+        pass: ExpertPass,
+        provider: &mut P,
+        context: &<B::Tensor as Tensor>::Context,
+        observer: &mut O,
+    ) -> Result<B::Tensor, Error>
+    where
+        P: RoutedExpertProvider<B>,
+        P::Error: std::fmt::Display,
+        O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
+    {
+        self.forward_components(
+            group, index, unit, hidden, state, forward, pass, provider, context, observer,
+        )
+    }
+
     fn forward_unit_with_provider<P>(
         &mut self,
         group: usize,
@@ -862,6 +1141,36 @@ where
     S: LayerRuntimeState<B>,
     S::LayerState: AttentionCache<B::Tensor>,
 {
+    fn parallel_routed_unit_observations(&self) -> bool {
+        true
+    }
+    fn parallel_routed_sparse_observations(&self) -> bool {
+        true
+    }
+    fn forward_unit_parallel_observed_with_provider<P, O>(
+        &mut self,
+        group: usize,
+        index: usize,
+        unit: &mut Self::Unit,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &mut Self::ForwardContext,
+        pass: ExpertPass,
+        provider: &mut P,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+        observer: &mut O,
+    ) -> Result<B::Tensor, Error>
+    where
+        P: eredu_runtime::TensorParallelRoutedExpertProvider<B>,
+        P::Error: std::fmt::Display,
+        O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
+    {
+        self.forward_components_parallel(
+            group, index, unit, hidden, state, forward, pass, provider, parallel, context, observer,
+        )
+    }
+
     fn forward_unit_parallel_with_provider<P>(
         &mut self,
         group: usize,
@@ -898,6 +1207,7 @@ pub struct ForwardContext<T> {
     per_layer_token_override: Option<T>,
     per_layer_inputs: Option<T>,
     shared: SharedAttentionStates<T>,
+    shared_pending: bool,
     vision_state: Option<VisionState<T>>,
     vision_initial: Option<T>,
     vision_output: Option<T>,
@@ -921,20 +1231,17 @@ impl<T> ForwardContext<T> {
 }
 
 /// Family-owned schema for decoder-wide per-layer input transport.
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[derive(Debug, Clone, Eq, PartialEq)]
 pub struct TextBoundarySchema {
     hidden_size: i32,
     per_layer_geometry: Option<(i32, i32)>,
+    shared_geometry: Vec<(eredu_core::AttentionPolicy, i32, i32)>,
 }
 
 impl TextBoundarySchema {
     /// Derives the schema from normalized text and rank-local geometry.
     pub fn from_args(args: &super::ModelArgs, geometry: &LocalGeometry) -> Self {
-        Self {
-            hidden_size: args.hidden_size,
-            per_layer_geometry: (args.hidden_size_per_layer_input > 0)
-                .then(|| (args.num_hidden_layers() as i32, geometry.per_layer_width())),
-        }
+        Self::from_state_layout(args, geometry.per_layer_width(), geometry.state_layout())
     }
 
     /// Derives the same wire schema from exact TP/PP-local construction geometry.
@@ -942,14 +1249,55 @@ impl TextBoundarySchema {
         args: &super::ModelArgs,
         geometry: &super::PartitionLocalGeometry,
     ) -> Self {
+        Self::from_state_layout(
+            args,
+            geometry.per_layer_range().len() as i32,
+            geometry.complete_state_layout(),
+        )
+    }
+
+    pub(crate) fn from_state_layout(
+        args: &super::ModelArgs,
+        width: i32,
+        state: &StateLayout,
+    ) -> Self {
+        use eredu_core::cache::LayerCachePolicy;
+        let shared_geometry = args
+            .layer_schedule
+            .iter()
+            .enumerate()
+            .filter(|(_, policy)| policy.key_value.publishes_state())
+            .map(|(layer, policy)| {
+                let (heads, dim) = match state.layer(layer).expect("publisher state") {
+                    LayerCachePolicy::KeyValue {
+                        num_key_value_heads,
+                        head_dim,
+                        ..
+                    }
+                    | LayerCachePolicy::KeyValueWithFixedState {
+                        num_key_value_heads,
+                        head_dim,
+                        ..
+                    } => (num_key_value_heads.get(), head_dim.get()),
+                    LayerCachePolicy::KeyOnly {
+                        num_key_heads,
+                        head_dim,
+                        ..
+                    }
+                    | LayerCachePolicy::KeyOnlyWithFixedState {
+                        num_key_heads,
+                        head_dim,
+                        ..
+                    } => (num_key_heads.get(), head_dim.get()),
+                    _ => unreachable!("validated Gemma publisher state"),
+                };
+                (policy.attention, heads as i32, dim as i32)
+            })
+            .collect();
         Self {
             hidden_size: args.hidden_size,
-            per_layer_geometry: (args.hidden_size_per_layer_input > 0).then(|| {
-                (
-                    args.num_hidden_layers() as i32,
-                    geometry.per_layer_range().end - geometry.per_layer_range().start,
-                )
-            }),
+            per_layer_geometry: (width > 0).then(|| (args.num_hidden_layers() as i32, width)),
+            shared_geometry,
         }
     }
 }
@@ -965,7 +1313,8 @@ impl eredu_runtime::ArchitectureBoundary for TextBoundarySchema {
 
     fn auxiliary_tensor_specs(&self) -> Vec<eredu_runtime::BoundaryTensorSpec> {
         use eredu_runtime::{BoundaryTensorDimension as Dim, BoundaryTensorDtype as Dtype};
-        self.per_layer_geometry
+        let mut specs: Vec<_> = self
+            .per_layer_geometry
             .map(|(layers, width)| {
                 eredu_runtime::BoundaryTensorSpec::new(
                     "per_layer_input",
@@ -979,7 +1328,22 @@ impl eredu_runtime::ArchitectureBoundary for TextBoundarySchema {
                 )
             })
             .into_iter()
-            .collect()
+            .collect();
+        for (index, (_, heads, dim)) in self.shared_geometry.iter().enumerate() {
+            for component in ["keys", "values"] {
+                specs.push(eredu_runtime::BoundaryTensorSpec::new(
+                    format!("shared.{index}.{component}"),
+                    [
+                        Dim::Batch,
+                        Dim::Fixed(*heads),
+                        Dim::Sequence,
+                        Dim::Fixed(*dim),
+                    ],
+                    Dtype::Activation,
+                ));
+            }
+        }
+        specs
     }
 
     /// Decodes the optional per-layer input without positional guessing.
@@ -988,8 +1352,19 @@ impl eredu_runtime::ArchitectureBoundary for TextBoundarySchema {
         tensors: Vec<T>,
     ) -> Result<Self::Boundary<T>, eredu_runtime::ArchitectureBoundaryError> {
         eredu_runtime::validate_boundary_tensor_count(self, &tensors)?;
+        let mut tensors = tensors.into_iter();
+        let per_layer_input = self
+            .per_layer_geometry
+            .is_some()
+            .then(|| tensors.next().unwrap());
+        let shared = self
+            .shared_geometry
+            .iter()
+            .map(|(policy, _, _)| (*policy, (tensors.next().unwrap(), tensors.next().unwrap())))
+            .collect();
         Ok(TextBoundary {
-            per_layer_input: tensors.into_iter().next(),
+            per_layer_input,
+            shared,
         })
     }
 
@@ -1001,20 +1376,38 @@ impl eredu_runtime::ArchitectureBoundary for TextBoundarySchema {
         Vec<eredu_runtime::ArchitectureBoundaryValue<T>>,
         eredu_runtime::ArchitectureBoundaryError,
     > {
-        let actual = usize::from(boundary.per_layer_input.is_some());
-        let expected = usize::from(self.per_layer_geometry.is_some());
-        if actual != expected {
+        let actual = usize::from(boundary.per_layer_input.is_some()) + 2 * boundary.shared.len();
+        let expected =
+            usize::from(self.per_layer_geometry.is_some()) + 2 * self.shared_geometry.len();
+        if actual != expected
+            || boundary.per_layer_input.is_some() != self.per_layer_geometry.is_some()
+            || self
+                .shared_geometry
+                .iter()
+                .any(|(policy, _, _)| !boundary.shared.contains_key(policy))
+        {
             return Err(eredu_runtime::ArchitectureBoundaryError::TensorCount {
                 boundary: "gemma4.text",
                 expected,
                 actual,
             });
         }
-        boundary
+        let mut values: Vec<_> = boundary
             .per_layer_input
             .into_iter()
             .map(|tensor| eredu_runtime::ArchitectureBoundaryValue::new("per_layer_input", tensor))
-            .collect()
+            .collect::<Result<_, _>>()?;
+        let mut shared = boundary.shared;
+        for (index, (policy, _, _)) in self.shared_geometry.iter().enumerate() {
+            let (keys, payload) = shared.remove(policy).expect("validated shared policy");
+            for (component, tensor) in [("keys", keys), ("values", payload)] {
+                values.push(eredu_runtime::ArchitectureBoundaryValue::new(
+                    format!("shared.{index}.{component}"),
+                    tensor,
+                )?);
+            }
+        }
+        Ok(values)
     }
 }
 
@@ -1022,12 +1415,16 @@ impl eredu_runtime::ArchitectureBoundary for TextBoundarySchema {
 pub struct TextBoundary<T> {
     /// Decoder-wide per-layer input, when configured by the checkpoint.
     pub per_layer_input: Option<T>,
+    shared: SharedAttentionStates<T>,
 }
 
 impl<T> TextBoundary<T> {
     /// Creates a typed text boundary.
-    pub const fn new(per_layer_input: Option<T>) -> Self {
-        Self { per_layer_input }
+    pub fn new(per_layer_input: Option<T>) -> Self {
+        Self {
+            per_layer_input,
+            shared: HashMap::new(),
+        }
     }
 }
 
@@ -1037,6 +1434,9 @@ pub struct LayeredModel<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBac
     static_modules: StaticModules<B>,
     parallel_geometry: Option<LocalGeometry>,
     partition_state_offset: usize,
+    partition_state: Option<StateLayout>,
+    partition_media_inputs: [bool; 2],
+    expert_realization: Option<crate::ExpertRealizationPlan<eredu_nn::GroupedGatedProductSpec>>,
 }
 
 impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend>
@@ -1320,11 +1720,15 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
             .vision
             .as_ref()
             .map(|config| {
-                ModalityProjector::new(
+                ModalityProjector::new_with_format(
                     &args.text,
                     "embed_vision",
                     config.hidden_size,
                     config.rms_norm_eps,
+                    config.linear_format_for(
+                        "model.embed_vision.embedding_projection.weight",
+                        config.hidden_size,
+                    ),
                     context,
                 )
             })
@@ -1338,11 +1742,15 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
             .audio
             .as_ref()
             .map(|config| {
-                ModalityProjector::new(
+                ModalityProjector::new_with_format(
                     &args.text,
                     "embed_audio",
                     config.output_proj_dims,
                     config.rms_norm_eps,
+                    config.linear_format_for(
+                        "model.embed_audio.embedding_projection.weight",
+                        config.output_proj_dims,
+                    ),
                     context,
                 )
             })
@@ -1358,24 +1766,256 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
             },
             parallel_geometry,
             partition_state_offset: 0,
+            partition_state: None,
+            partition_media_inputs: [true; 2],
+            expert_realization: None,
         })
     }
 
-    /// Retains the architecture-global ordinal of this pipeline partition's first state row.
-    pub(crate) fn with_partition_state_offset(mut self, offset: usize) -> Result<Self, Error> {
-        if offset >= self.args.text.num_hidden_layers() {
+    pub(crate) fn with_expert_realization(
+        mut self,
+        plan: crate::ExpertRealizationPlan<eredu_nn::GroupedGatedProductSpec>,
+    ) -> Result<Self, Error> {
+        if self.args.text.num_experts.map(|count| count as usize)
+            != Some(plan.global_expert_count())
+        {
             return Err(Error::backend(
-                "Gemma 4 partition state offset is outside the decoder",
+                "Gemma 4 expert realization changed the global expert count",
             ));
         }
-        self.partition_state_offset = offset;
+        let expected = self
+            .args
+            .text
+            .layer_schedule
+            .iter()
+            .enumerate()
+            .filter(|(_, policy)| {
+                policy.feed_forward == super::FeedForwardPolicy::DenseWithSparseMoe
+            })
+            .map(|(layer, _)| {
+                (
+                    eredu_runtime::ExecutionGroupId::new(TEXT_EXECUTION_GROUP)
+                        .expect("static group"),
+                    layer,
+                )
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        if plan
+            .unit_specs()
+            .keys()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>()
+            != expected
+        {
+            return Err(Error::backend(
+                "Gemma 4 expert realization changed its invocation owners",
+            ));
+        }
+        self.expert_realization = Some(plan);
         Ok(self)
+    }
+
+    /// Retains the architecture-global ordinal of this pipeline partition's first state row.
+    pub(crate) fn with_partition_state(
+        mut self,
+        geometry: &super::PartitionLocalGeometry,
+    ) -> Result<Self, Error> {
+        self.partition_state_offset = geometry.text_units().start;
+        self.partition_state = Some(geometry.complete_state_layout().clone());
+        self.partition_media_inputs = [
+            geometry
+                .vision_units()
+                .is_some_and(|units| units.start == 0),
+            geometry.audio_units().is_some_and(|units| units.start == 0),
+        ];
+        Ok(self)
+    }
+
+    fn pipeline_boundary(
+        &self,
+        hidden: &B::Tensor,
+        forward: &ForwardContext<B::Tensor>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<TextBoundary<B::Tensor>, Error> {
+        let geometry = self
+            .parallel_geometry()
+            .ok_or_else(|| Error::backend("Gemma pipeline boundary requires local geometry"))?;
+        let schema = TextBoundarySchema::from_args(&self.args.text, geometry);
+        let sequence = hidden.dim(1);
+        let mut shared = HashMap::new();
+        for (policy, heads, dim) in schema.shared_geometry {
+            let pair = match forward.shared.get(&policy) {
+                Some((keys, values)) => {
+                    let tail = |value: &B::Tensor| {
+                        let extent = value.dim(2);
+                        if extent < sequence {
+                            return Err(Error::backend(
+                                "Gemma publication omitted current positions",
+                            ));
+                        }
+                        value.index(
+                            &[
+                                Index::Full,
+                                Index::Full,
+                                Index::Range(extent - sequence, extent),
+                                Index::Full,
+                            ],
+                            context,
+                        )
+                    };
+                    (tail(keys)?, tail(values)?)
+                }
+                None => {
+                    // A cut may precede this policy's publisher. Its fixed wire
+                    // slots are inactive until that publisher overwrites them;
+                    // no consumer or receiver cache can read them before then.
+                    let zero =
+                        B::Tensor::full_f32(0.0, &[hidden.dim(0), heads, sequence, dim], context)?;
+                    (zero.clone(), zero)
+                }
+            };
+            shared.insert(policy, pair);
+        }
+        Ok(TextBoundary {
+            per_layer_input: forward.per_layer_inputs.clone(),
+            shared,
+        })
+    }
+
+    fn begin_partition_vision(
+        &mut self,
+        input: VisionInput<'_, B::Tensor>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<(B::Tensor, VisionState<B::Tensor>), Error> {
+        let vision = self
+            .static_modules
+            .vision
+            .as_mut()
+            .ok_or_else(|| Error::backend("Gemma 4 has no vision tower"))?;
+        if self.partition_media_inputs[0] {
+            return vision.begin(input, context);
+        }
+        let shape = [
+            input.patches.dim(0),
+            input.patches.dim(1),
+            self.args
+                .vision
+                .as_ref()
+                .expect("vision configuration")
+                .hidden_size,
+        ];
+        let state = vision.prepare_state(input, context)?;
+        let hidden = B::Tensor::full_f32(0.0, &shape, context)?;
+        Ok((hidden, state))
+    }
+
+    fn begin_partition_audio(
+        &mut self,
+        input: AudioInput<'_, B::Tensor>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<(B::Tensor, Vec<i32>), Error> {
+        let audio = self
+            .static_modules
+            .audio
+            .as_mut()
+            .ok_or_else(|| Error::backend("Gemma 4 has no audio tower"))?;
+        if self.partition_media_inputs[1] {
+            return audio.begin(input, context);
+        }
+        let frames = input.features.dim(1);
+        let frames = (frames / 2 + frames % 2 + 1) / 2;
+        let hidden = B::Tensor::full_f32(
+            0.0,
+            &[input.features.dim(0), frames, audio.config().hidden_size],
+            context,
+        )?;
+        Ok((hidden, input.valid_subsampled_frames.to_vec()))
+    }
+
+    fn install_pipeline_shared<S: LayerRuntimeState<B>>(
+        &self,
+        state: &mut S,
+        forward: &mut ForwardContext<B::Tensor>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<(), Error>
+    where
+        S::LayerState: AttentionCache<B::Tensor>,
+    {
+        if !std::mem::take(&mut forward.shared_pending) {
+            return Ok(());
+        }
+        let units = self.partition_state_offset..self.partition_state_offset + state.layout().len();
+        for (receiver, publisher) in super::pipeline::receiver_caches(&self.args.text, units) {
+            let policy = self
+                .args
+                .text
+                .layer_policy(publisher)
+                .expect("validated publisher")
+                .attention;
+            let (keys, values) = forward
+                .shared
+                .remove(&policy)
+                .ok_or_else(|| Error::backend("Gemma boundary omitted a remote publication"))?;
+            let cache = state
+                .layer(self.local_state_ordinal(receiver)?)
+                .map_err(Error::backend)?;
+            if cache.offset() != forward.position_offset {
+                return Err(Error::backend(
+                    "Gemma shared-state receiver frontier differs from decoder",
+                ));
+            }
+            let pair = cache.update_for_attention(keys, values, context)?;
+            forward.shared.insert(policy, pair);
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn resume_pipeline_boundary<S: LayerRuntimeState<B>>(
+        &self,
+        hidden: B::Tensor,
+        mask: Option<B::Tensor>,
+        boundary: TextBoundary<B::Tensor>,
+        state: &mut S,
+        expected: &StateLayout,
+        first_state_ordinal: usize,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<LayeredForwardState<B::Tensor, ForwardContext<B::Tensor>>, Error>
+    where
+        S::LayerState: AttentionCache<B::Tensor>,
+    {
+        let mut forward = self.resume_pipeline_text(
+            hidden,
+            mask,
+            boundary.per_layer_input,
+            state,
+            expected,
+            first_state_ordinal,
+        )?;
+        forward.context.shared = boundary.shared;
+        forward.context.shared_pending = true;
+        self.install_pipeline_shared(state, &mut forward.context, context)?;
+        Ok(forward)
     }
 
     fn local_state_ordinal(&self, global: usize) -> Result<usize, Error> {
         global
             .checked_sub(self.partition_state_offset)
             .ok_or_else(|| Error::backend("Gemma 4 unit precedes the partition state offset"))
+    }
+
+    fn attention_state_ordinal(&self, global: usize, state_len: usize) -> Result<usize, Error> {
+        let end = self
+            .partition_state_offset
+            .checked_add(state_len)
+            .ok_or_else(|| Error::backend("Gemma attention state interval overflow"))?;
+        let owner = super::pipeline::attention_cache_owner(
+            &self.args.text,
+            self.partition_state_offset..end,
+            global,
+        )
+        .ok_or_else(|| Error::backend("Gemma attention has no local history owner"))?;
+        self.local_state_ordinal(owner)
     }
 
     fn validate_partition_state<S: LayerRuntimeState<B>>(&self, state: &S) -> Result<(), Error> {
@@ -1401,20 +2041,10 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
         S::LayerState: AttentionCache<B::Tensor>,
     {
         let mut position_offset = 0;
-        for (local, policy) in self
-            .args
-            .text
-            .layer_schedule
-            .iter()
-            .skip(self.partition_state_offset)
-            .take(state.layout().len())
-            .enumerate()
-        {
-            if policy.key_value.owns_state() {
-                position_offset = position_offset.max(AttentionCache::<B::Tensor>::offset(
-                    state.layer(local).map_err(Error::backend)?,
-                ));
-            }
+        for local in 0..state.layout().len() {
+            position_offset = position_offset.max(AttentionCache::<B::Tensor>::offset(
+                state.layer(local).map_err(Error::backend)?,
+            ));
         }
         Ok(position_offset)
     }
@@ -1550,6 +2180,9 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
 
     /// Returns the replicated or rank-local mutable-state layout.
     fn state_layout_impl(&self) -> Result<StateLayout, Error> {
+        if let Some(state) = &self.partition_state {
+            return Ok(state.clone());
+        }
         self.parallel_geometry
             .as_ref()
             .map(|geometry| geometry.state_layout().clone())
@@ -1578,12 +2211,10 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
         let embeddings =
             embeddings.multiply_scalar((self.args.text.hidden_size as f32).sqrt(), context)?;
         let mut position_offset = 0;
-        for (layer, policy) in self.args.text.layer_schedule.iter().enumerate() {
-            if policy.key_value.owns_state() {
-                position_offset = position_offset.max(AttentionCache::<B::Tensor>::offset(
-                    state.layer(layer).map_err(Error::backend)?,
-                ));
-            }
+        for local in 0..state.layout().len() {
+            position_offset = position_offset.max(AttentionCache::<B::Tensor>::offset(
+                state.layer(local).map_err(Error::backend)?,
+            ));
         }
         Ok(LayeredForwardState {
             hidden: embeddings.clone(),
@@ -1597,6 +2228,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
                 per_layer_token_override: None,
                 per_layer_inputs: None,
                 shared: HashMap::new(),
+                shared_pending: false,
                 vision_state: None,
                 vision_initial: None,
                 vision_output: None,
@@ -1615,7 +2247,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
         mask: Option<B::Tensor>,
         state: &mut S,
         expected: &StateLayout,
-        first_state_ordinal: usize,
+        _first_state_ordinal: usize,
         parallel: Option<&B::ParallelContext>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<LayeredForwardState<B::Tensor, ForwardContext<B::Tensor>>, Error>
@@ -1637,22 +2269,10 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
             }
         };
         let mut position_offset = 0;
-        for (layer, policy) in self
-            .args
-            .text
-            .layer_schedule
-            .iter()
-            .enumerate()
-            .skip(first_state_ordinal)
-            .take(expected.len())
-        {
-            if policy.key_value.owns_state() {
-                position_offset = position_offset.max(AttentionCache::<B::Tensor>::offset(
-                    state
-                        .layer(layer - first_state_ordinal)
-                        .map_err(Error::backend)?,
-                ));
-            }
+        for local in 0..state.layout().len() {
+            position_offset = position_offset.max(AttentionCache::<B::Tensor>::offset(
+                state.layer(local).map_err(Error::backend)?,
+            ));
         }
         Ok(LayeredForwardState {
             hidden,
@@ -1663,6 +2283,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
                 per_layer_token_override: None,
                 per_layer_inputs: None,
                 shared: HashMap::new(),
+                shared_pending: false,
                 vision_state: None,
                 vision_initial: None,
                 vision_output: None,
@@ -1681,7 +2302,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
         per_layer_inputs: Option<B::Tensor>,
         state: &mut S,
         expected: &StateLayout,
-        first_state_ordinal: usize,
+        _first_state_ordinal: usize,
     ) -> Result<LayeredForwardState<B::Tensor, ForwardContext<B::Tensor>>, Error>
     where
         S::LayerState: AttentionCache<B::Tensor>,
@@ -1690,22 +2311,10 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
             return Err(Error::backend("Gemma 4 pipeline state layout mismatch"));
         }
         let mut position_offset = 0;
-        for (layer, policy) in self
-            .args
-            .text
-            .layer_schedule
-            .iter()
-            .enumerate()
-            .skip(first_state_ordinal)
-            .take(expected.len())
-        {
-            if policy.key_value.owns_state() {
-                position_offset = position_offset.max(AttentionCache::<B::Tensor>::offset(
-                    state
-                        .layer(layer - first_state_ordinal)
-                        .map_err(Error::backend)?,
-                ));
-            }
+        for local in 0..state.layout().len() {
+            position_offset = position_offset.max(AttentionCache::<B::Tensor>::offset(
+                state.layer(local).map_err(Error::backend)?,
+            ));
         }
         Ok(LayeredForwardState {
             hidden,
@@ -1716,6 +2325,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
                 per_layer_token_override: None,
                 per_layer_inputs,
                 shared: HashMap::new(),
+                shared_pending: false,
                 vision_state: None,
                 vision_initial: None,
                 vision_output: None,
@@ -1881,12 +2491,10 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
         let per_layer_inputs =
             self.per_layer_inputs(per_layer_tokens, &assembled.embeddings, context)?;
         let mut position_offset = 0;
-        for (layer, policy) in self.args.text.layer_schedule.iter().enumerate() {
-            if policy.key_value.owns_state() {
-                position_offset = position_offset.max(AttentionCache::<B::Tensor>::offset(
-                    state.layer(layer).map_err(Error::backend)?,
-                ));
-            }
+        for local in 0..state.layout().len() {
+            position_offset = position_offset.max(AttentionCache::<B::Tensor>::offset(
+                state.layer(local).map_err(Error::backend)?,
+            ));
         }
         Ok(LayeredForwardState {
             hidden: assembled.embeddings,
@@ -1897,6 +2505,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
                 per_layer_token_override: input.per_layer_tokens.cloned(),
                 per_layer_inputs,
                 shared: HashMap::new(),
+                shared_pending: false,
                 vision_state: None,
                 vision_initial: None,
                 vision_output,
@@ -1922,44 +2531,17 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
         S::LayerState: AttentionCache<B::Tensor>,
         B: eredu_nn::TensorParallelGroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
     {
-        let policy = self
-            .args
-            .text
-            .layer_policy(index)
-            .ok_or_else(|| Error::backend("missing Gemma 4 layer policy"))?;
-        let generated_mask = if forward.mask.is_none() && hidden.dim(1) > 1 {
-            Some(B::causal_mask(
-                hidden.dim(1),
-                forward.position_offset,
-                policy
-                    .attention
-                    .window()
-                    .map(|window| window.get() as i32 - 1),
-                context,
-            )?)
-        } else {
-            None
-        };
-        let per_layer_input = forward
-            .per_layer_inputs
-            .as_ref()
-            .map(|inputs| {
-                inputs.index(
-                    &[
-                        Index::Full,
-                        Index::Full,
-                        Index::At(index as i32),
-                        Index::Full,
-                    ],
-                    context,
-                )
-            })
-            .transpose()?;
+        let (generated_mask, per_layer_input) =
+            self.text_block_inputs(index, hidden, forward, context)?;
         unit.forward_parallel(
             BlockInput {
                 hidden,
                 mask: forward.mask.as_ref().or(generated_mask.as_ref()),
-                cache: Some(state.layer(index).map_err(Error::backend)?),
+                cache: Some(
+                    state
+                        .layer(self.attention_state_ordinal(index, state.layout().len())?)
+                        .map_err(Error::backend)?,
+                ),
                 shared: &mut forward.shared,
                 per_layer_input: per_layer_input.as_ref(),
                 rotary_position: Some(RotaryPosition::Offset(forward.position_offset)),
@@ -1989,44 +2571,17 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
         P: eredu_runtime::TensorParallelRoutedExpertProvider<B>,
         P::Error: std::fmt::Display,
     {
-        let policy = self
-            .args
-            .text
-            .layer_policy(index)
-            .ok_or_else(|| Error::backend("missing Gemma 4 layer policy"))?;
-        let generated_mask = if forward.mask.is_none() && hidden.dim(1) > 1 {
-            Some(B::causal_mask(
-                hidden.dim(1),
-                forward.position_offset,
-                policy
-                    .attention
-                    .window()
-                    .map(|window| window.get() as i32 - 1),
-                context,
-            )?)
-        } else {
-            None
-        };
-        let per_layer_input = forward
-            .per_layer_inputs
-            .as_ref()
-            .map(|inputs| {
-                inputs.index(
-                    &[
-                        Index::Full,
-                        Index::Full,
-                        Index::At(index as i32),
-                        Index::Full,
-                    ],
-                    context,
-                )
-            })
-            .transpose()?;
+        let (generated_mask, per_layer_input) =
+            self.text_block_inputs(index, hidden, forward, context)?;
         unit.forward_parallel_with_provider(
             BlockInput {
                 hidden,
                 mask: forward.mask.as_ref().or(generated_mask.as_ref()),
-                cache: Some(state.layer(index).map_err(Error::backend)?),
+                cache: Some(
+                    state
+                        .layer(self.attention_state_ordinal(index, state.layout().len())?)
+                        .map_err(Error::backend)?,
+                ),
                 shared: &mut forward.shared,
                 per_layer_input: per_layer_input.as_ref(),
                 rotary_position: Some(RotaryPosition::Offset(forward.position_offset)),
@@ -2079,44 +2634,17 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
         P: RoutedExpertProvider<B>,
         P::Error: std::fmt::Display,
     {
-        let policy = self
-            .args
-            .text
-            .layer_policy(index)
-            .ok_or_else(|| Error::backend("missing Gemma 4 layer policy"))?;
-        let generated_mask = if forward.mask.is_none() && hidden.dim(1) > 1 {
-            Some(B::causal_mask(
-                hidden.dim(1),
-                forward.position_offset,
-                policy
-                    .attention
-                    .window()
-                    .map(|window| window.get() as i32 - 1),
-                context,
-            )?)
-        } else {
-            None
-        };
-        let per_layer_input = forward
-            .per_layer_inputs
-            .as_ref()
-            .map(|inputs| {
-                inputs.index(
-                    &[
-                        Index::Full,
-                        Index::Full,
-                        Index::At(index as i32),
-                        Index::Full,
-                    ],
-                    context,
-                )
-            })
-            .transpose()?;
+        let (generated_mask, per_layer_input) =
+            self.text_block_inputs(index, hidden, forward, context)?;
         unit.forward_with_provider(
             BlockInput {
                 hidden,
                 mask: forward.mask.as_ref().or(generated_mask.as_ref()),
-                cache: Some(state.layer(index).map_err(Error::backend)?),
+                cache: Some(
+                    state
+                        .layer(self.attention_state_ordinal(index, state.layout().len())?)
+                        .map_err(Error::backend)?,
+                ),
                 shared: &mut forward.shared,
                 per_layer_input: per_layer_input.as_ref(),
                 rotary_position: Some(RotaryPosition::Offset(forward.position_offset)),
@@ -2138,6 +2666,10 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
         parts
             .iter()
             .map(|part| match part {
+                DecoderInputPart::Text(tokens) if self.partition_state_offset > 0 => Ok(PreparedPart::Text {
+                    tokens: (*tokens).clone(),
+                    embeddings: B::Tensor::full_f32(0.0, &[tokens.dim(0), tokens.dim(1), self.args.text.hidden_size], context)?,
+                }),
                 DecoderInputPart::Text(tokens) => Ok(PreparedPart::Text {
                     tokens: (*tokens).clone(),
                     embeddings: self
@@ -2188,6 +2720,10 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
         parts
             .iter()
             .map(|part| match part {
+                DecoderInputPart::Text(tokens) if self.partition_state_offset > 0 => Ok(PreparedPart::Text {
+                    tokens: (*tokens).clone(),
+                    embeddings: B::Tensor::full_f32(0.0, &[tokens.dim(0), tokens.dim(1), self.args.text.hidden_size], context)?,
+                }),
                 DecoderInputPart::Text(tokens) => Ok(PreparedPart::Text {
                     tokens: (*tokens).clone(),
                     embeddings: B::vocabulary_parallel_lookup(
@@ -2338,6 +2874,54 @@ where
     S: LayerRuntimeState<B>,
     S::LayerState: AttentionCache<B::Tensor>,
 {
+    fn observation_hooks(&self) -> eredu_runtime::inspection::ObservationHookSupport {
+        eredu_runtime::inspection::ObservationHookSupport::internal(true, true, true)
+            .with_routed_units(true)
+    }
+    fn forward_unit_observed<O>(
+        &mut self,
+        group: usize,
+        index: usize,
+        unit: &mut Self::Unit,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &mut Self::ForwardContext,
+        context: &<B::Tensor as Tensor>::Context,
+        observer: &mut O,
+    ) -> Result<B::Tensor, Error>
+    where
+        O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
+    {
+        let pass = <Self as RoutedLayeredArchitecture<B, S>>::expert_pass_for_unit(
+            self, group, index, hidden, forward,
+        );
+        self.forward_components(
+            group,
+            index,
+            unit,
+            hidden,
+            state,
+            forward,
+            pass,
+            &mut eredu_runtime::ResidentExpertProvider,
+            context,
+            observer,
+        )
+    }
+    fn finish_forward_observed<O>(
+        &mut self,
+        hidden: &B::Tensor,
+        _state: &mut S,
+        _forward: &Self::ForwardContext,
+        context: &<B::Tensor as Tensor>::Context,
+        observer: &mut O,
+    ) -> Result<B::Tensor, Error>
+    where
+        O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
+    {
+        self.finish_components(hidden, None, context, observer)
+    }
+
     type Input<'a> = ModelInput<'a, B::Tensor>;
     type StaticModules = StaticModules<B>;
     type Unit = Unit<B>;
@@ -2350,28 +2934,7 @@ where
 
     fn group_transport(&self, group: usize) -> eredu_runtime::ArchitectureGroupTransport {
         match group {
-            0 => eredu_runtime::ArchitectureGroupTransport {
-                placement: eredu_runtime::ArchitectureGroupPlacement::Pipeline,
-                kind: eredu_runtime::ArchitectureGroupKind::VisionEncoder,
-                first_owner_static_roles: self.args.vision.as_ref().map_or_else(Vec::new, |_| {
-                    vec!["vision".into(), "vision_projection".into()]
-                }),
-                last_owner_static_roles: Vec::new(),
-                merge_destination: eredu_runtime::ArchitectureMergeDestination::FirstPipelineOwner,
-                parallel_subgroup: Some(eredu_runtime::ArchitectureParallelSubgroup::TensorSharded),
-                request_optional: true,
-            },
-            1 => eredu_runtime::ArchitectureGroupTransport {
-                placement: eredu_runtime::ArchitectureGroupPlacement::Pipeline,
-                kind: eredu_runtime::ArchitectureGroupKind::AudioEncoder,
-                first_owner_static_roles: self.args.audio.as_ref().map_or_else(Vec::new, |_| {
-                    vec!["audio".into(), "audio_projection".into()]
-                }),
-                last_owner_static_roles: Vec::new(),
-                merge_destination: eredu_runtime::ArchitectureMergeDestination::FirstPipelineOwner,
-                parallel_subgroup: Some(eredu_runtime::ArchitectureParallelSubgroup::TensorSharded),
-                request_optional: true,
-            },
+            0 | 1 => super::pipeline::media_transport(&self.args, group),
             _ => eredu_runtime::ArchitectureGroupTransport {
                 placement: eredu_runtime::ArchitectureGroupPlacement::Pipeline,
                 kind: eredu_runtime::ArchitectureGroupKind::Decoder,
@@ -2533,7 +3096,18 @@ where
                     })?,
                     None => &self.args.text,
                 };
-                Ok(Unit::Text(DenseBlock::new(args, index, context)?))
+                let routed_spec = self
+                    .expert_realization
+                    .as_ref()
+                    .and_then(|plan| plan.unit_spec(TEXT_EXECUTION_GROUP, index))
+                    .cloned();
+                Ok(Unit::Text(DenseBlock::new_at_with_routed_spec(
+                    args,
+                    index,
+                    "model.language_model.layers",
+                    routed_spec,
+                    context,
+                )?))
             }
             _ => Err(Error::backend("Gemma 4 has three execution groups")),
         }
@@ -2549,24 +3123,14 @@ where
         let parts = self.prepare_parts(input.parts, context)?;
         let (vision_initial, vision_state) = match input.vision {
             Some(vision) => {
-                let (hidden, state) = self
-                    .static_modules
-                    .vision
-                    .as_mut()
-                    .ok_or_else(|| Error::backend("Gemma 4 has no vision tower"))?
-                    .begin(vision, context)?;
+                let (hidden, state) = self.begin_partition_vision(vision, context)?;
                 (Some(hidden), Some(state))
             }
             None => (None, None),
         };
         let (audio_initial, audio_valid) = match input.audio {
             Some(audio) => {
-                let (hidden, valid) = self
-                    .static_modules
-                    .audio
-                    .as_mut()
-                    .ok_or_else(|| Error::backend("Gemma 4 has no audio tower"))?
-                    .begin(audio, context)?;
+                let (hidden, valid) = self.begin_partition_audio(audio, context)?;
                 (Some(hidden), Some(valid))
             }
             None => (None, None),
@@ -2597,6 +3161,7 @@ where
                 per_layer_token_override: input.per_layer_tokens.cloned(),
                 per_layer_inputs: None,
                 shared: HashMap::new(),
+                shared_pending: false,
                 vision_state,
                 vision_initial,
                 vision_output: None,
@@ -2686,46 +3251,15 @@ where
                 context,
             ),
             (2, Unit::Text(unit)) => {
-                let policy = self
-                    .args
-                    .text
-                    .layer_policy(index)
-                    .ok_or_else(|| Error::backend("missing Gemma 4 layer policy"))?;
-                let generated_mask = if forward.mask.is_none() && hidden.dim(1) > 1 {
-                    Some(B::causal_mask(
-                        hidden.dim(1),
-                        forward.position_offset,
-                        policy
-                            .attention
-                            .window()
-                            .map(|window| window.get() as i32 - 1),
-                        context,
-                    )?)
-                } else {
-                    None
-                };
-                let per_layer_input = forward
-                    .per_layer_inputs
-                    .as_ref()
-                    .map(|inputs| {
-                        inputs.index(
-                            &[
-                                Index::Full,
-                                Index::Full,
-                                Index::At(index as i32),
-                                Index::Full,
-                            ],
-                            context,
-                        )
-                    })
-                    .transpose()?;
+                let (generated_mask, per_layer_input) =
+                    self.text_block_inputs(index, hidden, forward, context)?;
                 unit.forward(
                     BlockInput {
                         hidden,
                         mask: forward.mask.as_ref().or(generated_mask.as_ref()),
                         cache: Some(
                             state
-                                .layer(self.local_state_ordinal(index)?)
+                                .layer(self.attention_state_ordinal(index, state.layout().len())?)
                                 .map_err(Error::backend)?,
                         ),
                         shared: &mut forward.shared,
@@ -2844,6 +3378,58 @@ where
     S: LayerRuntimeState<B>,
     S::LayerState: AttentionCache<B::Tensor>,
 {
+    fn parallel_observation_hooks(&self) -> eredu_runtime::inspection::ObservationHookSupport {
+        eredu_runtime::inspection::ObservationHookSupport::internal(true, true, true)
+            .with_routed_units(true)
+    }
+
+    fn forward_unit_parallel_observed<O>(
+        &mut self,
+        group: usize,
+        index: usize,
+        unit: &mut Self::Unit,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &mut Self::ForwardContext,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+        observer: &mut O,
+    ) -> Result<B::Tensor, Error>
+    where
+        O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
+    {
+        let pass = <Self as RoutedLayeredArchitecture<B, S>>::expert_pass_for_unit(
+            self, group, index, hidden, forward,
+        );
+        self.forward_components_parallel(
+            group,
+            index,
+            unit,
+            hidden,
+            state,
+            forward,
+            pass,
+            &mut eredu_runtime::ResidentExpertProvider,
+            parallel,
+            context,
+            observer,
+        )
+    }
+    fn finish_forward_parallel_observed<O>(
+        &mut self,
+        hidden: &B::Tensor,
+        _state: &mut S,
+        _forward: &Self::ForwardContext,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+        observer: &mut O,
+    ) -> Result<B::Tensor, Error>
+    where
+        O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
+    {
+        self.finish_components(hidden, Some(parallel), context, observer)
+    }
+
     fn begin_forward_parallel<'a>(
         &mut self,
         input: Self::Input<'a>,
@@ -2858,24 +3444,14 @@ where
         let parts = self.prepare_parts_parallel(input.parts, parallel, context)?;
         let (vision_initial, vision_state) = match input.vision {
             Some(vision) => {
-                let (hidden, state) = self
-                    .static_modules
-                    .vision
-                    .as_mut()
-                    .ok_or_else(|| Error::backend("Gemma 4 has no vision tower"))?
-                    .begin(vision, context)?;
+                let (hidden, state) = self.begin_partition_vision(vision, context)?;
                 (Some(hidden), Some(state))
             }
             None => (None, None),
         };
         let (audio_initial, audio_valid) = match input.audio {
             Some(audio) => {
-                let (hidden, valid) = self
-                    .static_modules
-                    .audio
-                    .as_mut()
-                    .ok_or_else(|| Error::backend("Gemma 4 has no audio tower"))?
-                    .begin(audio, context)?;
+                let (hidden, valid) = self.begin_partition_audio(audio, context)?;
                 (Some(hidden), Some(valid))
             }
             None => (None, None),
@@ -2906,6 +3482,7 @@ where
                 per_layer_token_override: input.per_layer_tokens.cloned(),
                 per_layer_inputs: None,
                 shared: HashMap::new(),
+                shared_pending: false,
                 vision_state,
                 vision_initial,
                 vision_output: None,
@@ -2969,17 +3546,13 @@ where
                 "Gemma 4 model was not built with local geometry",
             ));
         }
-        let hidden = self.static_modules.text.norm.forward(hidden, context)?;
-        let logits = match &mut self.static_modules.text.head {
-            Some(head) => B::vocabulary_parallel_project(head, &hidden, parallel, context)?,
-            None => B::vocabulary_parallel_embedding_project(
-                &mut self.static_modules.text.embeddings,
-                &hidden,
-                parallel,
-                context,
-            )?,
-        };
-        model_text::args_cap::<B>(logits, self.args.text.final_logit_softcapping, context)
+        self.static_modules.text.project_logits_instrumented(
+            hidden,
+            self.args.text.final_logit_softcapping,
+            Some(parallel),
+            context,
+            &mut crate::decoder::ComponentInstrumentation::disabled(),
+        )
     }
 }
 
@@ -3037,8 +3610,8 @@ fn slice_component<T: Tensor>(
 // media without changing their stable parameter identities.
 pub(crate) mod model_text {
     use eredu_nn::{
-        EmbeddingSpec, Error, GroupedNeuralBackend, LinearOperator, LinearSpec,
-        NormalizationConstructionSpec, ParameterSpec, Parameterized, Tensor,
+        EmbeddingSpec, Error, GroupedNeuralBackend, LinearSpec, NormalizationConstructionSpec,
+        ParameterSpec, Parameterized, Tensor,
     };
 
     use super::super::ModelArgs;
@@ -3283,12 +3856,54 @@ pub(crate) mod model_text {
             cap: Option<f32>,
             context: &<B::Tensor as Tensor>::Context,
         ) -> Result<B::Tensor, Error> {
-            use eredu_nn::{EmbeddingOperator, NormalizationOperator};
-            let hidden = self.norm.forward(hidden, context)?;
-            let logits = match self.head.as_mut() {
-                Some(head) => head.forward(&hidden, context)?,
-                None => self.embeddings.as_linear(&hidden, context)?,
+            self.project_logits_instrumented(
+                hidden,
+                cap,
+                None,
+                context,
+                &mut crate::decoder::ComponentInstrumentation::disabled(),
+            )
+        }
+
+        pub(super) fn project_logits_instrumented(
+            &mut self,
+            hidden: &B::Tensor,
+            cap: Option<f32>,
+            parallel: Option<&B::ParallelContext>,
+            context: &<B::Tensor as Tensor>::Context,
+            instrumentation: &mut crate::decoder::ComponentInstrumentation<'_, B::Tensor>,
+        ) -> Result<B::Tensor, Error> {
+            let hidden = instrumentation.normalize_readout(hidden, &mut self.norm, context)?;
+            let logits = match (parallel, self.head.as_mut()) {
+                (Some(parallel), Some(head)) => instrumentation.project_vocabulary::<B>(
+                    "projection_input",
+                    head,
+                    &hidden,
+                    parallel,
+                    context,
+                )?,
+                (Some(parallel), None) => instrumentation.project_vocabulary_embedding::<B>(
+                    "projection_input",
+                    &mut self.embeddings,
+                    &hidden,
+                    parallel,
+                    context,
+                )?,
+                (None, Some(head)) => instrumentation.project::<B>(
+                    "projection_input",
+                    head,
+                    &hidden,
+                    None,
+                    context,
+                )?,
+                (None, None) => instrumentation.project_embedding(
+                    "projection_input",
+                    &mut self.embeddings,
+                    &hidden,
+                    context,
+                )?,
             };
+            let logits = instrumentation.apply("linear", logits)?;
             args_cap::<B>(logits, cap, context)
         }
     }

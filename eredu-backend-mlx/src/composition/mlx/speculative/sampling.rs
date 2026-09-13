@@ -487,24 +487,28 @@ impl LogitCapture {
                     crate::composition::mlx::session::intervention::NativeInterventionEstimator,
                 ),
             )
-            .map_err(|e| Exception::custom(e.to_string()))?;
+            .map_err(Exception::from_source)?;
         self.session
             .begin_step(phase, position)
-            .map_err(|e| Exception::custom(e.to_string()))?;
+            .map_err(Exception::from_source)?;
         // Sampling receives one vocabulary row. Normalize only its logical shape
         // to the ordinary model.logits catalog; the collector owns reservation,
         // evaluation, bounded transformation and host transfer.
         let values = logits.reshape(&[1, 1, -1], stream)?;
         let tensor = MlxTensor::from_array(values);
-        let mut backend =
-            crate::composition::mlx::session::bounded_capture::NativeCapture { stream, domain };
+        let mut backend = crate::composition::mlx::session::bounded_capture::NativeCapture {
+            partition: None,
+            stream,
+            domain,
+        };
         self.session
             .observe(
                 &mut backend,
                 eredu_core::MODEL_LOGITS_OBSERVATION_PATH,
                 &tensor,
             )
-            .map_err(|e| Exception::custom(e.to_string()))?;
+            .map_err(crate::composition::mlx::session::bounded_capture::capture_error)
+            .map_err(Exception::from_source)?;
         let effective = self
             .session
             .intervene(
@@ -512,10 +516,11 @@ impl LogitCapture {
                 eredu_core::MODEL_LOGITS_OBSERVATION_PATH,
                 &tensor,
             )
-            .map_err(|e| Exception::custom(e.to_string()))?;
+            .map_err(crate::composition::mlx::session::bounded_capture::capture_error)
+            .map_err(Exception::from_source)?;
         self.session
             .finish_interventions()
-            .map_err(|e| Exception::custom(e.to_string()))?;
+            .map_err(Exception::from_source)?;
         if let Some(capture) = self.session.take_step() {
             self.records.push(SpeculativePredictionCapture {
                 role,

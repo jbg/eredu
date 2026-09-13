@@ -41,6 +41,7 @@ fn native_activation_primitives_pass_shared_conformance() {
     let stream = Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
     eredu_evaluation::intervention::activation_conformance(
         &mut NativeCapture {
+            partition: None,
             stream: &stream,
             domain: None,
         },
@@ -61,6 +62,7 @@ fn row() -> ResolvedCaptureSlice {
 fn native_intervention_patch_scale_mask_and_bias_preserve_other_rows() {
     let stream = Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
     let mut native = NativeCapture {
+        partition: None,
         stream: &stream,
         domain: None,
     };
@@ -140,6 +142,7 @@ fn native_intervention_patch_scale_mask_and_bias_preserve_other_rows() {
 fn native_intervention_half_payload_bits_are_exact_and_casts_are_rejected() {
     let stream = Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
     let mut native = NativeCapture {
+        partition: None,
         stream: &stream,
         domain: None,
     };
@@ -208,5 +211,243 @@ fn native_intervention_half_payload_bits_are_exact_and_casts_are_rejected() {
             &slice
         )
         .is_err());
+    }
+}
+
+#[test]
+fn native_prepaid_partition_activation_preserves_payloads_and_global_masks_cpu() {
+    verify_prepaid_partition_activation(safemlx::DeviceType::Cpu);
+}
+
+#[cfg(feature = "metal")]
+#[test]
+fn native_prepaid_partition_activation_preserves_payloads_and_global_masks_metal() {
+    verify_prepaid_partition_activation(safemlx::DeviceType::Gpu);
+}
+
+fn verify_prepaid_partition_activation(device: safemlx::DeviceType) {
+    use eredu_core::{component::ComponentCoordinateMap, *};
+    use eredu_runtime::intervention::PartitionActivationProjection;
+    let stream = Stream::new_with_device(&safemlx::Device::new(device, 0));
+    let request = CaptureRequestShape {
+        batch: 1,
+        prompt_tokens: 3,
+        max_predictions: 1,
+    };
+    let mut capture = CapturePlan::none();
+    let usage = CaptureUsage {
+        captures: 0,
+        retained_bytes: 1 << 20,
+        host_bytes: 1 << 20,
+        encoded_bytes: 0,
+    };
+    capture.limits.per_step = usage;
+    capture.limits.cumulative = usage;
+    let capabilities = CaptureCapabilities::default();
+    let capture = capture
+        .admit(
+            &ObservationCatalog {
+                schema_version: 1,
+                points: vec![],
+                completeness: DescriptionCompleteness::Complete,
+            },
+            &ObservationSupportReport {
+                schema_version: 1,
+                capture: capabilities.clone(),
+                points: vec![],
+            },
+            &capabilities,
+            request,
+        )
+        .unwrap();
+    let plan = |action: InterventionAction, partial| {
+        let logits = matches!(action, InterventionAction::MaskLogits { .. });
+        let axis = if logits { "vocabulary" } else { "component" };
+        let mut slices = vec![CaptureSlice {
+            axis: "sequence".into(),
+            start: 1,
+            end: 3,
+            stride: 1,
+        }];
+        if partial {
+            slices.push(CaptureSlice {
+                axis: axis.into(),
+                start: 1,
+                end: 8,
+                stride: 2,
+            });
+        }
+        let point = InterventionPoint {
+            path: "units".into(),
+            node_id: "block".into(),
+            stage: if logits {
+                InterventionStage::LogitsBeforeSampling
+            } else {
+                InterventionStage::Activation
+            },
+            axes: vec![
+                TensorAxis {
+                    name: "sequence".into(),
+                    dimension: SymbolicDimension::Sequence,
+                },
+                TensorAxis {
+                    name: axis.into(),
+                    dimension: SymbolicDimension::Known(8),
+                },
+            ],
+            dtypes: vec![action.dtype().unwrap()],
+            operations: vec![action.kind()],
+            score_stages: vec![],
+            prefill: ObservationSupportStatus::Supported,
+            decode: ObservationSupportStatus::Supported,
+            conditions: vec![],
+            routed_units: None,
+            routing: None,
+        };
+        InterventionPlan {
+            schema_version: 1,
+            operations: vec![InterventionOperation {
+                id: "edit".into(),
+                target: point.path.clone(),
+                schedule: CaptureSchedule {
+                    decode: false,
+                    ..Default::default()
+                },
+                slices,
+                action,
+                evidence: InterventionEvidence::None,
+            }],
+        }
+        .admit(
+            &InterventionDiscovery {
+                schema_version: 1,
+                artifact_identity: "fixture".into(),
+                session_identity: Some("native-fixture".into()),
+                points: vec![point],
+            },
+            request,
+            "trial",
+        )
+        .unwrap()
+    };
+    for (dtype, values) in [
+        (
+            Dtype::Float32,
+            InterventionValues::Float32(vec![0.25, -0.5, 0.75, 1.0, -1.25, 1.5, -1.75, 2.0]),
+        ),
+        (
+            Dtype::Float16,
+            InterventionValues::Float16(vec![
+                0x3400, 0xb800, 0x3a00, 0x3c00, 0xbd00, 0x3e00, 0xbf00, 0x4000,
+            ]),
+        ),
+        (
+            Dtype::Bfloat16,
+            InterventionValues::Bfloat16(vec![
+                0x3e80, 0xbf00, 0x3f40, 0x3f80, 0xbfa0, 0x3fc0, 0xbfe0, 0x4000,
+            ]),
+        ),
+    ] {
+        let admitted = plan(
+            InterventionAction::Replace {
+                tensor: InterventionTensor {
+                    shape: vec![2, 4],
+                    values,
+                },
+            },
+            true,
+        );
+        let map = ComponentCoordinateMap::indices(8, vec![7, 1, 5, 3]).unwrap();
+        let source: Vec<f32> = (0..3)
+            .flat_map(|row| {
+                let map = &map;
+                (0..4).map(move |column| (row * 8 + map.local_to_global(column).unwrap()) as f32)
+            })
+            .collect();
+        let input = MlxTensor::from_array(
+            Array::from_slice(&source, &[3, 4])
+                .as_dtype(dtype, &stream)
+                .unwrap(),
+        );
+        let projection = PartitionActivationProjection::new(
+            &admitted,
+            0,
+            CapturePhase::Prefill,
+            0,
+            &[3, 8],
+            1,
+            &map,
+            4,
+        )
+        .unwrap();
+        let mut ledger = CaptureLedger::new(&capture);
+        let work = projection
+            .reserve(&mut ledger, &NativeInterventionEstimator)
+            .unwrap();
+        let charged = ledger.total();
+        assert!(charged.retained_bytes > 0 && charged.host_bytes > 0);
+        let mut native = NativeCapture {
+            partition: None,
+            stream: &stream,
+            domain: None,
+        };
+        let output = work.apply(&mut native, &input).unwrap().unwrap();
+        assert_eq!(
+            output.to_f32_vec(&stream).unwrap(),
+            [7.0, 1.0, 5.0, 3.0, 1.0, 0.25, 0.75, -0.5, 2.0, -1.25, -1.75, 1.5]
+        );
+        assert_eq!(input.to_f32_vec(&stream).unwrap(), source);
+        assert_eq!(ledger.total(), charged);
+    }
+    for (action, expected_tail) in [
+        (
+            InterventionAction::MaskComponents {
+                dtype: InterventionDtype::Float32,
+                indices: vec![0, 1],
+                keep_selected: true,
+            },
+            0.0,
+        ),
+        (
+            InterventionAction::MaskLogits {
+                dtype: InterventionDtype::Float32,
+                token_ids: vec![4, 5, 6, 7],
+            },
+            f32::NEG_INFINITY,
+        ),
+    ] {
+        let admitted = plan(action, false);
+        let map = ComponentCoordinateMap::range(8, 4..8).unwrap();
+        let input = MlxTensor::from_array(Array::from_slice(&[2.0f32; 12], &[3, 4]));
+        let work = PartitionActivationProjection::new(
+            &admitted,
+            0,
+            CapturePhase::Prefill,
+            0,
+            &[3, 8],
+            1,
+            &map,
+            1,
+        )
+        .unwrap()
+        .reserve(
+            &mut CaptureLedger::new(&capture),
+            &NativeInterventionEstimator,
+        )
+        .unwrap();
+        let output = work
+            .apply(
+                &mut NativeCapture {
+                    partition: None,
+                    stream: &stream,
+                    domain: None,
+                },
+                &input,
+            )
+            .unwrap()
+            .unwrap();
+        let data = output.to_f32_vec(&stream).unwrap();
+        assert_eq!(&data[..4], &[2.0; 4]);
+        assert_eq!(&data[4..], &[expected_tail; 8]);
     }
 }

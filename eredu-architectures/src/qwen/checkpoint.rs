@@ -41,6 +41,16 @@ pub fn with_checkpoint_formats(
     args: &ModelArgs,
     mut formats: HashMap<String, WeightQuantization>,
 ) -> Result<ModelArgs, String> {
+    if args.is_moe() {
+        for layer in 0..args.num_hidden_layers {
+            let prefix = format!("{}.layers.{layer}.mlp.experts", args.parameter_root);
+            let gate = formats.get(&format!("{prefix}.gate_proj.weight"));
+            let up = formats.get(&format!("{prefix}.up_proj.weight"));
+            if (gate.is_some() || up.is_some()) && gate != up {
+                return Err(format!("split expert gate/up formats disagree at {prefix}"));
+            }
+        }
+    }
     normalize_weight_formats(args, &mut formats);
     let mut target = args.clone();
     target.quantized_weights = Some(formats.keys().cloned().collect());
@@ -892,10 +902,13 @@ pub fn normalize_weight_formats<V>(args: &ModelArgs, formats: &mut HashMap<Strin
         return;
     }
     for layer in 0..args.num_hidden_layers {
-        let prefix = format!("model.layers.{layer}.mlp.experts");
+        let prefix = format!("{}.layers.{layer}.mlp.experts", args.parameter_root);
         if let Some(format) = formats.remove(&format!("{prefix}.gate_proj.weight")) {
             formats.remove(&format!("{prefix}.up_proj.weight"));
             formats.insert(format!("{prefix}.gate_up_proj"), format);
+        }
+        if let Some(format) = formats.remove(&format!("{prefix}.down_proj.weight")) {
+            formats.insert(format!("{prefix}.down_proj"), format);
         }
     }
 }
@@ -1039,6 +1052,45 @@ mod tests {
         assert_eq!(formats.get(&format!("{prefix}.gate_up_proj")), Some(&1));
         assert!(!formats.contains_key(&format!("{prefix}.gate_proj.weight")));
         assert!(!formats.contains_key(&format!("{prefix}.up_proj.weight")));
+    }
+
+    #[test]
+    fn checkpoint_formats_preserve_mixed_packed_banks_and_reject_split_drift() {
+        let mut model = args("qwen3_moe", false);
+        model.parameter_root = "decoder".into();
+        let q8 = WeightQuantization::GgufIQuant {
+            ggml_type: eredu_gguf::GgmlType::Q8_0,
+            endian: eredu_gguf::Endian::Little,
+        };
+        let iq = WeightQuantization::GgufIQuant {
+            ggml_type: eredu_gguf::GgmlType::IQ4NL,
+            endian: eredu_gguf::Endian::Little,
+        };
+        let mut formats = HashMap::new();
+        for (layer, format) in [(0, q8), (1, iq)] {
+            for projection in ["gate_proj.weight", "up_proj.weight", "down_proj.weight"] {
+                formats.insert(
+                    format!("decoder.layers.{layer}.mlp.experts.{projection}"),
+                    format,
+                );
+            }
+        }
+        let normalized = with_checkpoint_formats(&model, formats.clone()).unwrap();
+        for (layer, format) in [(0, q8), (1, iq)] {
+            for projection in ["gate_up_proj", "down_proj"] {
+                assert_eq!(
+                    normalized.weight_quantization_for(&format!(
+                        "decoder.layers.{layer}.mlp.experts.{projection}"
+                    )),
+                    Some(format)
+                );
+            }
+        }
+        let up = "decoder.layers.0.mlp.experts.up_proj.weight";
+        formats.insert(up.into(), iq);
+        assert!(with_checkpoint_formats(&model, formats.clone()).is_err());
+        formats.remove(up);
+        assert!(with_checkpoint_formats(&model, formats).is_err());
     }
 
     #[test]

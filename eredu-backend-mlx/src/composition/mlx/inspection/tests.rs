@@ -12,6 +12,7 @@ impl eredu_architectures::PreparationMechanismProvider for IndependentMechanisms
         eredu_core::ObservationMechanisms {
             activation_tensors: true,
             routing_tensors: true,
+            routed_unit_tensors: false,
             floating_to_f32: true,
         }
     }
@@ -291,7 +292,9 @@ fn bounded_capture_preserves_native_generation_tokens_and_rng_progression() {
             "ordinary loading must not hash weights"
         );
         let model = eredu_core::PreparedModel::new(
-            model.with_capture_discovery(discovery_probe.clone()),
+            model
+                .with_capture_discovery(discovery_probe.clone())
+                .unwrap(),
             capabilities,
         );
         let mut runtime = ModelRuntime::from_prepared(backend, model).unwrap();

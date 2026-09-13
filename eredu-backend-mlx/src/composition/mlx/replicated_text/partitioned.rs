@@ -58,7 +58,7 @@ impl eredu_architectures::partitioned_execution::PartitionTensorAllocator<MlxNeu
             .as_array()
             .as_dtype(dtype, context)
             .map(MlxTensor::from_array)
-            .map_err(|error| eredu_nn::Error::backend(error.to_string()))
+            .map_err(eredu_nn::Error::backend_source)
     }
 
     fn tensor_placeholder(
@@ -71,7 +71,7 @@ impl eredu_architectures::partitioned_execution::PartitionTensorAllocator<MlxNeu
         let dtype = mlx_boundary_dtype(logical_dtype, activation_dtype)?;
         safemlx::ops::zeros_dtype(shape, dtype, context)
             .map(MlxTensor::from_array)
-            .map_err(|error| eredu_nn::Error::backend(error.to_string()))
+            .map_err(eredu_nn::Error::backend_source)
     }
 }
 
@@ -131,6 +131,14 @@ pub(super) enum MlxSelectedLayerwisePolicyInner<U: 'static, P> {
 
 pub(super) struct MlxSelectedLayerwisePolicy<U: 'static, P> {
     inner: Arc<Mutex<MlxSelectedLayerwisePolicyInner<U, P>>>,
+    /// Exact architecture addresses paired with policy-local residency addresses.
+    /// Pipeline cuts may retain a nonzero global unit index at local ordinal zero.
+    parameter_locations: Arc<
+        [(
+            eredu_runtime::ExecutionUnitAddress,
+            eredu_runtime::ExecutionUnitAddress,
+        )],
+    >,
 }
 
 pub(super) type MlxArchitectureLayerwisePolicy<A, S> = MlxSelectedLayerwisePolicy<
@@ -142,23 +150,63 @@ impl<U: 'static, P> Clone for MlxSelectedLayerwisePolicy<U, P> {
     fn clone(&self) -> Self {
         Self {
             inner: Arc::clone(&self.inner),
+            parameter_locations: Arc::clone(&self.parameter_locations),
         }
     }
 }
 
 impl<U: 'static, P> MlxSelectedLayerwisePolicy<U, P> {
-    pub(super) fn resident(policy: MlxResidentPolicy<U>) -> Self {
-        Self {
+    fn parameter_locations(
+        layout: &eredu_runtime::ExecutionUnitLayout,
+        addresses: &[eredu_runtime::ExecutionUnitAddress],
+    ) -> Result<
+        Arc<
+            [(
+                eredu_runtime::ExecutionUnitAddress,
+                eredu_runtime::ExecutionUnitAddress,
+            )],
+        >,
+        Error,
+    > {
+        if layout.len() != addresses.len() {
+            return Err(Error::ArchitectureModel(
+                "prepared parameter addresses differ from policy units".into(),
+            ));
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        let mut locations = Vec::with_capacity(addresses.len());
+        for (ordinal, address) in addresses.iter().copied().enumerate() {
+            let local = layout.address(ordinal).expect("validated policy layout");
+            if local.group() != address.group() || !seen.insert((address.group(), address.index()))
+            {
+                return Err(Error::ArchitectureModel(
+                    "prepared parameter addresses differ from policy groups".into(),
+                ));
+            }
+            locations.push((address, local));
+        }
+        Ok(locations.into())
+    }
+
+    pub(super) fn resident(
+        policy: MlxResidentPolicy<U>,
+        layout: &eredu_runtime::ExecutionUnitLayout,
+        addresses: &[eredu_runtime::ExecutionUnitAddress],
+    ) -> Result<Self, Error> {
+        Ok(Self {
+            parameter_locations: Self::parameter_locations(layout, addresses)?,
             inner: Arc::new(Mutex::new(MlxSelectedLayerwisePolicyInner::Resident(
                 policy,
             ))),
-        }
+        })
     }
 
     pub(super) fn bounded(
         policy: MlxLayerwisePolicy<U, P>,
         layout: &eredu_runtime::ExecutionUnitLayout,
-    ) -> Self {
+        addresses: &[eredu_runtime::ExecutionUnitAddress],
+    ) -> Result<Self, Error> {
+        let parameter_locations = Self::parameter_locations(layout, addresses)?;
         let local_addresses = (0..layout.len())
             .map(|ordinal| {
                 layout
@@ -166,12 +214,13 @@ impl<U: 'static, P> MlxSelectedLayerwisePolicy<U, P> {
                     .expect("validated execution layout covers every ordinal")
             })
             .collect();
-        Self {
+        Ok(Self {
+            parameter_locations,
             inner: Arc::new(Mutex::new(MlxSelectedLayerwisePolicyInner::Bounded {
                 policy,
                 local_addresses,
             })),
-        }
+        })
     }
 
     pub(super) fn residency_report(&self) -> Result<ResidencyReport, Error> {
@@ -228,6 +277,48 @@ where
     type Lease = MlxSelectedUnitLease<U>;
     type Error = Error;
 
+    fn resident_parameters_available(&self) -> bool {
+        let Ok(policy) = self.inner.lock() else {
+            return false;
+        };
+        match &*policy {
+            MlxSelectedLayerwisePolicyInner::Resident(policy) => {
+                policy.resident_parameters_available()
+            }
+            MlxSelectedLayerwisePolicyInner::Bounded { .. } => false,
+        }
+    }
+
+    fn visit_resident_units(&mut self, visitor: &mut impl FnMut(&mut U)) -> bool {
+        let Ok(mut policy) = self.inner.lock() else {
+            return false;
+        };
+        match &mut *policy {
+            MlxSelectedLayerwisePolicyInner::Resident(policy) => {
+                policy.visit_resident_units(visitor)
+            }
+            MlxSelectedLayerwisePolicyInner::Bounded { .. } => false,
+        }
+    }
+
+    fn publish_parameter_replacements(
+        &mut self,
+        values: &std::collections::BTreeMap<String, MlxTensor>,
+        active: bool,
+    ) -> Result<bool, Error> {
+        let mut policy = self.inner.lock().map_err(|_| {
+            Error::ArchitectureModel("selected layerwise policy lock was poisoned".into())
+        })?;
+        match &mut *policy {
+            MlxSelectedLayerwisePolicyInner::Resident(policy) => {
+                policy.publish_parameter_replacements(values, active)
+            }
+            MlxSelectedLayerwisePolicyInner::Bounded { policy, .. } => {
+                policy.publish_parameter_replacements(values, active)
+            }
+        }
+    }
+
     fn begin(&mut self, initial: &MlxTensor, context: &Stream) -> Result<(), Self::Error> {
         let mut policy = self.inner.lock().map_err(|_| {
             Error::ArchitectureModel("selected layerwise policy lock was poisoned".into())
@@ -236,6 +327,45 @@ where
             MlxSelectedLayerwisePolicyInner::Resident(policy) => policy.begin(initial, context),
             MlxSelectedLayerwisePolicyInner::Bounded { policy, .. } => {
                 policy.begin(initial, context)
+            }
+        }
+    }
+
+    fn inspect_unit<E, F, V>(
+        &mut self,
+        ordinal: usize,
+        address: eredu_runtime::ExecutionUnitAddress,
+        build: F,
+        operation: V,
+        context: &Stream,
+    ) -> Result<bool, eredu_runtime::LayerwiseAcquireError<E, Self::Error>>
+    where
+        F: FnOnce(&Stream) -> Result<U, E>,
+        V: FnOnce(&mut U) -> Result<(), Self::Error>,
+    {
+        let &(expected, local) = self.parameter_locations.get(ordinal).ok_or_else(|| {
+            eredu_runtime::LayerwiseAcquireError::Policy(Error::ArchitectureModel(
+                "parameter unit ordinal is outside the selected policy".into(),
+            ))
+        })?;
+        if expected != address {
+            return Err(eredu_runtime::LayerwiseAcquireError::Policy(
+                Error::ArchitectureModel(
+                    "parameter unit address differs from the prepared owner".into(),
+                ),
+            ));
+        }
+        let mut policy = self.inner.lock().map_err(|_| {
+            eredu_runtime::LayerwiseAcquireError::Policy(Error::ArchitectureModel(
+                "selected layerwise policy lock was poisoned".into(),
+            ))
+        })?;
+        match &mut *policy {
+            MlxSelectedLayerwisePolicyInner::Resident(policy) => {
+                policy.inspect_unit(ordinal, local, build, operation, context)
+            }
+            MlxSelectedLayerwisePolicyInner::Bounded { policy, .. } => {
+                policy.inspect_unit(ordinal, local, build, operation, context)
             }
         }
     }

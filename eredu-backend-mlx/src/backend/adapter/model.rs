@@ -46,9 +46,23 @@ impl MlxModel {
     pub(crate) fn with_capture_discovery(
         mut self,
         discovery: eredu_architectures::prepared_sources::PreparedModelDiscovery,
-    ) -> Self {
-        self.capture_discovery = Some(discovery);
-        self
+    ) -> Result<Self, Error> {
+        self.capture_discovery = Some(
+            discovery
+                .bind_partition_parameters(
+                    self.executable
+                        .erased()
+                        .partition_parameter_description()
+                        .cloned(),
+                )
+                .and_then(|discovery| {
+                    discovery.bind_partition_observation_hooks(
+                        self.executable.erased().partition_observation_hooks(),
+                    )
+                })
+                .map_err(|error| Error::Other(Box::new(error)))?,
+        );
+        Ok(self)
     }
 
     pub(crate) fn take_capture_discovery(

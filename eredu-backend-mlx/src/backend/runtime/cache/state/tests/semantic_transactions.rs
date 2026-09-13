@@ -357,7 +357,7 @@ fn paged_transaction_discard_restores_shared_manager_frontier() {
     let branch = canonical.branch().unwrap();
     let manager = match &branch.state.layers[0] {
         MlxKeyValueLayerState::Paged(cache) => cache.manager().clone(),
-        MlxKeyValueLayerState::Device(_) => unreachable!(),
+        MlxKeyValueLayerState::Stateless | MlxKeyValueLayerState::Device(_) => unreachable!(),
     };
     manager.set_tail_state(0, 0, 3).unwrap();
     assert_eq!(manager.report().unwrap().logical_cached_tokens, 3);
@@ -462,7 +462,7 @@ fn mlx_realtime_transaction_paged_rollback_release_resume() {
     let mut branch = canonical.branch().unwrap();
     let manager = match &branch.state.layers[0] {
         MlxKeyValueLayerState::Paged(cache) => cache.manager().clone(),
-        MlxKeyValueLayerState::Device(_) => unreachable!(),
+        MlxKeyValueLayerState::Stateless | MlxKeyValueLayerState::Device(_) => unreachable!(),
     };
     let stream = Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
     let keys = Array::from_slice(&[1.0_f32; 5], &[1, 1, 5, 1]);
@@ -487,4 +487,52 @@ fn mlx_realtime_transaction_paged_rollback_release_resume() {
     canonical.commit_branch(resumed).unwrap();
     assert_eq!(canonical.offset(), 2);
     assert_eq!(manager.report().unwrap().logical_cached_tokens, 2);
+}
+
+#[test]
+fn key_value_profiles_keep_stateless_invocations_empty_through_snapshots() {
+    let layout = StateLayout::new(
+        LayerSchedule::new(
+            2,
+            vec![
+                LayerCachePolicy::key_value(AttentionPolicy::Full, 1, 8).unwrap(),
+                LayerCachePolicy::NoState,
+            ],
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let stream = Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
+    for mut state in [
+        MlxKeyValueState::device(layout.clone()).unwrap(),
+        MlxKeyValueState::paged(layout.clone(), manager(), None).unwrap(),
+    ] {
+        assert!(matches!(state.layers[1], MlxKeyValueLayerState::Stateless));
+        assert_eq!(
+            RuntimeLayerState::<MlxNeuralBackend>::retained_values(&state.layers[1]).count(),
+            0
+        );
+        let keys = Array::from_slice(&[0.5_f32; 8], &[1, 1, 1, 8]);
+        assert!(KeyValueCache::update_for_attention(
+            &mut state.layers[1],
+            keys.clone(),
+            keys.clone(),
+            &stream
+        )
+        .is_err());
+        let isolated = state.isolated_snapshot(&stream).unwrap();
+        assert!(matches!(
+            isolated.layers[1],
+            MlxKeyValueLayerState::Stateless
+        ));
+        let snapshot = state.deep_clone_state().unwrap();
+        KeyValueCache::update_for_attention(&mut state.layers[0], keys.clone(), keys, &stream)
+            .unwrap();
+        assert_eq!(KeyValueCache::offset(&state.layers[0]), 1);
+        state.restore_checkpoint(&snapshot, &stream).unwrap();
+        assert_eq!(KeyValueCache::offset(&state.layers[0]), 0);
+        let branch = state.branch().unwrap();
+        state.commit_branch(branch).unwrap();
+        assert!(matches!(state.layers[1], MlxKeyValueLayerState::Stateless));
+    }
 }

@@ -1,3 +1,174 @@
+#[test]
+#[ignore = "spawns local MLX Ring ranks; run explicitly"]
+fn ring_lfm2_quantized_components_tensor_parallel() {
+    for family in [FixtureFamily::Lfm2, FixtureFamily::Lfm2Moe] {
+        for mode in [
+            WorkerMode::OpaqueComponentCaptureRequantize,
+            WorkerMode::OpaqueComponentCaptureMxFp4,
+        ] {
+            run_ring_cartesian_pipeline_mode(false, family, "tp", mode);
+        }
+    }
+    run_ring_cartesian_pipeline_mode(
+        false,
+        FixtureFamily::Lfm2Moe,
+        "tp",
+        WorkerMode::OpaqueComponentCaptureAddressableBankRequantize,
+    );
+}
+
+#[test]
+#[ignore = "spawns two to eight local MLX Ring ranks; run explicitly"]
+fn ring_lfm2_affine_components_matrix() {
+    for (family, routed) in [(FixtureFamily::Lfm2, false), (FixtureFamily::Lfm2Moe, true)] {
+        run_component_matrix_with_mode(
+            family,
+            routed,
+            WorkerMode::OpaqueComponentCaptureRequantize,
+        );
+    }
+}
+
+#[test]
+#[ignore = "spawns two to eight local MLX Ring ranks; run explicitly"]
+fn ring_lfm2_mxfp4_components_matrix() {
+    for (family, routed) in [(FixtureFamily::Lfm2, false), (FixtureFamily::Lfm2Moe, true)] {
+        run_component_matrix_with_mode(family, routed, WorkerMode::OpaqueComponentCaptureMxFp4);
+    }
+}
+
+#[test]
+#[ignore = "spawns local MLX Ring ranks; run explicitly"]
+fn ring_lfm2_affine_components_unequal_source_target_cuts() {
+    // F32 width 96 splits 48/48; affine groups of 32 split 64/32. Native
+    // materialization must read the exact source regions for the selected cuts.
+    for (family, routed) in [(FixtureFamily::Lfm2, false), (FixtureFamily::Lfm2Moe, true)] {
+        for axes in ["tp", "tp-pp"] {
+            for residency in [
+                WorkerResidency::FullyResident,
+                WorkerResidency::LayerwiseHost,
+                WorkerResidency::DenseDiskStream,
+            ] {
+                eprintln!("LFM2 unequal cuts routed={routed} {axes} {residency:?}");
+                let checkpoint = tempfile::tempdir().unwrap();
+                write_lfm2_fixture_with_component_width(checkpoint.path(), routed, true, 96);
+                let path = checkpoint.path().to_path_buf();
+                run_ring_pipeline_processes(
+                    residency,
+                    family,
+                    WorkerMode::OpaqueComponentCaptureRequantize,
+                    checkpoint,
+                    path,
+                    Some(axes),
+                );
+            }
+        }
+    }
+}
+
+#[test]
+#[ignore = "spawns local MLX Ring ranks; run explicitly"]
+fn ring_kimi_target_components_tensor_parallel() {
+    for family in [FixtureFamily::KimiLinear, FixtureFamily::KimiLinearGguf] {
+        run_ring_cartesian_pipeline_mode(false, family, "tp", WorkerMode::OpaqueComponentCapture);
+    }
+}
+
+#[test]
+#[ignore = "spawns two to eight local MLX Ring ranks; run explicitly"]
+fn ring_kimi_target_components_matrix() {
+    run_component_matrix_with_mode(
+        FixtureFamily::KimiLinear,
+        true,
+        WorkerMode::OpaqueComponentCapture,
+    );
+}
+
+#[test]
+#[ignore = "spawns two to eight local MLX Ring ranks; run explicitly"]
+fn ring_kimi_gguf_target_components_matrix() {
+    run_component_matrix_with_mode(
+        FixtureFamily::KimiLinearGguf,
+        true,
+        WorkerMode::OpaqueComponentCapture,
+    );
+}
+
+#[test]
+#[ignore = "spawns local MLX Ring ranks; run explicitly"]
+fn ring_kimi_addressable_components_tensor_parallel() {
+    for family in [FixtureFamily::KimiLinear, FixtureFamily::KimiLinearGguf] {
+        run_ring_cartesian_pipeline_mode(
+            false,
+            family,
+            "tp",
+            WorkerMode::OpaqueComponentCaptureAddressableBank,
+        );
+    }
+}
+
+#[test]
+#[ignore = "spawns local MLX Ring ranks; run explicitly"]
+fn ring_kimi_quantized_components_tensor_parallel() {
+    for mode in [
+        WorkerMode::OpaqueComponentCaptureRequantize,
+        WorkerMode::OpaqueComponentCaptureMxFp4,
+        WorkerMode::OpaqueComponentCaptureAddressableBankRequantize,
+    ] {
+        run_ring_cartesian_pipeline_mode(false, FixtureFamily::KimiLinear, "tp", mode);
+    }
+}
+
+#[test]
+#[ignore = "spawns two to eight local MLX Ring ranks; run explicitly"]
+fn ring_kimi_affine_components_matrix() {
+    run_component_matrix_with_mode(
+        FixtureFamily::KimiLinear,
+        true,
+        WorkerMode::OpaqueComponentCaptureRequantize,
+    );
+}
+
+#[test]
+#[ignore = "spawns two to eight local MLX Ring ranks; run explicitly"]
+fn ring_kimi_mxfp4_components_matrix() {
+    run_component_matrix_with_mode(
+        FixtureFamily::KimiLinear,
+        true,
+        WorkerMode::OpaqueComponentCaptureMxFp4,
+    );
+}
+
+#[test]
+#[ignore = "spawns two to eight local MLX Ring ranks; run explicitly"]
+fn ring_kimi_addressable_components_matrix() {
+    run_component_matrix_with_mode(
+        FixtureFamily::KimiLinear,
+        true,
+        WorkerMode::OpaqueComponentCaptureAddressableBank,
+    );
+}
+
+#[test]
+#[ignore = "spawns two to eight local MLX Ring ranks; run explicitly"]
+fn ring_kimi_gguf_addressable_components_matrix() {
+    run_component_matrix_with_mode(
+        FixtureFamily::KimiLinearGguf,
+        true,
+        WorkerMode::OpaqueComponentCaptureAddressableBank,
+    );
+}
+
+#[test]
+#[ignore = "spawns two to eight local MLX Ring ranks; run explicitly"]
+fn ring_kimi_affine_addressable_components_matrix() {
+    run_component_matrix_with_mode(
+        FixtureFamily::KimiLinear,
+        true,
+        WorkerMode::OpaqueComponentCaptureAddressableBankRequantize,
+    );
+}
+
 /// Verifies descriptor-backed convolution state, paged KV state, and persisted
 /// replay across two LFM2 pipeline ranks.
 #[test]

@@ -271,22 +271,22 @@ fn routed_only_default_observation_intervenes_on_provider_output() {
         stream: Stream,
     }
 
-    impl eredu_runtime::ActivationObserver<Array, Exception> for Observer {
-        fn observe(&mut self, _: &str, _: &Array) -> Result<(), Exception> {
+    impl eredu_runtime::ActivationObserver<Array, Error> for Observer {
+        fn observe(&mut self, _: &str, _: &Array) -> Result<(), Error> {
             Ok(())
         }
 
         fn observe_routing(
             &mut self,
             observation: eredu_runtime::RoutingObservation<'_, Array>,
-        ) -> Result<(), Exception> {
+        ) -> Result<(), Error> {
             self.routed_only =
                 observation.shared_output.is_none() && observation.combined_output.is_none();
             self.routing_path = Some(observation.path.to_owned());
             Ok(())
         }
 
-        fn intervene(&mut self, path: &str, value: &Array) -> Result<Option<Array>, Exception> {
+        fn intervene(&mut self, path: &str, value: &Array) -> Result<Option<Array>, Error> {
             if self
                 .routing_path
                 .as_deref()
@@ -356,22 +356,22 @@ fn routed_session_observation_reports_shared_combination_and_intervenes_causally
         stream: Stream,
     }
 
-    impl eredu_runtime::ActivationObserver<Array, Exception> for Observer {
-        fn observe(&mut self, _: &str, _: &Array) -> Result<(), Exception> {
+    impl eredu_runtime::ActivationObserver<Array, Error> for Observer {
+        fn observe(&mut self, _: &str, _: &Array) -> Result<(), Error> {
             Ok(())
         }
 
         fn observe_routing(
             &mut self,
             observation: eredu_runtime::RoutingObservation<'_, Array>,
-        ) -> Result<(), Exception> {
+        ) -> Result<(), Error> {
             self.semantic_outputs =
                 observation.shared_output.is_some() && observation.combined_output.is_some();
             self.routing_path = Some(observation.path.to_owned());
             Ok(())
         }
 
-        fn intervene(&mut self, path: &str, value: &Array) -> Result<Option<Array>, Exception> {
+        fn intervene(&mut self, path: &str, value: &Array) -> Result<Option<Array>, Error> {
             let routed_output = self
                 .routing_path
                 .as_deref()

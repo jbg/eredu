@@ -1,3 +1,154 @@
+fn prove_paged_relative_profiles(device: DeviceType) {
+    use crate::MlxTensor;
+    use eredu_nn::RelativeAttentionInput;
+    let context = ExecutionContext::new(Device::new(device, 0));
+    let stream = context.stream();
+    let q = |b: usize, h: usize, t: usize, d: usize| {
+        ((b * 11 + h * 7 + t * 3 + d * 5) % 19) as f32 * 0.07 - 0.6
+    };
+    let k = |b: usize, h: usize, t: usize, d: usize| {
+        ((b * 13 + h * 3 + t * 7 + d) % 17) as f32 * 0.09 - 0.5
+    };
+    let v = |b: usize, h: usize, t: usize, d: usize| {
+        ((b * 5 + h * 11 + t * 13 + d * 3) % 23) as f32 * 0.13 - 1.5
+    };
+    let profile = |b: usize, h: usize, t: usize, d: usize| {
+        ((b * 7 + h * 13 + t * 5 + d * 11) % 29) as f32 * 0.11 - 1.3
+    };
+    let tensor = |heads, start, end, width, f: &dyn Fn(usize, usize, usize, usize) -> f32| {
+        let mut values = Vec::new();
+        for b in 0..2 {
+            for h in 0..heads {
+                for t in start..end {
+                    for d in 0..width {
+                        values.push(f(b, h, t, d));
+                    }
+                }
+            }
+        }
+        MlxTensor::from_array(Array::from_slice(
+            &values,
+            &[2, heads as i32, (end - start) as i32, width as i32],
+        ))
+    };
+    for block in [1, 3] {
+        for window in [None, Some(3)] {
+            let options = PagedCacheOptions::new(block, 4 * block as u64 * 96, 1 << 20, 1)
+                .unwrap()
+                .with_full_attention(true);
+            let manager = CacheResidencyManager::new(options).unwrap();
+            let mut cache = PagedKeyValueCache::new(manager.clone(), 0, window).unwrap();
+            for (start, end) in [(0_usize, 5), (5, 11), (11, 12), (12, 16)] {
+                let queries = tensor(4, start, end, 3, &q);
+                let keys = tensor(2, start, end, 3, &k);
+                let values = tensor(2, start, end, 3, &v);
+                let profiles = tensor(4, start, end, 4, &profile);
+                cache
+                    .update_for_attention(
+                        keys.as_array().clone(),
+                        values.as_array().clone(),
+                        stream,
+                    )
+                    .unwrap();
+                let request = RelativeAttentionInput {
+                    queries: &queries,
+                    keys: &keys,
+                    values: &values,
+                    profiles: &profiles,
+                    query_offset: start as i32,
+                    key_offset: start as i32,
+                    window,
+                    log_scaling_floor: Some(2),
+                    log_scaling_alpha: 0.7,
+                };
+                let actual = cache
+                    .paged_relative_attention(&request, stream)
+                    .unwrap()
+                    .unwrap()
+                    .evaluated()
+                    .unwrap()
+                    .try_to_vec::<f32>()
+                    .unwrap();
+                let all_keys = tensor(2, 0, end, 3, &k);
+                let all_values = tensor(2, 0, end, 3, &v);
+                let contiguous = <crate::backend::nn::shared::MlxNeuralBackend as eredu_nn::NeuralBackend>::relative_attention(
+                    RelativeAttentionInput { keys: &all_keys, values: &all_values, key_offset: 0, ..request }, stream,
+                ).unwrap().as_array().evaluated().unwrap().try_to_vec::<f32>().unwrap();
+                let mut expected = Vec::new();
+                for b in 0..2 {
+                    for h in 0..4 {
+                        for t in start..end {
+                            let first = window.map_or(0, |w| (t + 1).saturating_sub(w as usize));
+                            let tau = if window.is_none() {
+                                1.0 + f64::from(0.7_f32) * (((t + 1) as f64 / 2.0).max(1.0)).ln()
+                            } else {
+                                1.0
+                            };
+                            let scores = (first..=t)
+                                .map(|past| {
+                                    let dot = (0..3)
+                                        .map(|d| {
+                                            f64::from(q(b, h, t, d))
+                                                * f64::from(k(b, h / 2, past, d))
+                                        })
+                                        .sum::<f64>()
+                                        / 3.0;
+                                    let bias = if t - past < 4 {
+                                        f64::from(profile(b, h, t, t - past))
+                                    } else {
+                                        0.0
+                                    };
+                                    tau * (dot + bias)
+                                })
+                                .collect::<Vec<_>>();
+                            let max = scores.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+                            let weights = scores
+                                .iter()
+                                .map(|score| (score - max).exp())
+                                .collect::<Vec<_>>();
+                            for d in 0..3 {
+                                expected.push(
+                                    weights
+                                        .iter()
+                                        .enumerate()
+                                        .map(|(i, w)| w * f64::from(v(b, h / 2, first + i, d)))
+                                        .sum::<f64>()
+                                        / weights.iter().sum::<f64>(),
+                                );
+                            }
+                        }
+                    }
+                }
+                for (i, (actual, expected)) in actual.iter().zip(&expected).enumerate() {
+                    assert!((f64::from(*actual)-expected).abs() < 2e-6, "{device:?} block={block} window={window:?} span={start}..{end} at {i}: {actual} != {expected}");
+                }
+                assert_eq!(actual.len(), expected.len());
+                for (actual, expected) in contiguous.iter().zip(&expected) {
+                    assert!(
+                        (f64::from(*actual) - expected).abs() < 2e-6,
+                        "contiguous relative profile: {actual} != {expected}"
+                    );
+                }
+                let report = manager.report().unwrap();
+                assert!(report.peak_device_bytes <= manager.options().device_budget_bytes());
+            }
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires MLX runtime execution"]
+fn paged_relative_profiles_match_scalar_reference_cpu() {
+    prove_paged_relative_profiles(DeviceType::Cpu);
+}
+
+#[cfg(feature = "metal")]
+#[test]
+#[ignore = "requires a local MLX Metal device"]
+fn paged_relative_profiles_match_scalar_reference_metal() {
+    prove_paged_relative_profiles(DeviceType::Gpu);
+}
+
 #[test]
 #[ignore = "requires MLX runtime execution"]
 fn blockwise_attention_returns_zero_for_fully_false_boolean_mask() {
@@ -220,10 +371,13 @@ fn paged_score_softcap_matches_scalar_masked_gqa_through_chunked_prefill() {
     let stream = context.stream();
     for window in [None, Some(2)] {
         for sink in [None, Some(0.5f32)] {
-            let manager = CacheResidencyManager::new(paged_options(true)).unwrap();
+            let options = PagedCacheOptions::new(2, 96, 256 * 1024, 1)
+                .unwrap()
+                .with_full_attention(true);
+            let manager = CacheResidencyManager::new(options).unwrap();
             let mut cache = PagedKeyValueCache::new(manager, 0, window).unwrap();
             let sinks = sink.map(|s| Array::from_slice(&[s, s], &[2]));
-            for (start, end) in [(0usize, 3usize), (3, 5)] {
+            for (start, end) in [(0usize, 9usize), (9, 16)] {
                 let count = end - start;
                 let keys = Array::from_slice(
                     &(start..end).map(|i| i as f32 * 3.0).collect::<Vec<_>>(),

@@ -760,18 +760,20 @@ fn public_gemma_external_observers_are_causal_exact_and_transactional() {
             DevicePlan::new("mlx", "cpu:0").unwrap(),
             DraftPlacementPlan::Target,
             move |drafter| {
-                drafter.install_external_observers(
-                    ExternalTensorObserver {
-                        trace: installed.clone(),
-                        path: tensor_path,
-                        intervention: tensor_intervention,
-                        stream: Stream::new_with_device(&Device::new(DeviceType::Cpu, 0)),
-                    },
-                    ExternalLogitsObserver {
-                        trace: installed,
-                        intervention: proposal_intervention,
-                    },
-                ).unwrap();
+                drafter
+                    .install_external_observers(
+                        ExternalTensorObserver {
+                            trace: installed.clone(),
+                            path: tensor_path,
+                            intervention: tensor_intervention,
+                            stream: Stream::new_with_device(&Device::new(DeviceType::Cpu, 0)),
+                        },
+                        ExternalLogitsObserver {
+                            trace: installed,
+                            intervention: proposal_intervention,
+                        },
+                    )
+                    .unwrap();
             },
         );
         (result, publications, trace)
@@ -1169,12 +1171,14 @@ fn complete_family_adapters_return_final_output_interventions() {
             observed: bool,
         }
 
-        impl eredu_runtime::ActivationObserver<MlxTensor, safemlx::error::Exception> for ReplacingLogits {
+        impl eredu_runtime::ActivationObserver<MlxTensor, crate::backend::error::Error>
+            for ReplacingLogits
+        {
             fn observe(
                 &mut self,
                 path: &str,
                 _value: &MlxTensor,
-            ) -> Result<(), safemlx::error::Exception> {
+            ) -> Result<(), crate::backend::error::Error> {
                 self.observed |= path == eredu_core::MODEL_LOGITS_OBSERVATION_PATH;
                 Ok(())
             }
@@ -1183,7 +1187,7 @@ fn complete_family_adapters_return_final_output_interventions() {
                 &mut self,
                 path: &str,
                 value: &MlxTensor,
-            ) -> Result<Option<MlxTensor>, safemlx::error::Exception> {
+            ) -> Result<Option<MlxTensor>, crate::backend::error::Error> {
                 Ok(
                     (path == eredu_core::MODEL_LOGITS_OBSERVATION_PATH).then(|| {
                         let value = value.as_array();
@@ -1310,13 +1314,40 @@ fn assert_final_logits_close(actual: &Array, expected: &[f32], tolerance: f32) {
 
 struct ChildGuard {
     children: Vec<Child>,
+    output_readers: Vec<(
+        thread::JoinHandle<std::io::Result<Vec<u8>>>,
+        thread::JoinHandle<std::io::Result<Vec<u8>>>,
+    )>,
 }
 
 impl ChildGuard {
+    fn push(&mut self, mut child: Child) {
+        fn drain(
+            mut pipe: impl std::io::Read + Send + 'static,
+        ) -> thread::JoinHandle<std::io::Result<Vec<u8>>> {
+            thread::spawn(move || {
+                let mut bytes = Vec::new();
+                pipe.read_to_end(&mut bytes)?;
+                Ok(bytes)
+            })
+        }
+        // Workers can fill either pipe while the parent polls their status.
+        // Drain both immediately so diagnostics cannot block a collective.
+        let stdout = drain(child.stdout.take().expect("piped worker stdout"));
+        let stderr = drain(child.stderr.take().expect("piped worker stderr"));
+        self.children.push(child);
+        self.output_readers.push((stdout, stderr));
+    }
+
     fn finish(mut self) -> Vec<Output> {
         self.children
             .drain(..)
-            .map(|child| child.wait_with_output().unwrap())
+            .zip(self.output_readers.drain(..))
+            .map(|(mut child, (stdout, stderr))| Output {
+                status: child.wait().unwrap(),
+                stdout: stdout.join().unwrap().unwrap(),
+                stderr: stderr.join().unwrap().unwrap(),
+            })
             .collect()
     }
 }
@@ -1329,5 +1360,50 @@ impl Drop for ChildGuard {
         for child in &mut self.children {
             let _ = child.wait();
         }
+        for (stdout, stderr) in self.output_readers.drain(..) {
+            let _ = stdout.join();
+            let _ = stderr.join();
+        }
     }
+}
+
+#[test]
+#[ignore = "subprocess helper for ring_worker_output_drains_while_running"]
+fn ring_verbose_output_worker() {
+    use std::io::Write;
+    std::io::stdout().write_all(&vec![b'o'; 256 << 10]).unwrap();
+    std::io::stderr().write_all(&vec![b'e'; 256 << 10]).unwrap();
+}
+
+#[test]
+fn ring_worker_output_drains_while_running() {
+    let mut children = ChildGuard {
+        children: Vec::new(),
+        output_readers: Vec::new(),
+    };
+    children.push(
+        Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::distributed_pipeline_ring::ring_verbose_output_worker",
+                "--ignored",
+                "--nocapture",
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while children.children[0].try_wait().unwrap().is_none() {
+        assert!(Instant::now() < deadline, "worker diagnostics blocked exit");
+        thread::sleep(Duration::from_millis(10));
+    }
+    let output = children.finish().pop().unwrap();
+    assert!(output.status.success());
+    assert!(output
+        .stdout
+        .windows(256 << 10)
+        .any(|bytes| bytes.iter().all(|byte| *byte == b'o')));
+    assert_eq!(output.stderr, vec![b'e'; 256 << 10]);
 }

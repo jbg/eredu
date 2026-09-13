@@ -15,11 +15,11 @@ use eredu_checkpoint::{
     recipe::RecipeCatalog,
 };
 use eredu_checkpoint::{recipe::DerivedWeightRecipe, store::TensorSelection};
-use eredu_checkpoint::{
-    BlockFp8Format, BlockFp8ScaleEncoding, LinearFormat, StoredDtype, WeightQuantization,
-};
+#[cfg(test)]
+use eredu_checkpoint::{BlockFp8Format, BlockFp8ScaleEncoding};
+use eredu_checkpoint::{LinearFormat, StoredDtype, WeightQuantization};
 
-use super::config::{ExpertFormat, LayerPolicy, V3Args, V4Args, V4AttentionPolicy};
+use super::config::{LayerPolicy, V3Args, V4Args, V4AttentionPolicy};
 
 /// Recipes for one independently resident DeepSeek routed expert.
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -593,8 +593,7 @@ pub fn v3_unit_recipes<C: RecipeCatalog + ?Sized>(
         && (layer >= target || args.layer_schedule.get(layer) == Some(&LayerPolicy::SparseMoe))
     {
         let expert = v3_expert_recipes(catalog, args, layer)?;
-        recipes.insert(expert.target_gate_up, expert.gate_up);
-        recipes.insert(expert.target_down, expert.down);
+        recipes.extend(expert_materialization_recipes(catalog, &expert)?);
     }
     Ok(recipes)
 }
@@ -666,6 +665,78 @@ pub fn v4_expert_recipes<C: RecipeCatalog + ?Sized>(
         },
     )
     .map_err(|error| error.to_string())
+}
+
+/// Carries encoded companions through the same expert stacking and gate/up
+/// concatenation as their weights. Source spellings remain family-owned here.
+pub(crate) fn expert_materialization_recipes<C: RecipeCatalog + ?Sized>(
+    catalog: &C,
+    bank: &GatedProductExpertRecipes,
+) -> Result<BTreeMap<String, DerivedWeightRecipe>, String> {
+    fn companion<C: RecipeCatalog + ?Sized>(
+        catalog: &C,
+        weight: &DerivedWeightRecipe,
+        bias: bool,
+    ) -> Result<Option<DerivedWeightRecipe>, String> {
+        let (axis, inputs, stack) = match weight {
+            DerivedWeightRecipe::Source {
+                key,
+                selection: TensorSelection::Full,
+            } => {
+                let prefix = key.strip_suffix(".weight").unwrap_or(key);
+                let names = if bias {
+                    vec![format!("{key}_biases"), format!("{prefix}.biases")]
+                } else {
+                    vec![
+                        format!("{key}_scale_inv"),
+                        format!("{key}_scales"),
+                        format!("{prefix}.weight_scale_inv"),
+                        format!("{prefix}.scale"),
+                        format!("{prefix}.scales"),
+                    ]
+                };
+                return Ok(names
+                    .into_iter()
+                    .find(|name| catalog.tensor_metadata(name).is_ok())
+                    .map(|name| DerivedWeightRecipe::source(name, TensorSelection::Full)));
+            }
+            DerivedWeightRecipe::Stack { axis, inputs } => (*axis, inputs, true),
+            DerivedWeightRecipe::Concatenate { axis, inputs } => (*axis, inputs, false),
+            _ => {
+                return Err("expert companion requires the selected full-source bank layout".into())
+            }
+        };
+        let mapped = inputs
+            .iter()
+            .map(|input| companion(catalog, input, bias))
+            .collect::<Result<Vec<_>, _>>()?;
+        if mapped.iter().all(Option::is_none) {
+            return Ok(None);
+        }
+        let inputs = mapped
+            .into_iter()
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(|| "encoded expert bank has an incomplete companion family".to_string())?;
+        Ok(Some(if stack {
+            DerivedWeightRecipe::Stack { axis, inputs }
+        } else {
+            DerivedWeightRecipe::Concatenate { axis, inputs }
+        }))
+    }
+    let mut outputs = BTreeMap::new();
+    for (target, weight) in [
+        (&bank.target_gate_up, &bank.gate_up),
+        (&bank.target_down, &bank.down),
+    ] {
+        outputs.insert(target.clone(), weight.clone());
+        for (suffix, bias) in [("scales", false), ("biases", true)] {
+            if let Some(recipe) = companion(catalog, weight, bias)? {
+                recipe.infer(catalog).map_err(|error| error.to_string())?;
+                outputs.insert(format!("{target}_{suffix}"), recipe);
+            }
+        }
+    }
+    Ok(outputs)
 }
 
 fn v4_expert_roots(args: &V4Args, layer: usize) -> Result<(String, String), String> {
@@ -794,6 +865,12 @@ pub fn v3_expert_residency_catalog<C: RecipeCatalog + ?Sized>(
         };
         let unit_path = format!("model.layers.{layer}");
         let bank = v3_expert_recipes(catalog, args, layer)?;
+        let policy = if layer < target {
+            super::v3::moe_policy(args, layer)
+        } else {
+            super::v3::prediction_moe_policy(args, layer)
+        }
+        .map_err(|error| error.to_string())?;
         append_expert_residency_units(
             &mut units,
             catalog,
@@ -804,6 +881,7 @@ pub fn v3_expert_residency_catalog<C: RecipeCatalog + ?Sized>(
             experts,
             &bank,
             intermediate.clone(),
+            [policy.expert_gate_up_format, policy.expert_down_format],
         )?;
     }
     crate::ExpertResidencyCatalog::new(units)
@@ -835,6 +913,8 @@ pub fn v4_expert_residency_catalog<C: RecipeCatalog + ?Sized>(
             (format!("mtp.{depth}"), 0, format!("mtp.{depth}"))
         };
         let bank = v4_expert_recipes(catalog, args, layer)?;
+        let policy = super::v4::moe_policy_at(args, layer, &format!("{unit_path}.ffn"))
+            .map_err(|error| error.to_string())?;
         append_expert_residency_units(
             &mut units,
             catalog,
@@ -845,6 +925,7 @@ pub fn v4_expert_residency_catalog<C: RecipeCatalog + ?Sized>(
             experts,
             &bank,
             intermediate.clone(),
+            [policy.expert_gate_up_format, policy.expert_down_format],
         )?;
     }
     crate::ExpertResidencyCatalog::new(units)
@@ -863,32 +944,20 @@ fn append_expert_residency_units<C: RecipeCatalog + ?Sized>(
     experts: usize,
     bank: &GatedProductExpertRecipes,
     intermediate: Option<Range<usize>>,
+    formats: [LinearFormat; 2],
 ) -> Result<(), String> {
     let owner_group =
         eredu_runtime::ExecutionGroupId::new(owner_group).map_err(|error| error.to_string())?;
+    let outputs = expert_materialization_recipes(catalog, bank)?;
     for expert in 0..experts {
-        let recipes = expert_unit_recipes(catalog, bank, expert, intermediate.clone())?;
-        let parameters = [
-            ("gate_up_proj", bank.target_gate_up.clone(), recipes.gate_up),
-            ("down_proj", bank.target_down.clone(), recipes.down),
-        ]
-        .into_iter()
-        .map(|(binding, target, recipe)| {
-            let role = match binding {
-                "gate_up_proj" => crate::ExpertParameterRole::quantizable_projection(
-                    "gate_up_proj_scales",
-                    "gate_up_proj_biases",
-                ),
-                "down_proj" => crate::ExpertParameterRole::quantizable_projection(
-                    "down_proj_scales",
-                    "down_proj_biases",
-                ),
-                _ => crate::ExpertParameterRole::Preserved,
-            };
-            crate::ExpertParameterRecipe::new(binding, target, recipe, role)
-                .map_err(|error| error.to_string())
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+        let parameters = super::encoded_expert_residency::unit_parameters(
+            catalog,
+            bank,
+            &outputs,
+            expert,
+            intermediate.clone(),
+            formats,
+        )?;
         units.push(
             crate::ExpertResidencyUnit::new(
                 eredu_runtime::ParameterBankKey::new(0, identity_layer, expert),
@@ -1255,6 +1324,38 @@ struct V4TensorSpec {
     shape: Vec<usize>,
     operation: TensorOperation,
     format: LinearFormat,
+}
+
+/// Logical matrices consumed by V4's configurable projection operators.
+/// The checkpoint also contains rank-two integer routing tables, additive
+/// compressor positions and dense hyper-connection coefficients. Those retain
+/// their own storage and must never acquire a packed-linear transform merely
+/// because their shapes have two axes.
+pub(crate) fn v4_linear_parameter_shapes(
+    args: &V4Args,
+) -> Result<BTreeMap<String, Vec<usize>>, String> {
+    args.validate().map_err(|error| error.to_string())?;
+    let mut specs = v4_target_specs(args)?;
+    append_v4_draft_specs(&mut specs, args)?;
+    Ok(specs
+        .into_iter()
+        .filter(|spec| {
+            matches!(
+                spec.operation,
+                TensorOperation::Matrix | TensorOperation::MxFp4Matrix
+            )
+        })
+        .filter(|spec| {
+            // Vocabulary lookup and the Markov lookup are constructed as dense
+            // embeddings; hyper functions are parameters of their own operator.
+            spec.name != "embed.weight"
+                && !spec.name.ends_with(".markov_head.markov_w1.weight")
+                && !["hc_head_fn", "hc_attn_fn", "hc_ffn_fn"]
+                    .iter()
+                    .any(|name| spec.name == *name || spec.name.ends_with(&format!(".{name}")))
+        })
+        .map(|spec| (spec.name, spec.shape))
+        .collect())
 }
 
 /// Builds the canonical DeepSeek-V4 SafeTensors catalog plan, including
@@ -1648,17 +1749,7 @@ fn append_v4_experts(
     hidden: usize,
 ) -> Result<(), String> {
     let intermediate = dimension(args.moe_intermediate_size, "expert width")?;
-    let format = match args.expert_format {
-        ExpertFormat::Dense => LinearFormat::Dense,
-        ExpertFormat::MxFp4 => LinearFormat::MxFp4,
-        ExpertFormat::BlockFp8 => match args.linear_format {
-            format @ LinearFormat::E4M3BlockFp8(_) => format,
-            _ => LinearFormat::E4M3BlockFp8(
-                BlockFp8Format::new(128, 128, BlockFp8ScaleEncoding::Ue8m0)
-                    .map_err(|error| error.to_string())?,
-            ),
-        },
-    };
+    let format = args.expert_linear_format();
     for expert in 0..experts {
         for (projection, shape) in [
             ("w1", vec![intermediate, hidden]),
@@ -1759,7 +1850,7 @@ fn append_v4_draft_specs(specs: &mut Vec<V4TensorSpec>, args: &V4Args) -> Result
                 format!("mtp.{last}.hc_head_fn"),
                 vec![streams, stream_hidden],
                 TensorOperation::Matrix,
-                args.linear_format,
+                LinearFormat::Dense,
             ),
             (
                 format!("mtp.{last}.hc_head_base"),
@@ -1832,7 +1923,7 @@ fn append_v4_draft_specs(specs: &mut Vec<V4TensorSpec>, args: &V4Args) -> Result
                     "hc_head_fn",
                     vec![streams, stream_hidden],
                     TensorOperation::Matrix,
-                    args.linear_format,
+                    LinearFormat::Dense,
                 ),
                 (
                     "hc_head_base",
@@ -1924,6 +2015,194 @@ fn checked_add(left: usize, right: usize, name: &str) -> Result<usize, String> {
 mod tests {
     use super::*;
     use crate::deepseek::{parse_v3_config, parse_v4_config};
+
+    #[test]
+    fn encoded_expert_recipes_preserve_complete_companion_geometry() {
+        use eredu_checkpoint::store::{StoreError, TensorMetadata};
+        struct Catalog(BTreeMap<String, TensorMetadata>);
+        impl RecipeCatalog for Catalog {
+            fn tensor_metadata(&self, key: &str) -> Result<TensorMetadata, StoreError> {
+                self.0
+                    .get(key)
+                    .cloned()
+                    .ok_or_else(|| StoreError::UnknownTensor { key: key.into() })
+            }
+        }
+        for mx in [false, true] {
+            let mut catalog = Catalog(BTreeMap::new());
+            for expert in 0..2 {
+                for projection in ["w1", "w3", "w2"] {
+                    for scale in [false, true] {
+                        let root = format!("experts.{expert}.{projection}");
+                        let name = format!(
+                            "{root}.{}",
+                            if scale {
+                                if mx {
+                                    "scale"
+                                } else {
+                                    "weight_scale_inv"
+                                }
+                            } else {
+                                "weight"
+                            }
+                        );
+                        let (shape, dtype, element_bytes) = match (mx, scale) {
+                            (false, false) => (vec![256, 256], StoredDtype::F8E4M3, 1),
+                            (false, true) => (vec![2, 2], StoredDtype::F8E8M0, 1),
+                            (true, false) => (vec![256, 32], StoredDtype::U32, 4),
+                            (true, true) => (vec![256, 8], StoredDtype::U8, 1),
+                        };
+                        catalog.0.insert(
+                            name.clone(),
+                            TensorMetadata {
+                                name,
+                                encoded_byte_len: shape.iter().product::<usize>() as u64
+                                    * element_bytes,
+                                physical_shape: shape.clone(),
+                                logical_shape: shape,
+                                stored_dtype: dtype,
+                                backing_shard: None,
+                            },
+                        );
+                    }
+                }
+            }
+            let bank = resolve_gated_product_expert_recipes(
+                &catalog,
+                &GatedProductExpertLayoutNames {
+                    target_gate_up: "bank.gate_up".into(),
+                    target_down: "bank.down".into(),
+                    packed_gate_up: "bank.gate_up".into(),
+                    packed_down: "bank.down".into(),
+                    separate_gate: "bank.gate".into(),
+                    separate_up: "bank.up".into(),
+                    separate_down: "bank.down".into(),
+                    independent: (0..2)
+                        .map(|expert| IndependentGatedProductExpertNames {
+                            gate: format!("experts.{expert}.w1.weight"),
+                            up: format!("experts.{expert}.w3.weight"),
+                            down: format!("experts.{expert}.w2.weight"),
+                        })
+                        .collect(),
+                },
+            )
+            .unwrap();
+            let outputs = expert_materialization_recipes(&catalog, &bank).unwrap();
+            assert_eq!(outputs.len(), 4);
+            let scales = outputs["bank.gate_up_scales"].infer(&catalog).unwrap();
+            assert_eq!(
+                scales.shape(),
+                if mx { &[2, 512, 8][..] } else { &[2, 4, 2][..] }
+            );
+            let down = outputs["bank.down_scales"].infer(&catalog).unwrap();
+            assert_eq!(
+                down.shape(),
+                if mx { &[2, 256, 8][..] } else { &[2, 2, 2][..] }
+            );
+            assert_eq!(outputs["bank.gate_up_scales"].source_keys().len(), 4);
+            let format = if mx {
+                LinearFormat::MxFp4
+            } else {
+                LinearFormat::E4M3BlockFp8(
+                    BlockFp8Format::new(128, 128, BlockFp8ScaleEncoding::Ue8m0).unwrap(),
+                )
+            };
+            let parameters = super::super::encoded_expert_residency::unit_parameters(
+                &catalog,
+                &bank,
+                &outputs,
+                1,
+                Some(128..256),
+                [format; 2],
+            )
+            .unwrap();
+            assert_eq!(parameters.len(), 4);
+            for parameter in &parameters {
+                assert_eq!(parameter.role(), &crate::ExpertParameterRole::Preserved);
+                assert!(parameter
+                    .recipe()
+                    .source_keys()
+                    .iter()
+                    .all(|key| key.starts_with("experts.1.")));
+                let expected = match (mx, parameter.binding_name()) {
+                    (false, "gate_up_proj") => vec![1, 256, 256],
+                    (false, "gate_up_proj_scales") => vec![1, 2, 2],
+                    (false, "down_proj") => vec![1, 256, 128],
+                    (false, "down_proj_scales") => vec![1, 2, 1],
+                    (true, "gate_up_proj") => vec![1, 256, 32],
+                    (true, "gate_up_proj_scales") => vec![1, 256, 8],
+                    (true, "down_proj") => vec![1, 256, 16],
+                    (true, "down_proj_scales") => vec![1, 256, 4],
+                    other => panic!("unexpected encoded expert parameter {other:?}"),
+                };
+                assert_eq!(
+                    parameter.recipe().infer(&catalog).unwrap().shape(),
+                    expected
+                );
+            }
+            assert!(super::super::encoded_expert_residency::unit_parameters(
+                &catalog,
+                &bank,
+                &outputs,
+                1,
+                Some(1..129),
+                [format; 2],
+            )
+            .unwrap_err()
+            .contains("encoded contraction block"));
+            let weights_only = outputs
+                .iter()
+                .filter(|(key, _)| !key.ends_with("_scales"))
+                .map(|(key, recipe)| (key.clone(), recipe.clone()))
+                .collect();
+            assert!(super::super::encoded_expert_residency::unit_parameters(
+                &catalog,
+                &bank,
+                &weights_only,
+                1,
+                None,
+                [format; 2],
+            )
+            .unwrap_err()
+            .contains("missing required companions"));
+            let mut units = Vec::new();
+            append_expert_residency_units(
+                &mut units,
+                &catalog,
+                0,
+                "target",
+                0,
+                "layers.0",
+                2,
+                &bank,
+                None,
+                [format; 2],
+            )
+            .unwrap();
+            let residency = crate::ExpertResidencyCatalog::new(units).unwrap();
+            let unowned = crate::routed_text::unowned_expert_sources(&residency, &[0]);
+            assert_eq!(
+                unowned.len(),
+                6,
+                "off-rank weights and all three scale sources are declared"
+            );
+            assert!(unowned.iter().all(|key| key.starts_with("experts.1.")));
+            assert_eq!(
+                unowned
+                    .iter()
+                    .filter(|key| key.ends_with(".weight"))
+                    .count(),
+                3
+            );
+            catalog.0.remove(&format!(
+                "experts.1.w3.{}",
+                if mx { "scale" } else { "weight_scale_inv" }
+            ));
+            assert!(expert_materialization_recipes(&catalog, &bank)
+                .unwrap_err()
+                .contains("incomplete companion"));
+        }
+    }
 
     #[test]
     fn expert_unit_recipe_owns_segmented_rank_local_selection() {
@@ -2214,6 +2493,10 @@ mod tests {
             tensor("layers.0.hc_attn_fn").dtype,
             StoredDtypeConstraint::Floating
         );
+        assert_eq!(
+            tensor("mtp.0.hc_head_fn").dtype,
+            StoredDtypeConstraint::Floating
+        );
         assert!(!plan
             .common_tensors
             .iter()
@@ -2227,6 +2510,22 @@ mod tests {
             StoredDtypeConstraint::Exact(StoredDtype::U32)
         );
         assert_eq!(tensor("layers.0.ffn.experts.0.w1.scale").shape, vec![64, 4]);
+        let projections = v4_linear_parameter_shapes(&args).unwrap();
+        assert_eq!(
+            projections["layers.0.ffn.experts.0.w1.weight"],
+            vec![64, 128]
+        );
+        assert_eq!(projections["layers.0.attn.wq_a.weight"], vec![32, 128]);
+        assert_eq!(projections["mtp.0.main_proj.weight"][0], 128);
+        for parameter in [
+            "layers.0.ffn.gate.tid2eid",
+            "layers.0.hc_attn_fn",
+            "layers.1.attn.compressor.ape",
+            "mtp.0.hc_head_fn",
+            "mtp.0.markov_head.markov_w1.weight",
+        ] {
+            assert!(!projections.contains_key(parameter), "{parameter}");
+        }
         assert!(plan
             .common_tensors
             .iter()

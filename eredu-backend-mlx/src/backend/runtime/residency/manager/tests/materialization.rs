@@ -228,7 +228,11 @@ fn unsupported_owner_binding_fails_preflight_before_any_payload_read() {
         ],
     )
     .unwrap();
-    let result = preflight_residency_owner_bindings(store.as_ref(), &control);
+    let sources = ResidencySources {
+        primary: store.clone(),
+        units: BTreeMap::new(),
+    };
+    let result = preflight_residency_owner_bindings(&sources, &control);
     assert!(matches!(result, Err(ResidencyError::BindingPreflight(_))));
     assert_eq!(
         store.source_diagnostics().unwrap().physical_reads,
@@ -348,21 +352,42 @@ fn resident_units_batch_direct_reads_across_reordered_parameters() {
     let manager = manager(
         Arc::clone(&store),
         OffloadConfig::new(Some(24), Some(0), 1).unwrap(),
-        [spec("resident", 24, ResidencyPolicy::Pinned, MemoryTier::Device)],
-        [unit("resident", [
-            binding("first", "c", TensorSelection::Full, 8),
-            binding("second", "a", TensorSelection::Full, 8),
-            binding("third", "b", TensorSelection::Full, 8),
-        ])],
+        [spec(
+            "resident",
+            24,
+            ResidencyPolicy::Pinned,
+            MemoryTier::Device,
+        )],
+        [unit(
+            "resident",
+            [
+                binding("first", "c", TensorSelection::Full, 8),
+                binding("second", "a", TensorSelection::Full, 8),
+                binding("third", "b", TensorSelection::Full, 8),
+            ],
+        )],
     );
     manager.initialize().unwrap();
-    let lease = manager.acquire(&id("resident"), MemoryTier::Device).unwrap();
+    let lease = manager
+        .acquire(&id("resident"), MemoryTier::Device)
+        .unwrap();
     for (name, expected) in [("first", [5, 6]), ("second", [1, 2]), ("third", [3, 4])] {
-        assert_eq!(lease.device_value(name).unwrap().evaluated().unwrap().as_slice::<i32>(), expected);
+        assert_eq!(
+            lease
+                .device_value(name)
+                .unwrap()
+                .evaluated()
+                .unwrap()
+                .as_slice::<i32>(),
+            expected
+        );
     }
     let diagnostics = store.source_diagnostics().unwrap();
     #[cfg(unix)]
     assert_eq!(diagnostics.physical_reads, 1);
-    assert_eq!(diagnostics.physical_read_bytes, 24, "the unselected matrix is not read");
+    assert_eq!(
+        diagnostics.physical_read_bytes, 24,
+        "the unselected matrix is not read"
+    );
     assert_eq!(diagnostics.currently_cached_shards, 0);
 }

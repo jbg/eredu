@@ -37,6 +37,7 @@ pub(crate) mod autoregressive;
 mod completion;
 mod execution_streams;
 mod sampling;
+pub(crate) mod state_snapshot;
 
 pub use assistant::MlxDrafter;
 pub(crate) use assistant::{

@@ -413,6 +413,12 @@ impl<P> AdmittedCompositeInput<P> {
         &self.parts
     }
 
+    /// Admitted decoder batch and sequence dimensions after assembling all parts.
+    /// Current composite ingress contracts validate one sequence per request.
+    pub const fn decoder_shape(&self) -> [u64; 2] {
+        [1, self.decoder_positions]
+    }
+
     /// Total decoder positions occupied by all ordered parts.
     pub const fn decoder_positions(&self) -> u64 {
         self.decoder_positions

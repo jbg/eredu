@@ -1,5 +1,7 @@
 //! Composite Qwen3-VL lifecycle over the shared vision tower and ordinary Qwen decoder.
 
+mod observation;
+
 use eredu_core::cache::StateTensorRole;
 use eredu_nn::{
     multimodal::{assemble_ordered_inputs, OrderedInputPart},
@@ -16,8 +18,8 @@ use eredu_runtime::{
 
 use crate::decoder::static_parallel_parameter_groups;
 use crate::qwen::vision::{
-    block_parallel_parameter_groups, static_parallel_parameter_groups as vision_parameter_groups,
-    VisionBlock, VisionInput, VisionMode, VisionState, VisionStatic,
+    block_parallel_parameter_groups, VisionBlock, VisionInput, VisionMode, VisionState,
+    VisionStatic,
 };
 use crate::qwen::{self, AttentionInput};
 use crate::{
@@ -645,6 +647,35 @@ where
     S: LayerRuntimeState<B>,
     S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
 {
+    fn routed_unit_observations(&self) -> bool {
+        true
+    }
+    fn routed_sparse_observations(&self) -> bool {
+        true
+    }
+    fn forward_unit_observed_with_provider<P, O>(
+        &mut self,
+        group: usize,
+        index: usize,
+        unit: &mut Self::Unit,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &mut Self::ForwardContext,
+        pass: ExpertPass,
+        provider: &mut P,
+        context: &<B::Tensor as Tensor>::Context,
+        observer: &mut O,
+    ) -> Result<B::Tensor, Error>
+    where
+        P: RoutedExpertProvider<B>,
+        P::Error: std::fmt::Display,
+        O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
+    {
+        self.forward_components(
+            group, index, unit, hidden, state, forward, pass, provider, context, observer,
+        )
+    }
+
     fn forward_unit_with_provider<P>(
         &mut self,
         group: usize,
@@ -673,6 +704,36 @@ where
     S: LayerRuntimeState<B>,
     S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
 {
+    fn parallel_routed_unit_observations(&self) -> bool {
+        true
+    }
+    fn parallel_routed_sparse_observations(&self) -> bool {
+        true
+    }
+    fn forward_unit_parallel_observed_with_provider<P, O>(
+        &mut self,
+        group: usize,
+        index: usize,
+        unit: &mut Self::Unit,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &mut Self::ForwardContext,
+        pass: ExpertPass,
+        provider: &mut P,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+        observer: &mut O,
+    ) -> Result<B::Tensor, Error>
+    where
+        P: eredu_runtime::TensorParallelRoutedExpertProvider<B>,
+        P::Error: std::fmt::Display,
+        O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
+    {
+        self.forward_components_parallel(
+            group, index, unit, hidden, state, forward, pass, provider, parallel, context, observer,
+        )
+    }
+
     fn forward_unit_parallel_with_provider<P>(
         &mut self,
         group: usize,
@@ -1076,6 +1137,45 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend>
 }
 
 impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<B> {
+    fn add_deepstack(
+        &self,
+        index: usize,
+        output: B::Tensor,
+        forward: &ForwardContext<B::Tensor>,
+        context: &<B::Tensor as Tensor>::Context,
+        instrumentation: &mut crate::decoder::ComponentInstrumentation<'_, B::Tensor>,
+    ) -> Result<B::Tensor, Error> {
+        let Some(features) = forward.deepstack.get(index) else {
+            return Ok(output);
+        };
+        instrumentation.observe("deepstack.input", &output)?;
+        let output = if features.shape() == output.shape() {
+            if instrumentation.enabled() {
+                output.add(
+                    &instrumentation.apply("deepstack.output", features.clone())?,
+                    context,
+                )?
+            } else {
+                output.add(features, context)?
+            }
+        } else {
+            let source = features.index(&[Index::At(0), Index::Full, Index::Full], context)?;
+            let contribution = output.zeros_like(context)?.masked_scatter(
+                forward
+                    .visual_mask
+                    .as_ref()
+                    .ok_or_else(|| Error::backend("missing Qwen3-VL visual mask"))?,
+                &source,
+                context,
+            )?;
+            output.add(
+                &instrumentation.apply("deepstack.output", contribution)?,
+                context,
+            )?
+        };
+        instrumentation.apply("deepstack.residual", output)
+    }
+
     fn text_state_ordinal(&self, global_unit: usize) -> Result<usize, Error> {
         let Some(geometry) = self.partition_geometry.as_deref() else {
             return Ok(global_unit);
@@ -1362,13 +1462,18 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
             &self.args.text.parameter_root,
         )
         .map_err(Error::backend)?;
-        let vision_static =
-            vision_parameter_groups::<B>(vision_modules, &self.args.vision, "model.visual")
-                .map_err(Error::backend)?;
+        let vision_static = crate::qwen::vision::owned_static_parallel_parameter_groups::<B>(
+            vision_modules,
+            &self.args.vision,
+            "model.visual",
+            eredu_runtime::ExecutionGroupId::new(VISION_EXECUTION_GROUP).map_err(Error::backend)?,
+            "vision",
+        )
+        .map_err(Error::backend)?;
         let mut expected = text_static
             .iter()
-            .chain(&vision_static)
             .cloned()
+            .chain(vision_static.iter().map(|owned| owned.group().clone()))
             .collect::<Vec<_>>();
         let mut owned = text_static
             .into_iter()
@@ -1387,9 +1492,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
                     group,
                 )
             })
-            .chain(vision_static.into_iter().map(|group| {
-                OwnedParameterGroupSpec::new(ParameterGroupOwner::static_role("vision"), group)
-            }))
+            .chain(vision_static)
             .collect::<Vec<_>>();
         for (group_index, &count) in counts.iter().enumerate() {
             let group_id = layout
@@ -2141,7 +2244,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
                 let mask = forward.mask.as_ref();
                 let cosine = &forward.rotary.0;
                 let sine = &forward.rotary.1;
-                let mut output = block.forward_with_feed_forward(
+                let output = block.forward_with_feed_forward(
                     AttentionInput {
                         hidden,
                         mask,
@@ -2161,28 +2264,13 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
                             .reshape(&shape, context)
                     },
                 )?;
-                if let Some(features) = forward.deepstack.get(index) {
-                    output = if features.shape().iter().eq(output.shape()) {
-                        output.add(features, context)?
-                    } else {
-                        let source =
-                            features.index(&[Index::At(0), Index::Full, Index::Full], context)?;
-                        output.add(
-                            &output.zeros_like(context)?.masked_scatter(
-                                forward.visual_mask.as_ref().ok_or_else(|| {
-                                    Error::backend(format!(
-                                        "missing Qwen3-VL visual mask for DeepStack shape {:?} and output shape {:?}",
-                                        features.shape(),
-                                        output.shape(),
-                                    ))
-                                })?,
-                                &source,
-                                context,
-                            )?,
-                            context,
-                        )?
-                    };
-                }
+                let output = self.add_deepstack(
+                    index,
+                    output,
+                    forward,
+                    context,
+                    &mut crate::decoder::ComponentInstrumentation::disabled(),
+                )?;
                 Ok(output)
             }
             _ => Err(Error::backend("Qwen3-VL unit/group mismatch")),
@@ -2238,7 +2326,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
                 let mask = forward.mask.as_ref();
                 let cosine = &forward.rotary.0;
                 let sine = &forward.rotary.1;
-                let mut output = block.forward_tensor_parallel_with_feed_forward(
+                let output = block.forward_tensor_parallel_with_feed_forward(
                     AttentionInput {
                         hidden,
                         mask,
@@ -2261,28 +2349,13 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
                             .reshape(&shape, context)
                     },
                 )?;
-                if let Some(features) = forward.deepstack.get(index) {
-                    output = if features.shape().iter().eq(output.shape()) {
-                        output.add(features, context)?
-                    } else {
-                        let source =
-                            features.index(&[Index::At(0), Index::Full, Index::Full], context)?;
-                        output.add(
-                            &output.zeros_like(context)?.masked_scatter(
-                                forward.visual_mask.as_ref().ok_or_else(|| {
-                                    Error::backend(format!(
-                                        "missing Qwen3-VL visual mask for DeepStack shape {:?} and output shape {:?}",
-                                        features.shape(),
-                                        output.shape(),
-                                    ))
-                                })?,
-                                &source,
-                                context,
-                            )?,
-                            context,
-                        )?
-                    };
-                }
+                let output = self.add_deepstack(
+                    index,
+                    output,
+                    forward,
+                    context,
+                    &mut crate::decoder::ComponentInstrumentation::disabled(),
+                )?;
                 Ok(output)
             }
             _ => Err(Error::backend("Qwen3-VL parallel unit/group mismatch")),
@@ -2296,6 +2369,54 @@ where
     S: LayerRuntimeState<B>,
     S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
 {
+    fn observation_hooks(&self) -> eredu_runtime::inspection::ObservationHookSupport {
+        eredu_runtime::inspection::ObservationHookSupport::internal(true, true, true)
+            .with_routed_units(true)
+    }
+    fn forward_unit_observed<O>(
+        &mut self,
+        group: usize,
+        index: usize,
+        unit: &mut Self::Unit,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &mut Self::ForwardContext,
+        context: &<B::Tensor as Tensor>::Context,
+        observer: &mut O,
+    ) -> Result<B::Tensor, Error>
+    where
+        O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
+    {
+        let pass = <Self as RoutedLayeredArchitecture<B, S>>::expert_pass_for_unit(
+            self, group, index, hidden, forward,
+        );
+        self.forward_components(
+            group,
+            index,
+            unit,
+            hidden,
+            state,
+            forward,
+            pass,
+            &mut eredu_runtime::ResidentExpertProvider,
+            context,
+            observer,
+        )
+    }
+    fn finish_forward_observed<O>(
+        &mut self,
+        hidden: &B::Tensor,
+        _state: &mut S,
+        _forward: &Self::ForwardContext,
+        context: &<B::Tensor as Tensor>::Context,
+        observer: &mut O,
+    ) -> Result<B::Tensor, Error>
+    where
+        O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
+    {
+        self.finish_components(hidden, None, context, observer)
+    }
+
     type Input<'a> = ModelInput<'a, B::Tensor>;
     type StaticModules = StaticModules<B>;
     type Unit = Unit<B>;
@@ -2639,7 +2760,7 @@ where
                     self.ensure_visual_mask(forward, context)?;
                 }
                 let state_ordinal = self.text_state_ordinal(index)?;
-                let mut output = block.forward(
+                let output = block.forward(
                     AttentionInput {
                         hidden,
                         mask: forward.mask.as_ref(),
@@ -2656,28 +2777,13 @@ where
                     },
                     context,
                 )?;
-                if let Some(features) = forward.deepstack.get(index) {
-                    output = if features.shape().iter().eq(output.shape()) {
-                        output.add(features, context)?
-                    } else {
-                        let source =
-                            features.index(&[Index::At(0), Index::Full, Index::Full], context)?;
-                        output.add(
-                            &output.zeros_like(context)?.masked_scatter(
-                                forward.visual_mask.as_ref().ok_or_else(|| {
-                                    Error::backend(format!(
-                                        "missing Qwen3-VL visual mask for DeepStack shape {:?} and output shape {:?}",
-                                        features.shape(),
-                                        output.shape(),
-                                    ))
-                                })?,
-                                &source,
-                                context,
-                            )?,
-                            context,
-                        )?
-                    };
-                }
+                let output = self.add_deepstack(
+                    index,
+                    output,
+                    forward,
+                    context,
+                    &mut crate::decoder::ComponentInstrumentation::disabled(),
+                )?;
                 Ok(output)
             }
             _ => Err(Error::backend("Qwen3-VL unit/group mismatch")),
@@ -2754,6 +2860,58 @@ where
     S: LayerRuntimeState<B>,
     S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
 {
+    fn parallel_observation_hooks(&self) -> eredu_runtime::inspection::ObservationHookSupport {
+        eredu_runtime::inspection::ObservationHookSupport::internal(true, true, true)
+            .with_routed_units(true)
+    }
+
+    fn forward_unit_parallel_observed<O>(
+        &mut self,
+        group: usize,
+        index: usize,
+        unit: &mut Self::Unit,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &mut Self::ForwardContext,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+        observer: &mut O,
+    ) -> Result<B::Tensor, Error>
+    where
+        O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
+    {
+        let pass = <Self as RoutedLayeredArchitecture<B, S>>::expert_pass_for_unit(
+            self, group, index, hidden, forward,
+        );
+        self.forward_components_parallel(
+            group,
+            index,
+            unit,
+            hidden,
+            state,
+            forward,
+            pass,
+            &mut eredu_runtime::ResidentExpertProvider,
+            parallel,
+            context,
+            observer,
+        )
+    }
+    fn finish_forward_parallel_observed<O>(
+        &mut self,
+        hidden: &B::Tensor,
+        _state: &mut S,
+        _forward: &Self::ForwardContext,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+        observer: &mut O,
+    ) -> Result<B::Tensor, Error>
+    where
+        O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
+    {
+        self.finish_components(hidden, Some(parallel), context, observer)
+    }
+
     fn begin_forward_parallel<'a>(
         &mut self,
         input: Self::Input<'a>,
@@ -2988,6 +3146,35 @@ where
     S: LayerRuntimeState<B>,
     S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
 {
+    fn partition_observation_hooks(
+        &self,
+        _tensor_parallel: bool,
+    ) -> eredu_runtime::inspection::ObservationHookSupport {
+        eredu_runtime::inspection::ObservationHookSupport::internal(true, true, true)
+            .with_routed_units(true)
+    }
+    fn finish_partition_observed<O>(
+        &mut self,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &Self::ForwardContext,
+        owns_output: bool,
+        parallel: Option<&B::ParallelContext>,
+        context: &<B::Tensor as Tensor>::Context,
+        observer: &mut O,
+    ) -> Result<LayeredPartitionOutput<B::Tensor, PipelineBoundary<B::Tensor>>, Error>
+    where
+        O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
+    {
+        if !owns_output {
+            return self.finish_partition(hidden, state, forward, false, parallel, context);
+        }
+        Ok(LayeredPartitionOutput::Final {
+            output: self.finish_components(hidden, parallel, context, observer)?,
+            retained: None,
+        })
+    }
+
     type Boundary = PipelineBoundarySchema;
 
     fn boundary_schema(&self) -> Result<Self::Boundary, Self::Error> {

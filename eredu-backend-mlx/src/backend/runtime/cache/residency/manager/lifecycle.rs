@@ -44,6 +44,7 @@ impl CacheResidencyManager {
                     background_disk_error: None,
                     lifecycle: CacheBlockLifecycle::new(),
                     blocks: BTreeMap::new(),
+                    history_retentions: Vec::new(),
                     host_write_reservations: HashMap::new(),
                     retiring_host_demotions: HashMap::new(),
                     retiring_disk_reads: HashMap::new(),
@@ -455,7 +456,32 @@ impl CacheResidencyManager {
         Ok(())
     }
 
-    /// Discards layer blocks entirely before the visible window.
+    /// Retains a checkpoint's sealed sliding prefix without materializing it.
+    /// Existing blocks remain charged to this manager and its finite pool, and
+    /// may still move between tiers. Dead metadata is pruned on every admission
+    /// and discard; live storage is proportional to outstanding checkpoints.
+    pub(crate) fn retain_history(
+        &self,
+        global_layer: usize,
+        representation: CacheRepresentation,
+        start: i64,
+        end: i64,
+    ) -> Result<Arc<CacheHistoryRetention>, CacheResidencyError> {
+        let mut state = self.lock()?;
+        state
+            .history_retentions
+            .retain(|entry| entry.strong_count() > 0);
+        let retained = Arc::new(CacheHistoryRetention {
+            global_layer,
+            representation,
+            start,
+            end,
+        });
+        state.history_retentions.push(Arc::downgrade(&retained));
+        Ok(retained)
+    }
+
+    /// Discards layer blocks entirely before every live checkpoint's window.
     pub fn discard_before(
         &self,
         layer: usize,
@@ -467,6 +493,9 @@ impl CacheResidencyManager {
             return Ok(());
         }
         let mut state = self.lock()?;
+        state
+            .history_retentions
+            .retain(|entry| entry.strong_count() > 0);
         let ids = state
             .blocks
             .iter()
@@ -477,6 +506,11 @@ impl CacheResidencyManager {
                     && id.end > prefix_tokens
                     && state.lifecycle.lease_count(id).ok() == Some(0)
                     && !record.imported
+                    && !state.history_retentions.iter().any(|entry| {
+                        entry
+                            .upgrade()
+                            .is_some_and(|retained| retained.contains(id))
+                    })
             })
             .map(|(id, _)| id.clone())
             .collect::<Vec<_>>();

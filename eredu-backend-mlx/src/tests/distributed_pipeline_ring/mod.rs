@@ -82,10 +82,15 @@ const EXPECTED_UNSUPPORTED_DIRECT_PARTITION: &str =
     "EREDU_PIPELINE_EXPECTED_UNSUPPORTED_DIRECT_PARTITION";
 const OPAQUE_INSPECTION: &str = "EREDU_PIPELINE_OPAQUE_INSPECTION";
 const OPAQUE_TEXT_GENERATION: &str = "EREDU_PIPELINE_OPAQUE_TEXT_GENERATION";
+const OPAQUE_COMPONENT_CAPTURE: &str = "EREDU_PIPELINE_COMPONENT_CAPTURE";
+const COMPONENT_CAPTURE_MEDIA: &str = "EREDU_PIPELINE_COMPONENT_CAPTURE_MEDIA";
+const COMPONENT_CAPTURE_PATCH_WIDTH: &str = "EREDU_PIPELINE_COMPONENT_CAPTURE_PATCH_WIDTH";
+const OPAQUE_PROVIDER_FAILURE: &str = "EREDU_PIPELINE_PROVIDER_FAILURE";
 const OPAQUE_MUSE_IMAGE: &str = "EREDU_PIPELINE_OPAQUE_MUSE_IMAGE";
 const OPAQUE_INKLING_MEDIA: &str = "EREDU_PIPELINE_OPAQUE_INKLING_MEDIA";
 const OPAQUE_QWEN_CONDITIONAL_MEDIA: &str = "EREDU_PIPELINE_OPAQUE_QWEN_CONDITIONAL_MEDIA";
 const OPAQUE_INKLING_MTP: &str = "EREDU_PIPELINE_OPAQUE_INKLING_MTP";
+const OPAQUE_INKLING_COMPONENTS: &str = "EREDU_PIPELINE_OPAQUE_INKLING_COMPONENTS";
 const OPAQUE_QWEN_HYBRID_MTP: &str = "EREDU_PIPELINE_OPAQUE_QWEN_HYBRID_MTP";
 const OPAQUE_NEMOTRON_H_MTP: &str = "EREDU_PIPELINE_OPAQUE_NEMOTRON_H_MTP";
 const OPAQUE_DEEPSEEK_MTP_TARGET: &str = "EREDU_PIPELINE_OPAQUE_DEEPSEEK_MTP_TARGET";
@@ -133,6 +138,10 @@ impl TokenFilterController for AllowAllTokens {
 }
 
 impl SpeculativeTokenFilterController for AllowAllTokens {
+    fn control_snapshot_bytes(&self) -> Option<u64> {
+        Some(0)
+    }
+
     fn filter_at(&self, _history: &[u32]) -> Result<TokenFilter, Self::Error> {
         Ok(TokenFilter::All)
     }
@@ -148,6 +157,14 @@ struct TokenOnlySemanticState {
 }
 
 impl SpeculativeSemanticState for TokenOnlySemanticState {
+    fn control_snapshot_bytes(&self) -> Option<u64> {
+        // This token-only fixture has no decoder/parser history. Snapshot only
+        // after committed events have been delivered, like its fork contract.
+        self.events
+            .is_empty()
+            .then_some(std::mem::size_of::<Self>() as u64 + 256)
+    }
+
     fn fork_box(&self) -> Result<Box<dyn SpeculativeSemanticState>, SpeculativeOutputError> {
         let mut fork = self.clone();
         fork.events.clear();
@@ -193,6 +210,23 @@ fn execute_neutral_embedded_mtp<'world>(
     Result<eredu_core::SpeculativeGenerationOutput, crate::backend::error::Error>,
     usize,
 ) {
+    execute_neutral_embedded_mtp_with(
+        runtime,
+        prompt,
+        config,
+        eredu_runtime::RunSpeculativeGeneration::default(),
+    )
+}
+
+fn execute_neutral_embedded_mtp_with<'world, V: eredu_core::SpeculativeGenerationVisitor>(
+    runtime: &mut ModelRuntime<MlxBackend<'world>>,
+    prompt: crate::composition::mlx::MlxModelInput,
+    config: SpeculativeConfig,
+    visitor: V,
+) -> (
+    Result<eredu_core::SpeculativeGenerationOutput, crate::backend::error::Error>,
+    usize,
+) {
     let sampling = eredu_core::resolve_generation_config(
         None,
         eredu_core::GenerationConfigOverrides {
@@ -221,7 +255,7 @@ fn execute_neutral_embedded_mtp<'world>(
             )],
             [0; 32],
         ),
-        eredu_runtime::RunSpeculativeGeneration::default(),
+        visitor,
     )
     .map(|output| output.into_requests().into_iter().next().unwrap());
     (output, publications.load(Ordering::Relaxed))

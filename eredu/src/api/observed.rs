@@ -54,6 +54,7 @@ pub struct PreparedObservedGeneration {
     pub(super) intervention: Option<AdmittedInterventionPlan>,
     pub(super) session_identity: String,
     pub(super) artifact_identity: Option<String>,
+    pub(super) parameter_overlay_id: Option<String>,
     pub(super) trace_limits: TraceLimits,
 }
 
@@ -92,6 +93,9 @@ pub struct ObservedGenerationRecord {
     /// Session/source-bound intervention identity, absent for an ordinary run.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub intervention_plan_id: Option<String>,
+    /// Active parameter transaction; absent for baseline model parameters.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parameter_overlay_id: Option<String>,
     /// Ordered generation progress or terminal outcome.
     pub event: ObservedGenerationEvent,
 }
@@ -262,7 +266,32 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
         intervention: InterventionPlan,
         trace_limits: TraceLimits,
     ) -> Result<PreparedObservedGeneration, PreparedChatError> {
-        let mut prepared = self.prepare_observed_chat(chat, settings, capture, trace_limits)?;
+        let prepared = self.prepare_observed_chat(chat, settings, capture, trace_limits)?;
+        self.admit_prepared_interventions(prepared, intervention)
+    }
+
+    /// Admits an exact token-ID prefix with prospective interventions. The chat
+    /// supplies the output/termination contract only; the prefix is never decoded
+    /// or re-tokenized. Start from reset state or a prepared-boundary snapshot.
+    pub fn prepare_intervened_token_ids(
+        &self,
+        chat: &PreparedChat,
+        prefix: Vec<u32>,
+        settings: PreparedChatGenerationSettings,
+        capture: CapturePlan,
+        intervention: InterventionPlan,
+        trace_limits: TraceLimits,
+    ) -> Result<PreparedObservedGeneration, PreparedChatError> {
+        let prepared =
+            self.prepare_observed_token_ids(chat, prefix, settings, capture, trace_limits)?;
+        self.admit_prepared_interventions(prepared, intervention)
+    }
+
+    fn admit_prepared_interventions(
+        &self,
+        mut prepared: PreparedObservedGeneration,
+        intervention: InterventionPlan,
+    ) -> Result<PreparedObservedGeneration, PreparedChatError> {
         if intervention.schema_version != eredu_core::intervention::INTERVENTION_SCHEMA_VERSION {
             return Err(CaptureError::Invalid("unsupported intervention schema".into()).into());
         }
@@ -336,13 +365,38 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
         plan: CapturePlan,
         trace_limits: TraceLimits,
     ) -> Result<PreparedObservedGeneration, PreparedChatError> {
-        let (config, max_tokens) = self.resolve_text_generation_settings(settings)?;
         let prompt_token_ids = self
             .tokenizer
             .encode(chat.rendered_prompt(), false)
             .map_err(TextDecoderError::Tokenizer)?
             .get_ids()
             .to_vec();
+        self.prepare_observed_token_ids(chat, prompt_token_ids, settings, plan, trace_limits)
+    }
+
+    /// Admits a fixed prefix without decoding, chat-template rendering or tokenization.
+    /// IDs must belong to this loaded tokenizer. `chat` retains the output contract
+    /// (EOS, stop/semantic policy); its rendered prompt is not submitted. Captures
+    /// are planned before replay. No output token is forced by this operation.
+    pub fn prepare_observed_token_ids(
+        &self,
+        chat: &PreparedChat,
+        prompt_token_ids: Vec<u32>,
+        settings: PreparedChatGenerationSettings,
+        plan: CapturePlan,
+        trace_limits: TraceLimits,
+    ) -> Result<PreparedObservedGeneration, PreparedChatError> {
+        if prompt_token_ids.is_empty()
+            || prompt_token_ids
+                .iter()
+                .any(|id| self.tokenizer.id_to_token(*id).is_none())
+        {
+            return Err(CaptureError::Invalid(
+                "token-ID prefix must be nonempty and use this model's tokenizer vocabulary".into(),
+            )
+            .into());
+        }
+        let (config, max_tokens) = self.resolve_text_generation_settings(settings)?;
         let request = CaptureRequestShape {
             batch: 1,
             prompt_tokens: prompt_token_ids.len() as u64,
@@ -361,6 +415,7 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
             intervention: None,
             session_identity: self.session_identity.clone(),
             artifact_identity,
+            parameter_overlay_id: B::active_parameter_overlay(&self.runtime).map(str::to_owned),
             trace_limits,
         })
     }
@@ -381,18 +436,68 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
     where
         F: FnMut(ObservedGenerationRecord) -> ControlFlow<()>,
     {
-        if prepared.session_identity != self.session_identity {
-            return Err(CaptureError::Invalid(
+        self.generate_observed(
+            prepared,
+            caller_stop_sequences,
+            cancellation,
+            on_record,
+            super::request::PreparedGenerationMode::Semantic,
+        )
+    }
+
+    /// Generates observed literal text through the ordinary shared driver.
+    /// Supports unrecognized templates under the same text/tool admission rules
+    /// as `generate_prepared_text` and `start_controlled_text`.
+    pub fn generate_observed_text<F>(
+        &mut self,
+        prepared: PreparedObservedGeneration,
+        caller_stop_sequences: &[String],
+        cancellation: GenerationCancellationToken,
+        on_record: F,
+    ) -> Result<PreparedChatGenerationOutput, PreparedChatError>
+    where
+        F: FnMut(ObservedGenerationRecord) -> ControlFlow<()>,
+    {
+        self.generate_observed(
+            prepared,
+            caller_stop_sequences,
+            cancellation,
+            on_record,
+            super::request::PreparedGenerationMode::Text,
+        )
+    }
+
+    fn generate_observed<F>(
+        &mut self,
+        prepared: PreparedObservedGeneration,
+        caller_stop_sequences: &[String],
+        cancellation: GenerationCancellationToken,
+        on_record: F,
+        mode: super::request::PreparedGenerationMode,
+    ) -> Result<PreparedChatGenerationOutput, PreparedChatError>
+    where
+        F: FnMut(ObservedGenerationRecord) -> ControlFlow<()>,
+    {
+        let identity = if prepared.session_identity != self.session_identity {
+            Err(CaptureError::Invalid(
                 "observed request belongs to a different loaded session".into(),
             )
-            .into());
-        }
+            .into())
+        } else {
+            Ok(())
+        };
+        self.runtime.finish_text_preparation(
+            eredu_core::run_preparation::TextPreparationStage::Request,
+            identity,
+            PreparedChatError::Backend,
+        )?;
         let started = Instant::now();
         let prompt_length = prepared.prompt_token_ids.len() as u64;
         let template = ObservedGenerationRecord {
             schema_version: CAPTURE_SCHEMA_VERSION,
             run_id: new_identity("run"),
             artifact_identity: prepared.artifact_identity,
+            parameter_overlay_id: prepared.parameter_overlay_id,
             session_id: self.session_identity.clone(),
             capture_plan_id: prepared.plan.identity().into(),
             intervention_plan_id: prepared
@@ -462,34 +567,24 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
         };
         // The prepared prompt is fed into the existing generation route. No second
         // tokenizer, sampler, EOS loop, or semantic decoder is constructed here.
-        let result = if cancellation.is_cancelled() {
-            on_event(SemanticEvent::Finished {
-                reason: FinishReason::Cancelled,
-            });
-            Ok(PreparedChatGenerationOutput::new(
-                Vec::new(),
-                FinishReason::Cancelled,
-                eredu_core::GenerationTiming::default(),
-                (),
-            ))
-        } else {
-            match B::prepare_text_prompt(self.runtime.backend(), prepared.prompt_token_ids) {
-                Err(error) => Err(PreparedChatError::Backend(
-                    eredu_core::BackendFailure::from_error(error),
-                )),
-                Ok(prompt) => self.generate_prepared_chat_captured(
-                    PreparedChatGenerationRequest {
-                        input: PreparedChatInput::prepared_backend_input(&prepared.chat, prompt),
-                        settings: prepared.settings,
-                        caller_stop_sequences,
-                        cancellation,
-                        on_event,
-                    },
-                    Some((prepared.plan, prepared.intervention, &mut on_token)),
-                    started,
-                ),
-            }
-        };
+        let delivery_failure = || delivery.borrow().failure.clone();
+        let result = self.generate_prepared(
+            PreparedChatGenerationRequest {
+                input: PreparedChatInput::token_ids(&prepared.chat, prepared.prompt_token_ids),
+                settings: prepared.settings,
+                caller_stop_sequences,
+                cancellation,
+                on_event,
+            },
+            Some((
+                prepared.plan,
+                prepared.intervention,
+                &mut on_token,
+                &delivery_failure,
+            )),
+            started,
+            mode,
+        );
         let mut delivery = delivery.into_inner();
         match &result {
             Ok(output) => delivery.send(ObservedGenerationEvent::Completed {
@@ -502,9 +597,22 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
                 elapsed_seconds: started.elapsed().as_secs_f64(),
             }),
         }
-        if let Some(error) = delivery.failure {
-            return Err(error.into());
+        if result.is_err() {
+            // The shared driver already agreed this failure. Preserve its cause;
+            // a best-effort Failed record cannot replace it or start a new phase.
+            return result;
         }
-        result
+        let output = result?;
+        self.runtime.finish_text_preparation_cancellable(
+            eredu_core::run_preparation::TextPreparationStage::Delivery,
+            match delivery.failure {
+                Some(error) => Err(PreparedChatError::from(error)),
+                None => Ok((!delivery.cancellation.is_cancelled()).then_some(())),
+            },
+            PreparedChatError::Backend,
+        )?;
+        // Terminal publication cannot change the already established stop/EOS
+        // outcome. Cancellation is still agreed without turning it into an error.
+        Ok(output)
     }
 }

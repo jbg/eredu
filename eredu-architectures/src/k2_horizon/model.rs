@@ -14,6 +14,8 @@ use eredu_runtime::{
     TensorParallelRoutedExpertProvider,
 };
 
+mod observed;
+
 impl ExpertBank {
     /// Stable identity shared by execution, residency, and routing observations.
     pub const fn id(self) -> RoutedBankId {
@@ -59,6 +61,8 @@ pub enum FeedForward<B: GroupedNeuralBackend> {
 pub struct Projections<B: GroupedNeuralBackend> {
     #[parameter(skip)]
     layer: usize,
+    #[parameter(skip)]
+    points: Option<eredu_runtime::RoutedObservationPoints>,
     /// Optional routed attention-value stage.
     pub values: Option<RoutedValues<B>>,
     /// Dense or routed feed-forward stage.
@@ -84,36 +88,13 @@ impl<B: GroupedNeuralBackend> Projections<B> {
     where
         P::Error: std::fmt::Display,
     {
-        let Some(values) = &mut self.values else {
-            return Ok(None);
-        };
-        let mut shape = input.shape().to_vec();
-        let hidden = *shape
-            .last()
-            .ok_or_else(|| Error::backend("value input is scalar"))?;
-        let flat = input.reshape(&[-1, hidden], context)?;
-        let routes = eredu_runtime::select_routes_with_provider::<B, P>(
-            &mut values.router,
-            &flat,
-            context,
+        self.values_instrumented(
+            input,
+            pass,
             provider,
-            ExpertBank::AttentionValue.id(),
-        )?;
-        let output = provider
-            .forward_linear_routed(
-                &mut values.experts,
-                RoutedExpertRequest {
-                    layer: self.layer,
-                    bank: ExpertBank::AttentionValue.id(),
-                    input: &flat,
-                    routes: &routes,
-                    pass,
-                },
-                context,
-            )
-            .map_err(|e| Error::backend(e.to_string()))?;
-        *shape.last_mut().expect("validated input rank") = values.output_width;
-        Ok(Some(output.reshape(&shape, context)?))
+            context,
+            &mut decoder::ComponentInstrumentation::disabled(),
+        )
     }
 
     fn feed_forward<P: RoutedExpertProvider<B>>(
@@ -126,56 +107,37 @@ impl<B: GroupedNeuralBackend> Projections<B> {
     where
         P::Error: std::fmt::Display,
     {
-        match &mut self.feed_forward {
-            FeedForward::Dense(mlp) => mlp.forward_feed_forward(input, context),
-            FeedForward::Routed {
-                router,
-                experts,
-                shared,
-            } => {
-                let shape = input.shape();
-                let flat = input.reshape(
-                    &[
-                        -1,
-                        *shape
-                            .last()
-                            .ok_or_else(|| Error::backend("feed-forward input is scalar"))?,
-                    ],
-                    context,
-                )?;
-                let routes = eredu_runtime::select_routes_with_provider::<B, P>(
-                    router,
-                    &flat,
-                    context,
-                    provider,
-                    ExpertBank::FeedForward.id(),
-                )?;
-                let routed = provider
-                    .forward_grouped(
-                        experts,
-                        RoutedExpertRequest {
-                            layer: self.layer,
-                            bank: ExpertBank::FeedForward.id(),
-                            input: &flat,
-                            routes: &routes,
-                            pass,
-                        },
-                        context,
-                    )
-                    .map_err(|e| Error::backend(e.to_string()))?
-                    .reshape(shape, context)?;
-                match shared {
-                    Some(shared) => {
-                        routed.add(&shared.forward_feed_forward(input, context)?, context)
-                    }
-                    None => Ok(routed),
-                }
-            }
-        }
+        self.feed_forward_instrumented(
+            input,
+            pass,
+            provider,
+            context,
+            &mut decoder::ComponentInstrumentation::disabled(),
+        )
     }
 }
 
 impl<B: GroupedNeuralBackend> DecoderProjectionOperator<B> for Projections<B> {
+    fn project_values_observed(
+        &mut self,
+        input: &B::Tensor,
+        context: &<B::Tensor as Tensor>::Context,
+        instrumentation: &mut decoder::ComponentInstrumentation<'_, B::Tensor>,
+    ) -> Result<Option<B::Tensor>, Error> {
+        self.values_instrumented(
+            input,
+            pass(input),
+            &mut ResidentExpertProvider,
+            context,
+            instrumentation,
+        )
+    }
+    fn residual_observation(&self) -> &'static str {
+        match self.feed_forward {
+            FeedForward::Dense(_) => "feed_forward.output",
+            FeedForward::Routed { .. } => "feed_forward.contribution",
+        }
+    }
     fn project_values(
         &mut self,
         input: &B::Tensor,
@@ -190,8 +152,67 @@ impl<B: GroupedNeuralBackend> DecoderProjectionOperator<B> for Projections<B> {
     ) -> Result<B::Tensor, Error> {
         self.feed_forward(input, pass(input), &mut ResidentExpertProvider, context)
     }
+    fn forward_feed_forward_observed(
+        &mut self,
+        input: &B::Tensor,
+        context: &<B::Tensor as Tensor>::Context,
+        instrumentation: &mut crate::decoder::ComponentInstrumentation<'_, B::Tensor>,
+    ) -> Result<B::Tensor, Error> {
+        self.feed_forward_instrumented(
+            input,
+            pass(input),
+            &mut ResidentExpertProvider,
+            context,
+            instrumentation,
+        )
+    }
 }
 impl<B: GroupedNeuralBackend> RoutedProjectionOperator<B> for Projections<B> {
+    const COMPONENT_OBSERVATIONS: bool = true;
+
+    fn project_values_observed_with_provider<P>(
+        &mut self,
+        layer: usize,
+        input: &B::Tensor,
+        pass: ExpertPass,
+        provider: &mut P,
+        context: &<B::Tensor as Tensor>::Context,
+        instrumentation: &mut crate::decoder::ComponentInstrumentation<'_, B::Tensor>,
+        _points: Option<eredu_runtime::RoutedObservationPoints>,
+    ) -> Result<Option<B::Tensor>, Error>
+    where
+        P: RoutedExpertProvider<B>,
+        P::Error: std::fmt::Display,
+    {
+        if layer != self.layer {
+            return Err(Error::backend(
+                "value bank logical layer differs from request",
+            ));
+        }
+        self.values_instrumented(input, pass, provider, context, instrumentation)
+    }
+
+    fn forward_observed_with_provider<P>(
+        &mut self,
+        layer: usize,
+        input: &B::Tensor,
+        pass: ExpertPass,
+        provider: &mut P,
+        context: &<B::Tensor as Tensor>::Context,
+        instrumentation: &mut crate::decoder::ComponentInstrumentation<'_, B::Tensor>,
+        _points: Option<eredu_runtime::RoutedObservationPoints>,
+    ) -> Result<B::Tensor, Error>
+    where
+        P: RoutedExpertProvider<B>,
+        P::Error: std::fmt::Display,
+    {
+        if layer != self.layer {
+            return Err(Error::backend(
+                "feed-forward bank logical layer differs from request",
+            ));
+        }
+        self.feed_forward_instrumented(input, pass, provider, context, instrumentation)
+    }
     fn project_values_with_provider<P>(
         &mut self,
         layer: usize,
@@ -234,6 +255,22 @@ impl<B: GroupedNeuralBackend> RoutedProjectionOperator<B> for Projections<B> {
 impl<B: eredu_nn::TensorParallelGroupedNeuralBackend + eredu_nn::DistributedNeuralBackend>
     TensorParallelProjectionOperator<B> for Projections<B>
 {
+    fn forward_feed_forward_parallel_observed(
+        &mut self,
+        input: &B::Tensor,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+        instrumentation: &mut crate::decoder::ComponentInstrumentation<'_, B::Tensor>,
+    ) -> Result<B::Tensor, Error> {
+        self.feed_forward_parallel_instrumented(
+            input,
+            pass(input),
+            &mut ResidentExpertProvider,
+            parallel,
+            context,
+            instrumentation,
+        )
+    }
     fn forward_feed_forward_parallel(
         &mut self,
         input: &B::Tensor,
@@ -253,6 +290,35 @@ impl<B: eredu_nn::TensorParallelGroupedNeuralBackend + eredu_nn::DistributedNeur
 impl<B: eredu_nn::TensorParallelGroupedNeuralBackend + eredu_nn::DistributedNeuralBackend>
     TensorParallelRoutedProjectionOperator<B> for Projections<B>
 {
+    fn forward_parallel_observed_with_provider<P>(
+        &mut self,
+        layer: usize,
+        input: &B::Tensor,
+        pass: ExpertPass,
+        provider: &mut P,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+        instrumentation: &mut crate::decoder::ComponentInstrumentation<'_, B::Tensor>,
+        _points: Option<eredu_runtime::RoutedObservationPoints>,
+    ) -> Result<B::Tensor, Error>
+    where
+        P: TensorParallelRoutedExpertProvider<B>,
+        P::Error: std::fmt::Display,
+    {
+        if layer != self.layer {
+            return Err(Error::backend(
+                "parallel bank logical layer differs from request",
+            ));
+        }
+        self.feed_forward_parallel_instrumented(
+            input,
+            pass,
+            provider,
+            parallel,
+            context,
+            instrumentation,
+        )
+    }
     fn forward_parallel_with_provider<P>(
         &mut self,
         layer: usize,
@@ -271,57 +337,14 @@ impl<B: eredu_nn::TensorParallelGroupedNeuralBackend + eredu_nn::DistributedNeur
                 "parallel bank logical layer differs from request",
             ));
         }
-        match &mut self.feed_forward {
-            FeedForward::Dense(mlp) => mlp.forward_feed_forward_parallel(input, parallel, context),
-            FeedForward::Routed {
-                router,
-                experts,
-                shared,
-            } => {
-                let shape = input.shape();
-                let flat = input.reshape(
-                    &[
-                        -1,
-                        *shape
-                            .last()
-                            .ok_or_else(|| Error::backend("feed-forward input is scalar"))?,
-                    ],
-                    context,
-                )?;
-                let routes = eredu_runtime::select_routes_with_provider::<B, P>(
-                    router,
-                    &flat,
-                    context,
-                    provider,
-                    ExpertBank::FeedForward.id(),
-                )?;
-                let routed = provider
-                    .forward_grouped_tensor_parallel(
-                        experts,
-                        RoutedExpertRequest {
-                            layer,
-                            bank: ExpertBank::FeedForward.id(),
-                            input: &flat,
-                            routes: &routes,
-                            pass,
-                        },
-                        B::parallel_size(parallel),
-                        context,
-                    )
-                    .map_err(|e| Error::backend(e.to_string()))?;
-                let routed = eredu_runtime::reduce_routed_expert_tensor_parallel::<B>(
-                    routed, parallel, context,
-                )?
-                .reshape(shape, context)?;
-                match shared {
-                    Some(shared) => routed.add(
-                        &shared.forward_feed_forward_parallel(input, parallel, context)?,
-                        context,
-                    ),
-                    None => Ok(routed),
-                }
-            }
-        }
+        self.feed_forward_parallel_instrumented(
+            input,
+            pass,
+            provider,
+            parallel,
+            context,
+            &mut decoder::ComponentInstrumentation::disabled(),
+        )
     }
 }
 
@@ -333,7 +356,9 @@ fn shared_mlp<B: GroupedNeuralBackend>(
     if args.num_shared_experts == 0 {
         return Ok(None);
     }
-    let width = args.moe_intermediate_size * args.num_shared_experts;
+    let width = args
+        .local_shared_intermediate_size
+        .unwrap_or(args.moe_intermediate_size * args.num_shared_experts);
     let linear = |field: &str, input, output| {
         let name = format!("model.layers.{layer}.mlp.shared_experts.{field}.weight");
         B::linear(
@@ -427,6 +452,11 @@ impl<B: GroupedNeuralBackend> decoder::BlockFactory<B, ModelArgs> for BlockFacto
             self_attention: decoder::Attention::new(local, layer, context)?,
             mlp: Projections {
                 layer,
+                points: <ModelArgs as decoder::Config>::routed_observation_points(
+                    global,
+                    &format!("model.layers.{layer}"),
+                    layer,
+                ),
                 values,
                 feed_forward,
             },

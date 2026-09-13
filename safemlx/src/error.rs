@@ -67,6 +67,7 @@ impl From<RawException> for IoError {
         let exception = Exception {
             what: e.what,
             location: Location::caller(),
+            source: None,
         };
         Self::Exception(exception)
     }
@@ -140,11 +141,35 @@ pub(crate) struct RawException {
 }
 
 /// Exception. Most will come from the C API.
-#[derive(Debug, PartialEq, Error)]
-#[error("{what:?} at {location}")]
+#[derive(Debug)]
 pub struct Exception {
     pub(crate) what: String,
     pub(crate) location: &'static Location<'static>,
+    pub(crate) source: Option<std::sync::Arc<dyn std::error::Error + Send + Sync>>,
+}
+
+impl std::fmt::Display for Exception {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{:?} at {}", self.what, self.location)
+    }
+}
+
+impl std::error::Error for Exception {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.source.as_deref().map(|source| source as _)
+    }
+}
+
+impl PartialEq for Exception {
+    fn eq(&self, other: &Self) -> bool {
+        self.what == other.what
+            && self.location == other.location
+            && match (&self.source, &other.source) {
+                (None, None) => true,
+                (Some(a), Some(b)) => std::sync::Arc::ptr_eq(a, b),
+                _ => false,
+            }
+    }
 }
 
 impl Exception {
@@ -168,6 +193,18 @@ impl Exception {
         Self {
             what: what.into(),
             location: Location::caller(),
+            source: None,
+        }
+    }
+
+    /// Preserves a Rust failure while crossing an API that returns MLX exceptions.
+    /// The original error remains available through [`std::error::Error::source`].
+    #[track_caller]
+    pub fn from_source(error: impl std::error::Error + Send + Sync + 'static) -> Self {
+        Self {
+            what: error.to_string(),
+            location: Location::caller(),
+            source: Some(std::sync::Arc::new(error)),
         }
     }
 }
@@ -178,6 +215,7 @@ impl From<RawException> for Exception {
         Self {
             what: e.what,
             location: Location::caller(),
+            source: None,
         }
     }
 }
@@ -188,6 +226,7 @@ impl From<&str> for Exception {
         Self {
             what: what.to_string(),
             location: Location::caller(),
+            source: None,
         }
     }
 }
@@ -276,6 +315,32 @@ impl From<InexactDtypeError> for Exception {
 #[cfg(test)]
 mod tests {
     use crate::{array, Array};
+
+    #[test]
+    fn rust_exception_source_survives_nested_native_error_domains() {
+        use std::error::Error;
+        let cause = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "source sentinel");
+        let inner = super::Exception::from_source(cause);
+        assert_eq!(inner.what(), "source sentinel");
+        assert_eq!(inner.location().file(), file!());
+        let outer = super::Exception::from_source(inner);
+        let retained = outer
+            .source()
+            .unwrap()
+            .downcast_ref::<super::Exception>()
+            .unwrap();
+        let cause = retained
+            .source()
+            .unwrap()
+            .downcast_ref::<std::io::Error>()
+            .unwrap();
+        assert_eq!(cause.kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(cause.to_string(), "source sentinel");
+        assert_eq!(outer, outer);
+        assert!(super::Exception::custom("source sentinel")
+            .source()
+            .is_none());
+    }
 
     #[test]
     fn test_exception() {

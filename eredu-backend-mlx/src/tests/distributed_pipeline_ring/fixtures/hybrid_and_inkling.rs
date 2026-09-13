@@ -39,6 +39,20 @@ fn qwen_hybrid_moe_config(model_type: &str) -> serde_json::Value {
     config
 }
 
+// Target-component matrices select a target-only graph. Prediction scopes have
+// separate fixtures and acceptance so their state is never silently omitted.
+fn write_qwen_hybrid_component_fixture(directory: &Path, family: FixtureFamily) {
+    let mut config = match family {
+        FixtureFamily::Qwen3Next => qwen_hybrid_config("qwen3_next"),
+        FixtureFamily::Qwen35 => qwen_hybrid_config("qwen3_5_text"),
+        FixtureFamily::Qwen3NextMoe => qwen_hybrid_moe_config("qwen3_next"),
+        FixtureFamily::Qwen35Moe => qwen_hybrid_moe_config("qwen3_5_moe_text"),
+        _ => panic!("not a Qwen hybrid text component fixture"),
+    };
+    config["mtp_num_hidden_layers"] = 0.into();
+    write_qwen_hybrid_config_fixture(directory, config);
+}
+
 fn write_qwen_hybrid_fixture(directory: &Path, model_type: &str) {
     let config = qwen_hybrid_config(model_type);
     let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
@@ -262,11 +276,25 @@ fn write_qwen35_zero_prediction_fixture(directory: &Path) {
     write_qwen35_multimodal_fixture_with_prediction(directory, false, 0, false);
 }
 
+fn write_qwen35_conditional_component_fixture(directory: &Path, moe: bool) {
+    write_qwen35_multimodal_fixture_config(directory, moe, 0, false, true);
+}
+
 fn write_qwen35_multimodal_fixture_with_prediction(
     directory: &Path,
     moe: bool,
     prediction_layers: usize,
     fp8_experts: bool,
+) {
+    write_qwen35_multimodal_fixture_config(directory, moe, prediction_layers, fp8_experts, false);
+}
+
+fn write_qwen35_multimodal_fixture_config(
+    directory: &Path,
+    moe: bool,
+    prediction_layers: usize,
+    fp8_experts: bool,
+    deepstack: bool,
 ) {
     let mut text_config = if moe {
         qwen_hybrid_moe_config("qwen3_5_moe_text")
@@ -275,10 +303,15 @@ fn write_qwen35_multimodal_fixture_with_prediction(
     };
     text_config["mtp_num_hidden_layers"] = prediction_layers.into();
     if fp8_experts {
-        text_config["moe_intermediate_size"] = 128.into();
-        text_config["linear_key_head_dim"] = 64.into();
-        text_config["linear_value_head_dim"] = 64.into();
+        // Every two-rank expert/QKV shard retains complete 128x128 FP8 blocks.
+        text_config["hidden_size"] = 256.into();
+        text_config["num_attention_heads"] = 4.into();
+        text_config["head_dim"] = 64.into();
+        text_config["moe_intermediate_size"] = 256.into();
+        text_config["linear_key_head_dim"] = 128.into();
+        text_config["linear_value_head_dim"] = 128.into();
     }
+    let output_hidden_size = text_config["hidden_size"].clone();
     let mut config = serde_json::json!({
         "architectures": [if moe { "Qwen3_5MoeForConditionalGeneration" } else { "Qwen3_5ForConditionalGeneration" }],
         "model_type": if moe { "qwen3_5_moe" } else { "qwen3_5" },
@@ -297,9 +330,9 @@ fn write_qwen35_multimodal_fixture_with_prediction(
             "spatial_merge_size": 2,
             "temporal_patch_size": 1,
             "window_size": 8,
-            "out_hidden_size": 16,
+            "out_hidden_size": output_hidden_size,
             "fullatt_block_indexes": [0, 1],
-            "deepstack_visual_indexes": []
+            "deepstack_visual_indexes": if deepstack { vec![1] } else { vec![] }
         }
     });
     std::fs::create_dir_all(directory).unwrap();
@@ -317,7 +350,37 @@ fn write_qwen35_multimodal_fixture_with_prediction(
         )
         .unwrap(),
     );
-    initialize_fixture(&mut model, stream);
+    if fp8_experts {
+        // Distinct rows and channels keep component deletions observable even
+        // after readout normalization; constant rows can erase their effect.
+        for (name, parameter) in neutral_parameter_refs_mut(&mut model).flatten() {
+            let seed = k2_fp8_phase(&name);
+            let values = (0..parameter.shape().iter().product::<i32>() as usize)
+                .map(|index| {
+                    let mut bits =
+                        (seed as u32).wrapping_add((index as u32).wrapping_mul(0x9e3779b9));
+                    bits = (bits ^ (bits >> 16)).wrapping_mul(0x85ebca6b);
+                    bits = (bits ^ (bits >> 13)).wrapping_mul(0xc2b2ae35);
+                    bits ^= bits >> 16;
+                    let unit = (bits % 2001) as f32 / 1000.0 - 1.0;
+                    if name.ends_with("A_log") {
+                        -0.2 + unit * 0.05
+                    } else if name.contains("norm") && name.ends_with("weight") {
+                        0.95 + unit * 0.05
+                    } else if name.contains("embed_tokens") || name.contains("eh_proj") {
+                        0.003 + (unit + 1.0) * 0.002
+                    } else {
+                        0.02 * unit
+                    }
+                })
+                .collect::<Vec<_>>();
+            *parameter = Array::from_slice(&values, parameter.shape())
+                .as_dtype(parameter.dtype(), stream)
+                .unwrap();
+        }
+    } else {
+        initialize_fixture(&mut model, stream);
+    }
     save_parameter_fixture(directory, &config, &model);
     if fp8_experts {
         // Match the released Qwen3.6 layout: independent E4M3 expert matrices
@@ -340,11 +403,13 @@ fn write_qwen35_multimodal_fixture_with_prediction(
                             name.clone(),
                             Dtype::F8_E4M3,
                             shape.clone(),
-                            vec![0x38; shape.iter().product()],
+                            (0..shape.iter().product())
+                                .map(|index| k2_fp8_code(&name, index))
+                                .collect(),
                         ));
                         let scales = vec![shape[0].div_ceil(128), shape[1].div_ceil(128)];
                         let bytes = (0..scales.iter().product::<usize>())
-                            .flat_map(|_| 0.005f32.to_le_bytes())
+                            .flat_map(|index| k2_fp8_scale(&name, index).to_le_bytes())
                             .collect();
                         tensors.push((format!("{name}_scale_inv"), Dtype::F32, scales, bytes));
                         continue;
@@ -376,11 +441,13 @@ fn write_qwen35_multimodal_fixture_with_prediction(
                             name.clone(),
                             Dtype::F8_E4M3,
                             vec![rows, columns],
-                            vec![0x38; rows * columns],
+                            (0..rows * columns)
+                                .map(|index| k2_fp8_code(&name, index))
+                                .collect(),
                         ));
                         let shape = vec![rows.div_ceil(128), columns.div_ceil(128)];
                         let scales = (0..shape.iter().product::<usize>())
-                            .flat_map(|_| 0.005f32.to_le_bytes())
+                            .flat_map(|index| k2_fp8_scale(&name, index).to_le_bytes())
                             .collect();
                         tensors.push((format!("{name}_scale_inv"), Dtype::F32, shape, scales));
                     }
@@ -417,7 +484,15 @@ fn write_qwen35_multimodal_fixture_with_prediction(
 }
 
 fn write_qwen3_vl_fixture(directory: &Path, moe: bool) {
-    let config = serde_json::json!({
+    write_qwen3_vl_fixture_config(directory, moe, false, false);
+}
+
+fn write_qwen3_vl_component_fixture(directory: &Path, moe: bool, quantizable: bool) {
+    write_qwen3_vl_fixture_config(directory, moe, true, quantizable);
+}
+
+fn write_qwen3_vl_fixture_config(directory: &Path, moe: bool, components: bool, quantizable: bool) {
+    let mut config = serde_json::json!({
         "architectures": [if moe { "Qwen3VLMoeForConditionalGeneration" } else { "Qwen3VLForConditionalGeneration" }],
         "model_type": if moe { "qwen3_vl_moe" } else { "qwen3_vl" },
         "image_token_id": 42,
@@ -456,6 +531,21 @@ fn write_qwen3_vl_fixture(directory: &Path, moe: bool) {
             "deepstack_visual_indexes": [0, 1]
         }
     });
+    if components {
+        config["text_config"]["hidden_size"] = 64.into();
+        config["text_config"]["num_attention_heads"] = 4.into();
+        config["text_config"]["head_dim"] = 16.into();
+        config["text_config"]["intermediate_size"] = if moe { 0 } else { 128 }.into();
+        config["text_config"]["moe_intermediate_size"] = if moe { 64 } else { 0 }.into();
+        config["text_config"]["num_experts"] = if moe { 4 } else { 0 }.into();
+        config["text_config"]["num_experts_per_tok"] = if moe { 2 } else { 0 }.into();
+        config["text_config"]["rope_scaling"]["mrope_section"] = serde_json::json!([4, 2, 2]);
+        config["vision_config"]["out_hidden_size"] = 64.into();
+    }
+    if quantizable {
+        config["vision_config"]["hidden_size"] = 64.into();
+        config["vision_config"]["intermediate_size"] = 64.into();
+    }
     let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
     let stream = execution.stream();
     let args = eredu_architectures::qwen::vl::model_args_from_config_value(&config).unwrap();
@@ -474,7 +564,25 @@ fn write_qwen3_vl_fixture(directory: &Path, moe: bool) {
                 .map_or(canonical.clone(), |suffix| {
                     format!("model.language_model.{suffix}")
                 });
-            (canonical, value.clone())
+            let value = if components {
+                let seed = canonical
+                    .bytes()
+                    .fold(0_u32, |a, b| a.wrapping_mul(31).wrapping_add(u32::from(b)));
+                let values = (0..value.shape().iter().product::<i32>() as usize)
+                    .map(|i| {
+                        let delta = ((i * 7 + (seed % 97) as usize) % 41) as f32 - 20.0;
+                        if canonical.contains("norm") && canonical.ends_with("weight") {
+                            0.9 + delta * 0.002
+                        } else {
+                            delta * 0.008
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                Array::from_slice(&values, value.shape())
+            } else {
+                value.clone()
+            };
+            (canonical, value)
         })
         .collect::<Vec<_>>();
     save_indexed_pipeline_fixture(directory, &arrays, "model.language_model.layers.", 2);

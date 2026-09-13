@@ -32,7 +32,8 @@ pub use model::{
     LayeredModel, ModelInput, PartitionMtpOutput, PreparedInput, StaticModules, TextPartitionInput,
     Unit, AUDIO_EXECUTION_GROUP, MTP_STATIC_ROLE, TEXT_EXECUTION_GROUP, VISION_EXECUTION_GROUP,
 };
-pub use mtp::{MtpDepth, MtpModel, MtpOutput};
+pub(crate) use mtp::mtp_text_args;
+pub use mtp::{MtpDepth, MtpModel, MtpOutput, MtpShared};
 pub use parallel::{
     layer_parameter_groups, local_geometry, local_text_args, mtp_parameter_groups,
     partition_local_geometry, static_parameter_groups, vision_layer_parameter_groups,

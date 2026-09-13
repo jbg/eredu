@@ -14,7 +14,7 @@ pub(super) fn tiny_config(skip_norm: bool) -> serde_json::Value {
 
 // Bind the independent fixture's physical tensors into logical invocations.
 // This deliberately does not call the production alias planner.
-struct FixtureAliases;
+pub(super) struct FixtureAliases;
 impl<'a> ParameterVisitorMut<'a, NumericTensor> for FixtureAliases {
     fn visit_mut(&mut self, metadata: ParameterMetadata, value: &'a mut NumericTensor) {
         let name = metadata.id.as_str();

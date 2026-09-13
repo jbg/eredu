@@ -33,7 +33,7 @@ where
 {
     let Some(control) = provider
         .routing_control(bank, token_rows(input)?)
-        .map_err(Error::backend)?
+        .map_err(Error::backend_source)?
     else {
         return selector.select(input, context);
     };
@@ -45,7 +45,7 @@ where
                 selection.original.as_ref().map(Into::into),
                 (&selection.effective).into(),
             )
-            .map_err(Error::backend)?;
+            .map_err(Error::backend_source)?;
         Ok(selection.effective)
     })();
     if let Err(error) = &result {

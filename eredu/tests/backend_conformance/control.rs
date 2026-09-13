@@ -636,3 +636,47 @@ fn cancelled_controlled_session_has_no_ttft() {
     session.cancel(|_| ControlFlow::Continue(())).unwrap();
     assert_eq!(session.timing().time_to_first_token(), None);
 }
+
+#[test]
+fn exact_token_prefix_admission_preserves_ids_and_rejects_unknown_vocabulary_before_execution() {
+    let (mut model, chat, mut settings, _) = setup();
+    settings.overrides.max_new_tokens = Some(1);
+    let rendered = model.encode(chat.rendered_prompt(), false).unwrap();
+    let prefix = vec![rendered[0]; 3];
+    for invalid in [vec![], vec![u32::MAX]] {
+        assert!(model
+            .prepare_observed_token_ids(&chat, invalid, settings, CapturePlan::none(), limits())
+            .is_err());
+    }
+    let prepared = model
+        .prepare_observed_token_ids(
+            &chat,
+            prefix.clone(),
+            settings,
+            CapturePlan::none(),
+            limits(),
+        )
+        .unwrap();
+    assert_eq!(prepared.prompt_token_ids(), prefix);
+    assert_eq!(prepared.capture_plan().request().prompt_tokens, 3);
+    let mut records = vec![];
+    let mut run = model
+        .start_controlled_chat(prepared, &[], Default::default(), |r| {
+            records.push(r);
+            ControlFlow::Continue(())
+        })
+        .unwrap();
+    run.step(|r| {
+        records.push(r);
+        ControlFlow::Continue(())
+    })
+    .unwrap();
+    assert!(records.iter().any(|r| matches!(
+        &r.generation.event,
+        ObservedGenerationEvent::Token {
+            input_range: [0, 3],
+            forced: false,
+            ..
+        }
+    )));
+}

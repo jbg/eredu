@@ -50,6 +50,11 @@ impl MlxGroupedLinear {
             ));
         }
         // Validate every shape before changing any parameter slot.
+        let floating_shape = [
+            self.spec.group_count(),
+            self.spec.output_dimensions(),
+            self.spec.input_dimensions(),
+        ];
         for (name, parameter) in names.iter().zip([
             Some(&self.weight),
             self.scale.as_ref(),
@@ -57,11 +62,12 @@ impl MlxGroupedLinear {
             self.bias.as_ref(),
         ]) {
             if let (Some(name), Some(parameter)) = (name, parameter) {
-                if parameter.as_ref().shape() != bindings[name].shape() {
-                    return Err(ComputeError::backend(format!(
-                        "compact linear binding {name} has an incorrect shape"
-                    )));
-                }
+                super::parameters::validate_compact_binding(
+                    name,
+                    parameter.as_ref().as_array(),
+                    &bindings[name],
+                    (Some(name) == names[0].as_ref()).then_some(floating_shape.as_slice()),
+                )?;
             }
         }
         for (name, parameter) in names.iter().zip([
@@ -193,6 +199,11 @@ impl GroupedLinearOperator<MlxTensor> for MlxGroupedLinear {
         selections: &GroupSelection<MlxTensor>,
         context: &Stream,
     ) -> Result<MlxTensor, ComputeError> {
+        #[cfg(test)]
+        crate::tests::support::provider_failure::check(
+            crate::tests::support::provider_failure::Operator::Linear,
+            context,
+        )?;
         let input = input.as_array();
         let ids = selections.group_indices().as_array();
         if input.ndim() != 2
@@ -234,9 +245,10 @@ impl GroupedLinearOperator<MlxTensor> for MlxGroupedLinear {
             LinearFormat::GgufIQuant { .. } => {
                 let quantization = encoding.weight_quantization().expect("GGUF format");
                 let (ty, endian) = quantization.gguf_iquant().expect("GGUF type");
-                let native = compute(
-                    common::native_quantization::NativeQuantizedTensor::from_iq_array(
-                        weight.clone(),
+                compute(
+                    common::native_quantization::native_grouped_linear_from_array(
+                        &rows,
+                        weight,
                         &[
                             self.spec.group_count(),
                             self.spec.output_dimensions(),
@@ -244,14 +256,10 @@ impl GroupedLinearOperator<MlxTensor> for MlxGroupedLinear {
                         ],
                         ty,
                         endian,
+                        &plan.sorted_group_ids,
+                        context,
                     ),
-                )?;
-                compute(common::native_quantization::native_grouped_linear(
-                    &rows,
-                    &native,
-                    &plan.sorted_group_ids,
-                    context,
-                ))?
+                )?
             }
             LinearFormat::Affine(_) | LinearFormat::MxFp4 => {
                 compute(common::grouped::packed_grouped_linear(
@@ -293,6 +301,90 @@ impl GroupedLinearOperator<MlxTensor> for MlxGroupedLinear {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    #[ignore = "explicit native promoted grouped-linear conformance"]
+    fn compact_packed_linear_accepts_logical_float_weights_and_rejects_partial_updates() {
+        let stream = crate::test_stream();
+        let spec = eredu_nn::GroupedProjectionSpec::new(
+            ParameterSpec::trainable("bank.weight").unwrap(),
+            None,
+            LinearFormatSpec::scaled(
+                LinearFormat::MxFp4,
+                ParameterSpec::trainable("bank.scales").unwrap(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let mut bank = MlxNeuralBackend::grouped_linear_bank(
+            GroupedLinearSpec::new(2, 64, 32, GroupedLinearActivation::Identity, spec).unwrap(),
+            stream,
+        )
+        .unwrap();
+        let values = (0..2 * 32 * 64)
+            .map(|i| ((i * 7 % 31) as f32 - 15.) / 8.)
+            .collect::<Vec<_>>();
+        let input_values = (0..64)
+            .map(|i| ((i % 9) as f32 - 4.) / 4.)
+            .collect::<Vec<_>>();
+        let input = MlxTensor::from_array(Array::from_slice(&input_values, &[1, 64]));
+        let coefficients = MlxTensor::from_array(Array::from_slice(&[0.25f32, 0.75], &[1, 2]));
+        let routes = GroupSelection::new(
+            MlxTensor::from_array(Array::from_slice(&[1i32, 0], &[1, 2])),
+            coefficients.clone(),
+            coefficients,
+        );
+        let expected = (0..32)
+            .map(|row| {
+                [1usize, 0]
+                    .into_iter()
+                    .zip([0.25, 0.75])
+                    .map(|(expert, coefficient)| {
+                        (0..64)
+                            .map(|col| values[(expert * 32 + row) * 64 + col] * input_values[col])
+                            .sum::<f32>()
+                            * coefficient
+                    })
+                    .sum::<f32>()
+            })
+            .collect::<Vec<_>>();
+        for dtype in [Dtype::Float32, Dtype::Float16, Dtype::Bfloat16] {
+            let bindings = BTreeMap::from([
+                (
+                    "weight".into(),
+                    Array::from_slice(&values, &[2, 32, 64])
+                        .as_dtype(dtype, stream)
+                        .unwrap(),
+                ),
+                (
+                    "scales".into(),
+                    bank.scale.as_ref().unwrap().as_ref().as_array().clone(),
+                ),
+            ]);
+            bank.bind_local_parameters(bindings.clone()).unwrap();
+            let mut invalid = bindings.clone();
+            invalid.insert(
+                "weight".into(),
+                safemlx::ops::zeros_dtype(&[2, 32, 8], dtype, stream).unwrap(),
+            );
+            assert!(bank.bind_local_parameters(invalid).is_err());
+            // A valid changed weight must not publish before a later malformed
+            // companion is rejected. The scalar reference below stays unchanged.
+            let mut invalid = bindings;
+            invalid.insert(
+                "weight".into(),
+                safemlx::ops::zeros_dtype(&[2, 32, 64], dtype, stream).unwrap(),
+            );
+            invalid.insert(
+                "scales".into(),
+                safemlx::ops::zeros_dtype(&[1], Dtype::Uint8, stream).unwrap(),
+            );
+            assert!(bank.bind_local_parameters(invalid).is_err());
+            let output = bank.forward_grouped(&input, &routes, stream).unwrap();
+            let actual = output.as_array().evaluated().unwrap();
+            assert_eq!(actual.as_slice::<f32>(), expected);
+        }
+    }
+
     #[test]
     #[ignore = "explicit native grouped-linear conformance"]
     fn selected_linear_applies_activation_before_mixing_and_partitions_output() {

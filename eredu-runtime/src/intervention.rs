@@ -7,8 +7,17 @@ use crate::capture::{
 use eredu_core::{capture::*, intervention::*, ObservationPosition};
 
 mod activation;
+mod partition;
+mod routed;
 mod session;
-pub use activation::apply_activation;
+pub use activation::{apply_activation, localize_component_mask};
+pub use partition::{
+    PartitionActivationLayout, PartitionActivationMember, PartitionActivationProjection,
+    PartitionRoutedActivationMember, ReservedPartitionActivation,
+};
+pub use routed::{
+    lower_partition_routed_intervention, lower_routed_intervention, LoweredRoutedIntervention,
+};
 pub(crate) use session::validate_continuation;
 pub use session::{install_session, validate_session, CaptureObserver};
 
@@ -16,7 +25,7 @@ pub(crate) struct InterventionRun {
     pub(crate) plan: AdmittedInterventionPlan,
     pub(crate) records: Option<Vec<InterventionRecord>>,
     pub(crate) routing_pending: Option<usize>,
-    estimator: std::sync::Arc<dyn InterventionEstimator>,
+    pub(crate) estimator: std::sync::Arc<dyn InterventionEstimator>,
 }
 
 impl InterventionRun {
@@ -47,6 +56,7 @@ impl InterventionRun {
                     node_id: geometry.node_id,
                     position: geometry.position,
                     source_shape: None,
+                    source_dtype: None,
                     selected_shape: None,
                     outcome: if active {
                         CaptureOutcome::Missing
@@ -60,6 +70,7 @@ impl InterventionRun {
                 });
             }
             records.push(InterventionRecord {
+                routed_units: None,
                 schema_version: INTERVENTION_SCHEMA_VERSION,
                 plan_id: self.plan.identity().into(),
                 operation_id: operation.id.clone(),
@@ -100,10 +111,10 @@ impl CaptureSession {
                 "intervention selection requires a drained successful step".into(),
             ));
         }
-        if plan
-            .as_ref()
-            .is_some_and(|plan| plan.request() != self.plan.request())
-        {
+        if plan.as_ref().is_some_and(|plan| {
+            plan.request() != self.plan.request()
+                || plan.invocation_bounds() != self.plan.invocation_bounds()
+        }) {
             return Err(CaptureError::Invalid(
                 "capture and intervention request geometry differs".into(),
             ));
@@ -131,7 +142,9 @@ impl CaptureSession {
                 "interventions must be installed once before generation".into(),
             ));
         }
-        if plan.request() != self.plan.request() {
+        if plan.request() != self.plan.request()
+            || plan.invocation_bounds() != self.plan.invocation_bounds()
+        {
             return Err(CaptureError::Invalid(
                 "capture and intervention request geometry differs".into(),
             ));
@@ -156,6 +169,8 @@ impl CaptureSession {
         path: &str,
         tensor: &B::Tensor,
     ) -> Result<Option<B::Tensor>, CaptureExecutionError<B::Error>> {
+        self.validate_ordinary_intervention()?;
+        let tensor_geometry = self.tensor_geometry()?;
         let Some(run) = &mut self.interventions else {
             return Ok(None);
         };
@@ -175,6 +190,7 @@ impl CaptureSession {
         {
             if operation.target != path
                 || point.routing.is_some()
+                || point.routed_units.is_some()
                 || record.outcome == InterventionOutcome::Inactive
             {
                 continue;
@@ -194,14 +210,19 @@ impl CaptureSession {
                 let dtype = backend
                     .intervention_dtype(input)
                     .map_err(CaptureExecutionError::Backend)?;
-                let slice = run.plan.validate_actual(
+                let slice = run.plan.validate_at(
                     index,
                     self.phase,
                     self.prediction,
+                    self.invocation,
                     &shape,
                     Some(dtype),
                 )?;
                 run.estimator.validate_geometry(&shape, &slice)?;
+                let usage =
+                    activation_cost(run.estimator.as_ref(), &shape, &slice, &operation.action)?;
+                reserve_envelope(&mut self.ledger, usage)?;
+                record.charged = record.charged.checked_add(usage)?;
                 let evidence = evidence_selections(operation, point);
                 if let Some((selection, geometry)) = evidence.first() {
                     capture_evidence(
@@ -210,9 +231,7 @@ impl CaptureSession {
                         selection,
                         geometry,
                         &mut record.evidence[0],
-                        run.plan.request(),
-                        self.phase,
-                        self.prediction,
+                        tensor_geometry,
                         &mut self.ledger,
                     )?;
                 }
@@ -225,10 +244,11 @@ impl CaptureSession {
                 let output_dtype = backend
                     .intervention_dtype(&output)
                     .map_err(CaptureExecutionError::Backend)?;
-                run.plan.validate_actual(
+                run.plan.validate_at(
                     index,
                     self.phase,
                     self.prediction,
+                    self.invocation,
                     &output_shape,
                     Some(output_dtype),
                 )?;
@@ -239,9 +259,7 @@ impl CaptureSession {
                         selection,
                         geometry,
                         &mut record.evidence[1],
-                        run.plan.request(),
-                        self.phase,
-                        self.prediction,
+                        tensor_geometry,
                         &mut self.ledger,
                     )?;
                 }
@@ -277,11 +295,11 @@ impl CaptureSession {
                 .records
                 .as_ref()
                 .ok_or_else(|| CaptureError::Invalid("intervention step not started".into()))?;
-            if let Some(record) = records.iter().find(|r| {
+            if let Some((_, record)) = records.iter().enumerate().find(|(index, r)| {
                 matches!(
                     r.outcome,
                     InterventionOutcome::Missing | InterventionOutcome::Failed { .. }
-                )
+                ) && !self.partition_intervention_completed(*index)
             }) {
                 return Err(CaptureError::Invalid(format!(
                     "scheduled intervention {} at {} did not complete",
@@ -293,7 +311,10 @@ impl CaptureSession {
     }
 }
 
-fn reserve_envelope(ledger: &mut CaptureLedger, usage: CaptureUsage) -> Result<(), CaptureError> {
+fn reserve_envelope(
+    ledger: &mut impl CaptureReservation,
+    usage: CaptureUsage,
+) -> Result<(), CaptureError> {
     match ledger.reserve(usage)? {
         Some(CaptureSkipReason::Limit { budget, cumulative }) => {
             Err(CaptureError::Limit { budget, cumulative })
@@ -368,21 +389,16 @@ pub(crate) fn evidence_selections(
     entries
 }
 
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn capture_evidence<B: CaptureBackend>(
     backend: &mut B,
     tensor: &B::Tensor,
     selection: &CaptureSelection,
     point: &eredu_core::ObservationPoint,
     record: &mut CaptureRecord,
-    request: CaptureRequestShape,
-    phase: CapturePhase,
-    prediction: u64,
+    geometry: CaptureInvocationShape,
     ledger: &mut CaptureLedger,
 ) -> Result<(), CaptureExecutionError<B::Error>> {
-    let result = capture_value(
-        backend, tensor, selection, point, record, request, phase, prediction, ledger,
-    );
+    let result = capture_value(backend, tensor, selection, point, record, geometry, ledger);
     if let Err(error) = &result {
         record.payload = None;
         record.outcome = CaptureOutcome::Failed {
@@ -419,7 +435,9 @@ pub(crate) fn preflight_continuation(
     next_prediction: u64,
     inherited: CaptureUsage,
 ) -> Result<(), CaptureError> {
-    if capture.request() != intervention.request() {
+    if capture.request() != intervention.request()
+        || capture.invocation_bounds() != intervention.invocation_bounds()
+    {
         return Err(CaptureError::Invalid(
             "capture/intervention geometry mismatch".into(),
         ));
@@ -445,43 +463,62 @@ pub(crate) fn preflight_continuation(
             .into_iter()
             .enumerate()
         {
-            let Some((_, last)) = operation.schedule.count_and_last_from(
-                phase,
-                next_prediction,
-                intervention.request().max_predictions,
-            )?
-            else {
+            let range = if intervention.invocation_bounds().is_some() {
+                operation.schedule.count_coordinates(
+                    phase,
+                    0,
+                    intervention.request().max_predictions,
+                )?
+            } else {
+                operation.schedule.count_and_last_from(
+                    phase,
+                    next_prediction,
+                    intervention.request().max_predictions,
+                )?
+            };
+            let Some((_, last)) = range else {
                 continue;
             };
             if let Some(shape) =
-                intervention
-                    .request()
-                    .resolve(&point.observation_geometry(), phase, last)?
+                intervention.estimate_shape(&point.observation_geometry(), phase, last)?
             {
-                let slice = intervention.validate_actual(
+                let slice = intervention.validate_at(
                     index,
                     phase,
                     last,
+                    intervention
+                        .invocation_bounds()
+                        .map(|bounds| bounds.maximum())
+                        .transpose()?,
                     &shape,
                     operation.action.dtype(),
                 )?;
-                estimator.validate_geometry(&shape, &slice)?;
+                if let Some(routed) = &point.routed_units {
+                    costs[phase_index] = routed::cost(
+                        estimator,
+                        routed.geometry,
+                        &shape,
+                        &slice,
+                        &operation.action,
+                    )?;
+                } else if point.routing.is_none() {
+                    estimator.validate_geometry(&shape, &slice)?;
+                    costs[phase_index] =
+                        activation_cost(estimator, &shape, &slice, &operation.action)?;
+                }
             }
             if let Some(policy) = &point.routing {
                 if operation.evidence != InterventionEvidence::None {
-                    let rows = mul(
-                        intervention.request().batch,
-                        if phase == CapturePhase::Prefill {
-                            intervention.request().prompt_tokens
-                        } else {
-                            1
-                        },
-                    )?;
+                    let geometry = match intervention.invocation_bounds() {
+                        Some(bounds) => bounds.maximum()?,
+                        None => intervention.request().invocation_shape(phase, last)?,
+                    };
+                    let rows = mul(geometry.batch, geometry.sequence)?;
                     costs[phase_index] = original_route_cost(estimator, policy, rows)?;
                 }
             }
         }
-        if point.routing.is_some() && operation.evidence != InterventionEvidence::None {
+        if point.routing.is_none() || operation.evidence != InterventionEvidence::None {
             scheduled_costs.push((operation.schedule.clone(), costs));
         }
     }
@@ -494,6 +531,21 @@ pub(crate) fn preflight_continuation(
         inherited,
         |source, selection, slice| estimator.capture_usage(source, selection, slice),
     )
+}
+
+fn activation_cost(
+    estimator: &dyn InterventionEstimator,
+    source: &[u64],
+    slice: &ResolvedCaptureSlice,
+    action: &InterventionAction,
+) -> Result<CaptureUsage, CaptureError> {
+    let cost = estimator.activation_usage(source, slice, action)?;
+    if cost.captures != 0 || cost.encoded_bytes != 0 {
+        return Err(CaptureError::Invalid(
+            "activation estimate must exclude capture and record encoding".into(),
+        ));
+    }
+    Ok(cost)
 }
 
 fn original_route_cost(
@@ -525,6 +577,7 @@ impl CaptureSession {
         use eredu_nn::routing_intervention::{
             GroupScoreStage, GroupSelectionAction, GroupSelectionControl,
         };
+        self.validate_ordinary_intervention()?;
         let Some(run) = &mut self.interventions else {
             return Ok(None);
         };
@@ -557,10 +610,11 @@ impl CaptureSession {
             let policy = point.routing.as_ref().ok_or_else(|| {
                 CaptureError::Invalid("routing control reached activation target".into())
             })?;
-            let slice = run.plan.validate_actual(
+            let slice = run.plan.validate_at(
                 index,
                 self.phase,
                 self.prediction,
+                self.invocation,
                 &[token_rows, policy.top_k as u64],
                 None,
             )?;
@@ -649,6 +703,8 @@ impl CaptureSession {
         original: Option<crate::RoutingDecision<'_, B::Tensor>>,
         effective: crate::RoutingDecision<'_, B::Tensor>,
     ) -> Result<(), CaptureExecutionError<B::Error>> {
+        self.validate_ordinary_intervention()?;
+        let tensor_geometry = self.tensor_geometry()?;
         let run = self
             .interventions
             .as_mut()
@@ -672,8 +728,14 @@ impl CaptureSession {
             let shape = backend
                 .shape(effective.ids)
                 .map_err(CaptureExecutionError::Backend)?;
-            run.plan
-                .validate_actual(index, self.phase, self.prediction, &shape, None)?;
+            run.plan.validate_at(
+                index,
+                self.phase,
+                self.prediction,
+                self.invocation,
+                &shape,
+                None,
+            )?;
             if backend
                 .shape(effective.coefficients)
                 .map_err(CaptureExecutionError::Backend)?
@@ -705,9 +767,7 @@ impl CaptureSession {
                         selection,
                         geometry,
                         evidence,
-                        run.plan.request(),
-                        self.phase,
-                        self.prediction,
+                        tensor_geometry,
                         &mut self.ledger,
                     )?;
                 }

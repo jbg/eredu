@@ -1115,6 +1115,33 @@ pub(super) fn iq_metal_header(format: NativeQuantizationFormat, big_endian: bool
     ));
 
     match format {
+        NativeQuantizationFormat::GgufQ4K => {
+            header.push_str(concat!(
+                "float iq_value(const device uint8_t* w,uint r,uint c){",
+                "uint b=c/256u;uint x=c%256u;uint g=x/32u;uint i=x%32u;uint p=r+b*144u;",
+                "uint s;uint m;if(g<4u){s=uint(w[p+4u+g])&63u;m=uint(w[p+8u+g])&63u;}",
+                "else{s=(uint(w[p+8u+g])&15u)|((uint(w[p+g])>>6u)<<4u);",
+                "m=(uint(w[p+8u+g])>>4u)|((uint(w[p+4u+g])>>6u)<<4u);}",
+                "uint packed=uint(w[p+16u+(g/2u)*32u+i]);",
+                "uint q=(g&1u)==0u?(packed&15u):(packed>>4u);",
+                "return iq_half(w,p)*float(s)*float(q)-iq_half(w,p+2u)*float(m);}\n"
+            ));
+        }
+        NativeQuantizationFormat::GgufQ5_1 => {
+            header.push_str(concat!(
+                "float iq_value(const device uint8_t* w,uint r,uint c){",
+                "uint p=r+(c/32u)*24u;uint i=c%32u;uint packed=uint(w[p+8u+(i&15u)]);",
+                "uint q=(i<16u?(packed&15u):(packed>>4u))|(((iq_u32(w,p+4u)>>i)&1u)<<4u);",
+                "return iq_half(w,p)*float(q)+iq_half(w,p+2u);}\n"
+            ));
+        }
+        NativeQuantizationFormat::GgufQ8_0 => {
+            header.push_str(concat!(
+                "float iq_value(const device uint8_t* w,uint r,uint c){",
+                "uint p=r+(c/32u)*34u;int q=int(as_type<char>(w[p+2u+c%32u]));",
+                "return iq_half(w,p)*float(q);}\n"
+            ));
+        }
         NativeQuantizationFormat::GgufQ5K => {
             header.push_str(concat!(
                 "float iq_value(const device uint8_t* w,uint r,uint c){",
@@ -1328,7 +1355,6 @@ pub(super) fn iq_metal_header(format: NativeQuantizationFormat, big_endian: bool
                 "return dl*float(as_type<char>(IQ4[code]));}\n"
             ));
         }
-        _ => unreachable!("IQ Metal header requested for non-IQ format"),
     }
     header
 }

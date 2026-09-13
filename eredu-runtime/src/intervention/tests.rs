@@ -1,7 +1,98 @@
 use super::*;
 use eredu_core::*;
 
+mod invocation;
 mod session;
+mod sparse;
+
+#[test]
+fn global_component_masks_preserve_positions_and_empty_keep_semantics() {
+    use eredu_core::component::ComponentCoordinateMap;
+    let input = Value {
+        shape: vec![1, 3, 8],
+        data: (1..=24).map(|value| value as f32).collect(),
+    };
+    let slice = ResolvedCaptureSlice {
+        starts: vec![0, 1, 0],
+        ends: vec![1, 3, 8],
+        strides: vec![1, 1, 1],
+        shape: vec![1, 2, 8],
+    };
+    for selected in [vec![], vec![6], vec![7, 2, 0]] {
+        for keep_selected in [false, true] {
+            let action = InterventionAction::MaskComponents {
+                dtype: InterventionDtype::Float32,
+                indices: selected.clone(),
+                keep_selected,
+            };
+            let expected =
+                apply_activation(&mut Backend::default(), &input, &action, &slice).unwrap();
+            for map in [
+                ComponentCoordinateMap::range(8, 0..4).unwrap(),
+                ComponentCoordinateMap::range(8, 4..8).unwrap(),
+                ComponentCoordinateMap::indices(8, vec![7, 2, 0]).unwrap(),
+            ] {
+                let mut local = Value {
+                    shape: vec![1, 3, map.local_count() as u64],
+                    data: Vec::new(),
+                };
+                let mut expected_local = Vec::new();
+                for row in 0..3 {
+                    for index in 0..map.local_count() {
+                        let global = row * 8 + map.local_to_global(index).unwrap();
+                        local.data.push(input.data[global]);
+                        expected_local.push(expected.data[global]);
+                    }
+                }
+                let (action, local_slice) = localize_component_mask(&action, &slice, &map).unwrap();
+                assert_eq!(local_slice.starts[1], 1);
+                let actual =
+                    apply_activation(&mut Backend::default(), &local, &action, &local_slice)
+                        .unwrap();
+                assert_eq!(actual.data, expected_local);
+            }
+        }
+    }
+}
+
+#[test]
+fn global_component_mask_rejects_invalid_remote_indices_and_geometry() {
+    let map = eredu_core::component::ComponentCoordinateMap::range(8, 0..4).unwrap();
+    let slice = ResolvedCaptureSlice {
+        starts: vec![0, 1, 0],
+        ends: vec![1, 2, 8],
+        strides: vec![1, 1, 1],
+        shape: vec![1, 1, 8],
+    };
+    for indices in [vec![8], vec![7, 7]] {
+        let action = InterventionAction::MaskComponents {
+            dtype: InterventionDtype::Float32,
+            indices,
+            keep_selected: false,
+        };
+        assert!(localize_component_mask(&action, &slice, &map).is_err());
+    }
+    let action = InterventionAction::MaskComponents {
+        dtype: InterventionDtype::Float32,
+        indices: vec![7],
+        keep_selected: true,
+    };
+    let mut invalid = slice.clone();
+    invalid.strides[1] = 0;
+    assert!(localize_component_mask(&action, &invalid, &map).is_err());
+    invalid = slice.clone();
+    invalid.ends[2] = 4;
+    invalid.shape[2] = 4;
+    assert!(localize_component_mask(&action, &invalid, &map).is_err());
+    assert!(localize_component_mask(
+        &InterventionAction::Zero {
+            dtype: InterventionDtype::Float32
+        },
+        &slice,
+        &map
+    )
+    .is_err());
+}
 
 #[derive(Clone)]
 struct Value {
@@ -14,6 +105,7 @@ struct Backend {
     applications: usize,
     copies: usize,
     fail_application: Option<usize>,
+    dtype: Option<InterventionDtype>,
 }
 
 fn indices(shape: &[u64], slice: &ResolvedCaptureSlice) -> Vec<usize> {
@@ -84,8 +176,77 @@ impl CaptureBackend for Backend {
 }
 
 impl InterventionBackend for Backend {
+    fn routed_unit_locations(
+        &mut self,
+        source: &RoutedUnitCaptureSource<'_, Value>,
+        geometry: RoutedUnitGeometry,
+    ) -> Option<Result<RoutedUnitLocations, std::io::Error>> {
+        self.copies += 1;
+        Some(Ok(RoutedUnitLocations {
+            source_token_range: [
+                source.token_offset,
+                source.token_offset + source.coefficients.shape[0],
+            ],
+            rows: source
+                .token_indices
+                .data
+                .iter()
+                .zip(&source.selection_indices.data)
+                .map(|(token, slot)| {
+                    let token = *token as u64 + source.token_offset;
+                    let slot = *slot as u64 % geometry.routes_per_token;
+                    RoutedUnitLocation {
+                        source_peer: None,
+                        token,
+                        slot,
+                        expert: source.source_groups.data
+                            [(token * geometry.routes_per_token + slot) as usize]
+                            as u64,
+                    }
+                })
+                .collect(),
+        }))
+    }
+    fn select_elements(
+        &mut self,
+        source: &Value,
+        indices: &[u64],
+    ) -> Option<Result<Value, std::io::Error>> {
+        Some(Ok(Value {
+            shape: vec![indices.len() as u64],
+            data: indices.iter().map(|i| source.data[*i as usize]).collect(),
+        }))
+    }
+    fn update_elements(
+        &mut self,
+        source: &Value,
+        indices: &[u64],
+        replacement: &Value,
+    ) -> Option<Result<Value, std::io::Error>> {
+        let mut result = source.clone();
+        for (index, value) in indices.iter().zip(&replacement.data) {
+            result.data[*index as usize] = *value;
+        }
+        Some(Ok(result))
+    }
+    fn mask_components(
+        &mut self,
+        value: &Value,
+        ids: &[u32],
+        keep_selected: bool,
+    ) -> std::result::Result<Value, std::io::Error> {
+        let width = *value.shape.last().unwrap() as usize;
+        let mut result = value.clone();
+        for (index, value) in result.data.iter_mut().enumerate() {
+            if ids.contains(&((index % width) as u32)) != keep_selected {
+                *value = 0.0;
+            }
+        }
+        Ok(result)
+    }
+
     fn intervention_dtype(&self, _: &Value) -> Result<InterventionDtype, Self::Error> {
-        Ok(InterventionDtype::Float32)
+        Ok(self.dtype.unwrap_or(InterventionDtype::Float32))
     }
     fn validate_intervention_geometry(
         &self,
@@ -198,6 +359,46 @@ impl InterventionBackend for Backend {
 
 struct Estimates;
 impl InterventionEstimator for Estimates {
+    fn routed_unit_usage(
+        &self,
+        _: RoutedUnitGeometry,
+        _: &[u64],
+        _: &ResolvedCaptureSlice,
+        _: &InterventionAction,
+    ) -> Result<CaptureUsage, CaptureError> {
+        Ok(CaptureUsage {
+            retained_bytes: 4096,
+            host_bytes: 4096,
+            ..Default::default()
+        })
+    }
+    fn activation_usage(
+        &self,
+        source: &[u64],
+        slice: &ResolvedCaptureSlice,
+        _: &InterventionAction,
+    ) -> Result<CaptureUsage, CaptureError> {
+        let elements = |shape: &[u64]| {
+            shape
+                .iter()
+                .try_fold(1u64, |n, d| n.checked_mul(*d).ok_or(CaptureError::Overflow))
+        };
+        let bytes = elements(source)?
+            .checked_add(
+                elements(&slice.shape)?
+                    .checked_mul(3)
+                    .ok_or(CaptureError::Overflow)?,
+            )
+            .and_then(|n| n.checked_mul(8))
+            .ok_or(CaptureError::Overflow)?;
+        Ok(CaptureUsage {
+            captures: 0,
+            retained_bytes: bytes,
+            host_bytes: bytes,
+            encoded_bytes: 0,
+        })
+    }
+
     fn validate_geometry(&self, _: &[u64], _: &ResolvedCaptureSlice) -> Result<(), CaptureError> {
         Ok(())
     }
@@ -261,6 +462,7 @@ fn plans(
         prefill: ObservationSupportStatus::Supported,
         decode: ObservationSupportStatus::Supported,
         conditions: vec![],
+        routed_units: None,
         routing: None,
     };
     let geometry = point.observation_geometry();
@@ -479,6 +681,76 @@ fn none_and_inactive_plans_do_not_touch_native_values() {
 }
 
 #[test]
+fn conditional_intervention_requires_actual_application_before_commitment() {
+    let (capture, original) = plans(
+        vec![operation(
+            "scale",
+            InterventionAction::Scale {
+                dtype: InterventionDtype::Float32,
+                factor: 2.0,
+            },
+        )],
+        false,
+    );
+    let mut discovery = session::discovery(&original);
+    discovery.points[0].prefill =
+        ObservationSupportStatus::Conditional("requires media input".into());
+    for present in [false, true] {
+        let intervention = original
+            .plan()
+            .clone()
+            .admit(&discovery, original.request(), original.session_id())
+            .unwrap();
+        let mut session = CaptureSession::new(capture.clone());
+        session
+            .enable_interventions(intervention, std::sync::Arc::new(Estimates))
+            .unwrap();
+        session.begin_step(CapturePhase::Prefill, 0).unwrap();
+        let mut backend = Backend::default();
+        if present {
+            let input = Value {
+                shape: vec![2, 2],
+                data: vec![1.0, -2.0, 3.0, 4.0],
+            };
+            let output = session
+                .intervene(&mut backend, "block.output", &input)
+                .unwrap()
+                .unwrap();
+            assert_eq!(output.data, vec![2.0, -4.0, 6.0, 8.0]);
+            session.finish_interventions().unwrap();
+        } else {
+            assert!(matches!(
+                session.finish_interventions(),
+                Err(CaptureError::Invalid(_))
+            ));
+        }
+        let step = session.take_step().unwrap();
+        assert_eq!(backend.applications, usize::from(present));
+        assert_eq!(
+            step.interventions[0].outcome,
+            if present {
+                InterventionOutcome::Applied
+            } else {
+                InterventionOutcome::Missing
+            }
+        );
+    }
+    for status in [
+        ObservationSupportStatus::Unsupported("no collector".into()),
+        ObservationSupportStatus::Unverified("no collector facts".into()),
+    ] {
+        discovery.points[0].prefill = status;
+        assert!(matches!(
+            original
+                .plan()
+                .clone()
+                .admit(&discovery, original.request(), original.session_id()),
+            Err(CaptureError::Unsupported(_))
+        ));
+    }
+}
+
+#[test]
 fn missing_duplicate_and_failed_operations_remain_distinct() {
     let ops = vec![
         operation(
@@ -616,3 +888,115 @@ fn immutable_run_rejects_hot_replacement_and_undrained_steps() {
     session.begin_step(CapturePhase::Prefill, 0).unwrap();
     assert!(session.begin_step(CapturePhase::Decode, 1).is_err());
 }
+
+#[test]
+fn compact_component_masks_select_arbitrary_columns_only_in_explicit_rows() {
+    let source = Value {
+        shape: vec![1, 3, 4],
+        data: (1..=12).map(|n| n as f32).collect(),
+    };
+    let slice = ResolvedCaptureSlice {
+        starts: vec![0, 1, 0],
+        ends: vec![1, 2, 4],
+        strides: vec![1, 1, 1],
+        shape: vec![1, 1, 4],
+    };
+    for keep_selected in [true, false] {
+        let mut backend = Backend::default();
+        let out = apply_activation(
+            &mut backend,
+            &source,
+            &InterventionAction::MaskComponents {
+                dtype: InterventionDtype::Float32,
+                indices: vec![0, 2],
+                keep_selected,
+            },
+            &slice,
+        )
+        .unwrap();
+        assert_eq!(&out.data[..4], &source.data[..4]);
+        assert_eq!(&out.data[8..], &source.data[8..]);
+        assert_eq!(
+            &out.data[4..8],
+            if keep_selected {
+                &[5.0, 0.0, 7.0, 0.0]
+            } else {
+                &[0.0, 6.0, 0.0, 8.0]
+            }
+        );
+    }
+    for indices in [vec![4], vec![1, 1]] {
+        let mut backend = Backend::default();
+        assert!(apply_activation(
+            &mut backend,
+            &source,
+            &InterventionAction::MaskComponents {
+                dtype: InterventionDtype::Float32,
+                indices,
+                keep_selected: true,
+            },
+            &slice
+        )
+        .is_err());
+        assert_eq!(backend.applications, 0);
+        assert_eq!(backend.copies, 0);
+    }
+}
+
+#[test]
+fn activation_storage_exhaustion_fails_before_native_edit_or_evidence_copy() {
+    let mut op = operation(
+        "zero",
+        InterventionAction::Zero {
+            dtype: InterventionDtype::Float32,
+        },
+    );
+    op.evidence = InterventionEvidence::None;
+    let (capture, intervention) = plans(vec![op], false);
+    let mut plan = capture.plan().clone();
+    plan.limits.per_step.retained_bytes = 1;
+    let catalog = ObservationCatalog {
+        schema_version: 1,
+        points: vec![],
+        completeness: DescriptionCompleteness::Complete,
+    };
+    let caps = CaptureCapabilities::default();
+    let support = ObservationSupportReport {
+        schema_version: 1,
+        capture: caps.clone(),
+        points: vec![],
+    };
+    let limited = plan
+        .admit(&catalog, &support, &caps, capture.request())
+        .unwrap();
+    assert!(matches!(
+        preflight(&limited, &intervention, &Estimates),
+        Err(CaptureError::Limit {
+            budget: CaptureBudget::Retention,
+            ..
+        })
+    ));
+    let mut session = CaptureSession::new(limited);
+    session
+        .enable_interventions(intervention, std::sync::Arc::new(Estimates))
+        .unwrap();
+    session.begin_step(CapturePhase::Prefill, 0).unwrap();
+    let mut backend = Backend::default();
+    let result = session.intervene(
+        &mut backend,
+        "block.output",
+        &Value {
+            shape: vec![2, 2],
+            data: vec![1.0; 4],
+        },
+    );
+    assert!(result.is_err());
+    assert_eq!(backend.applications, 0);
+    assert_eq!(backend.copies, 0);
+    let step = session.take_step().unwrap();
+    assert!(matches!(
+        step.interventions[0].outcome,
+        InterventionOutcome::Failed { .. }
+    ));
+}
+mod partition;

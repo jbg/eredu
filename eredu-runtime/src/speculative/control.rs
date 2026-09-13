@@ -24,8 +24,28 @@ pub struct ControlledSpeculativeOptions {
     /// Admitted raw-logit selections, captured independently for draft and target.
     /// Other activation paths require a backend with phase-aware capture support.
     pub capture: Option<eredu_core::capture::AdmittedCapturePlan>,
+    /// Internal forward observations and interventions under one cumulative
+    /// invocation budget. Physical sequence positions are independent of the
+    /// scheduler's prediction coordinate and the sampler's one-row captures.
+    pub activations: Option<eredu_core::speculative::AdmittedSpeculativeActivations>,
     /// Snapshot retention and copying limits. `None` disables snapshots.
     pub snapshots: Option<SnapshotLimits>,
+}
+
+/// One already charged internal record drained after cancellation or a failed
+/// action. Forward completion is separate from speculative token acceptance.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ControlledSpeculativeActivation {
+    /// Wire version for the delivery envelope.
+    pub schema_version: u32,
+    /// Shares the step stream's monotone delivery sequence.
+    pub sequence: u64,
+    /// Logical run which performed the invocation.
+    pub run_id: u64,
+    /// Restore epoch which performed the invocation.
+    pub epoch: u64,
+    /// Original invocation evidence, including aborted forward status.
+    pub activation: eredu_core::speculative::SpeculativeActivationCapture,
 }
 
 impl Default for ControlledSpeculativeOptions {
@@ -37,6 +57,7 @@ impl Default for ControlledSpeculativeOptions {
             },
             snapshots: None,
             capture: None,
+            activations: None,
         }
     }
 }
@@ -105,6 +126,11 @@ pub struct ControlledSpeculativeStep {
     pub sampling: Option<crate::execution_control::SamplingStateFacts>,
     /// Bounded raw-logit captures, including tentative draft and target rows.
     pub captures: Vec<eredu_core::speculative::SpeculativePredictionCapture>,
+    /// Internal component evidence from actual forwards in this action. Physical
+    /// rows, scheduler coordinates and tentative phases remain distinct. These
+    /// records share this step's run/restore identity and transport accounting.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub activations: Vec<eredu_core::speculative::SpeculativeActivationCapture>,
     /// Active time to the first committed target token, before its callbacks.
     pub timing: GenerationTiming,
     /// Active host duration of this action, including synchronous publication.
@@ -132,6 +158,12 @@ impl SpeculativeSnapshotHandle {
 /// require `can_snapshot`; committed blocks are never split into fake token steps.
 /// Returning from the controlling closure cancels and safely settles unfinished work.
 pub trait ControlledSpeculativeSession {
+    /// Replaces future internal edits using authority prepared for this loaded
+    /// execution. Capture selections, geometry and allowances remain fixed.
+    fn readmit_activation_interventions(
+        &mut self,
+        plan: eredu_core::speculative::AdmittedSpeculativeActivations,
+    ) -> Result<(), SpeculativeControlError>;
     /// Current scheduler phase, or `Prefill` before the first step.
     fn status(&self) -> SpeculativeRequestStatus;
     /// Canonical generated-token prefix.
@@ -180,6 +212,13 @@ pub trait ControlledSpeculativeSession {
     fn epoch(&self) -> u64;
     /// Performs one action; `None` means the request is already terminal.
     fn step(&mut self) -> Result<Option<ControlledSpeculativeStep>, SpeculativeControlError>;
+    /// Drains one remaining host record after cancellation or failure. This is
+    /// allowed on failed sessions and uses the same cumulative transport budget
+    /// as ordinary steps. It never launches or recovers native work. A rejected
+    /// delivery is consumed, without refunding capture or invocation allowances.
+    fn take_activation_evidence(
+        &mut self,
+    ) -> Result<Option<ControlledSpeculativeActivation>, SpeculativeControlError>;
     /// Cancels and settles any retained exact completion before returning.
     fn cancel(&mut self) -> Result<(), SpeculativeControlError>;
     /// Whether complete snapshot mechanisms and costs exist at this boundary.
@@ -235,6 +274,7 @@ where
     failed: bool,
     vocabulary: usize,
     intervention_discovery: Option<eredu_core::intervention::InterventionDiscovery>,
+    activation_discovery: Option<eredu_core::speculative::SpeculativeActivationDiscovery>,
 }
 
 impl<'a, E, S, C, P> Session<'a, E, S, C, P>
@@ -253,6 +293,29 @@ where
         } else {
             Ok(())
         }
+    }
+
+    fn agree_delivery<T>(
+        &mut self,
+        local: Result<T, SpeculativeControlError>,
+    ) -> Result<T, SpeculativeControlError> {
+        let stage = eredu_core::run_preparation::TextPreparationStage::Delivery;
+        let result = eredu_core::run_preparation::finish_preparation(
+            stage,
+            local,
+            |status| {
+                self.scheduler.executor.agree_text_preparation(
+                    stage,
+                    status,
+                    self.scheduler.context,
+                )
+            },
+            SpeculativeControlError::backend,
+        );
+        if result.is_err() {
+            self.failed = true;
+        }
+        result
     }
     fn owned(&self, handle: &SpeculativeSnapshotHandle) -> Result<(), SpeculativeControlError> {
         if !Arc::ptr_eq(&self.owner, &handle.owner) || !self.snapshots.contains_key(&handle.id) {
@@ -400,6 +463,7 @@ where
             sampling: self.sampling_state(),
             committed_token_ids: committed,
             captures: Vec::new(),
+            activations: Vec::new(),
             timing: self.timing,
             step_seconds: elapsed.as_secs_f64(),
         };
@@ -410,12 +474,18 @@ where
             .expect("submitted request")
             .sampler_mut()
             .take_control_captures();
-        self.trace.charge(&record)?;
-        self.sequence = self
-            .sequence
-            .checked_add(1)
-            .ok_or(ExecutionControlError::Overflow)?;
-        Ok(Some(record))
+        while let Some(capture) = self.scheduler.executor.take_activation_capture() {
+            record.activations.push(capture);
+        }
+        let local = (|| {
+            self.trace.charge(&record)?;
+            self.sequence = self
+                .sequence
+                .checked_add(1)
+                .ok_or(ExecutionControlError::Overflow)?;
+            Ok(Some(record))
+        })();
+        self.agree_delivery(local)
     }
 }
 
@@ -426,6 +496,25 @@ where
     C: SpeculativeConstraint,
     P: SpeculativePublisher<C>,
 {
+    fn readmit_activation_interventions(
+        &mut self,
+        plan: eredu_core::speculative::AdmittedSpeculativeActivations,
+    ) -> Result<(), SpeculativeControlError> {
+        self.healthy()?;
+        if self.lane.is_none() {
+            self.request()
+                .ok_or(SpeculativeControlError::NotQuiescent)?
+                .validate_control_edit()?;
+        }
+        plan.validate(self.activation_discovery.as_ref().ok_or(
+            SpeculativeControlError::Unsupported(
+                "loaded execution has no internal activation discovery",
+            ),
+        )?)?;
+        self.scheduler
+            .executor
+            .readmit_activation_interventions(plan)
+    }
     fn status(&self) -> SpeculativeRequestStatus {
         self.request()
             .map_or(SpeculativeRequestStatus::Prefill, |r| r.status())
@@ -564,9 +653,12 @@ where
     }
     fn step(&mut self) -> Result<Option<ControlledSpeculativeStep>, SpeculativeControlError> {
         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.step_inner())) {
-            Ok(result) => {
+            Ok(mut result) => {
                 if result.is_err() {
                     self.failed = true;
+                    if let Some(error) = self.scheduler.executor.take_activation_error() {
+                        result = Err(error);
+                    }
                 }
                 result
             }
@@ -576,6 +668,28 @@ where
             }
         }
     }
+    fn take_activation_evidence(
+        &mut self,
+    ) -> Result<Option<ControlledSpeculativeActivation>, SpeculativeControlError> {
+        let Some(activation) = self.scheduler.executor.take_activation_capture() else {
+            return Ok(None);
+        };
+        let next = self
+            .sequence
+            .checked_add(1)
+            .ok_or(ExecutionControlError::Overflow)?;
+        let record = ControlledSpeculativeActivation {
+            schema_version: 1,
+            sequence: self.sequence,
+            run_id: self.run_id,
+            epoch: self.epoch,
+            activation,
+        };
+        self.trace.charge(&record)?;
+        self.sequence = next;
+        Ok(Some(record))
+    }
+
     fn cancel(&mut self) -> Result<(), SpeculativeControlError> {
         self.healthy()?;
         // Submit a pre-cancelled lane to retain the ordinary cancellation semantics
@@ -584,17 +698,14 @@ where
             if let Some(lane) = self.lane.as_mut() {
                 lane.runtime_mut().cancellation().cancel();
             }
-            if self.lane.is_some() {
-                self.step_inner()?;
-            }
             if let Some(id) = self.id {
                 self.scheduler
                     .cancel(id)
                     .map_err(SpeculativeControlError::backend)?;
-                self.scheduler
-                    .run()
-                    .map_err(SpeculativeControlError::backend)?;
             }
+            // Use the same action and bounded-record boundary as peers calling
+            // step, including cancellation of a retained verification.
+            while self.step_inner()?.is_some() {}
             Ok(())
         }))
         .unwrap_or_else(|payload| {
@@ -603,6 +714,9 @@ where
         });
         if result.is_err() {
             self.failed = true;
+            if let Some(error) = self.scheduler.executor.take_activation_error() {
+                return Err(error);
+            }
         }
         result
     }
@@ -714,6 +828,7 @@ pub struct DriveControlledSpeculation<'f, F> {
     failure: &'f mut Option<SpeculativeControlError>,
     vocabulary: usize,
     intervention_discovery: Option<eredu_core::intervention::InterventionDiscovery>,
+    activation_discovery: Option<eredu_core::speculative::SpeculativeActivationDiscovery>,
 }
 impl<'f, F> DriveControlledSpeculation<'f, F> {
     /// Starts active preparation timing before facade and backend preparation.
@@ -730,10 +845,19 @@ impl<'f, F> DriveControlledSpeculation<'f, F> {
             failure,
             vocabulary: 0,
             intervention_discovery: None,
+            activation_discovery: None,
         }
     }
 }
 impl<F> DriveControlledSpeculation<'_, F> {
+    /// Retains authoritative loaded internal discovery for prospective edits.
+    pub fn with_activation_discovery(
+        mut self,
+        discovery: Option<eredu_core::speculative::SpeculativeActivationDiscovery>,
+    ) -> Self {
+        self.activation_discovery = discovery;
+        self
+    }
     /// Retains exact loaded capabilities for re-admission of prospective edits.
     pub fn with_intervention_discovery(
         mut self,
@@ -769,17 +893,44 @@ where
         P: SpeculativePublisher<C>,
     {
         let result = (|| {
-            if lanes.len() != 1 {
-                return Err(SpeculativeControlError::Unsupported(
+            let local = if lanes.len() != 1 {
+                Err(SpeculativeControlError::Unsupported(
                     "controlled speculation requires exactly one lane",
-                ));
-            }
+                ))
+            } else {
+                Ok(())
+            };
+            let stage = eredu_core::run_preparation::TextPreparationStage::Request;
+            eredu_core::run_preparation::finish_preparation(
+                stage,
+                local,
+                |status| executor.agree_text_preparation(stage, status, context),
+                SpeculativeControlError::backend,
+            )?;
             let mut lane = lanes.pop().expect("checked single lane");
-            if let Some(plan) = self.options.capture.clone() {
-                lane.runtime_mut()
-                    .sampler_mut()
-                    .enable_control_capture(plan)?;
-            }
+            let local = (|| {
+                if let Some(plan) = self.options.activations.clone() {
+                    // A fresh single-lane scheduler assigns its first request index zero.
+                    executor.configure_activation_capture(
+                        plan,
+                        SpeculativeRequestId::new(0),
+                        context,
+                    )?;
+                }
+                if let Some(plan) = self.options.capture.clone() {
+                    lane.runtime_mut()
+                        .sampler_mut()
+                        .enable_control_capture(plan)?;
+                }
+                Ok(())
+            })();
+            let stage = eredu_core::run_preparation::TextPreparationStage::Instrumentation;
+            eredu_core::run_preparation::finish_preparation(
+                stage,
+                local,
+                |status| executor.agree_text_preparation(stage, status, context),
+                SpeculativeControlError::backend,
+            )?;
             let scheduler = SpeculativeScheduler::new(
                 executor,
                 self.run.options,
@@ -808,12 +959,24 @@ where
                 failed: false,
                 vocabulary: self.vocabulary,
                 intervention_discovery: self.intervention_discovery,
+                activation_discovery: self.activation_discovery,
             };
-            (self.drive)(&mut session)?;
-            session.healthy()?;
+            let driven = (self.drive)(&mut session);
+            if session.failed {
+                // The failing step already agreed its outcome. Even callers
+                // that ignore it cannot start an unmatched final exchange.
+                driven?;
+                return Err(SpeculativeControlError::Failed);
+            }
+            if driven.is_err() {
+                // A caller-owned failure aligns with a peer's next readiness
+                // check or its final controlling-closure disposition.
+                session.agree_delivery(driven)?;
+            }
             if session.lane.is_some() || !session.scheduler.is_finished() {
                 session.cancel()?;
             }
+            session.agree_delivery(Ok(()))?;
             let timing = session.timing;
             let completed = session
                 .scheduler

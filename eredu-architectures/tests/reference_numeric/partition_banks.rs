@@ -118,7 +118,7 @@ pub(super) fn bind(
     Error,
 > {
     let pool = Rc::new(RefCell::new(Pool {
-        budget: options.offload().device_budget_bytes().unwrap(),
+        budget: options.offload().device_budget_bytes().unwrap_or(u64::MAX),
         ..Pool::default()
     }));
     banks

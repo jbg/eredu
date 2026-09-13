@@ -5,6 +5,60 @@ fn singleton_communication() -> (crate::backend::runtime::distributed::Group, sa
     (group, stream)
 }
 
+fn verify_role_exact_payload_alignment(device: DeviceType) {
+    let stream = safemlx::Stream::new_with_device(&Device::new(device, 0));
+    let expected = [0.03125_f32, -1.5, 2.75, -0.125, 13.0, 0.5];
+    for dtype in [Dtype::Float32, Dtype::Float16, Dtype::Bfloat16] {
+        let source = Array::from_slice(&expected, &[2, 3])
+            .as_dtype(dtype, &stream)
+            .unwrap();
+        let bytes = source
+            .view_dtype(Dtype::Uint8, &stream)
+            .unwrap()
+            .reshape(&[-1], &stream)
+            .unwrap();
+        for header_len in 1..=8 {
+            let header = Array::from_slice(&vec![0xadu8; header_len], &[header_len as i32]);
+            let frame = safemlx::ops::concatenate(&[&header, &bytes], &stream).unwrap();
+            frame.evaluated().unwrap();
+            let decoded = super::submission::decode_boundary_payload(
+                &frame,
+                header_len as i32,
+                &source,
+                &stream,
+            )
+            .unwrap();
+            assert_eq!(decoded.shape(), source.shape());
+            assert_eq!(decoded.dtype(), source.dtype());
+            let actual = decoded.as_dtype(Dtype::Float32, &stream).unwrap();
+            assert_eq!(actual.evaluated().unwrap().as_slice::<f32>(), &expected);
+            // Consumption by a typed native kernel must agree too; a byte-wise
+            // host copy alone can hide a misaligned floating-point view.
+            let doubled = decoded
+                .add(&decoded, &stream)
+                .unwrap()
+                .as_dtype(Dtype::Float32, &stream)
+                .unwrap();
+            assert_eq!(
+                doubled.evaluated().unwrap().as_slice::<f32>(),
+                &expected.map(|v| v * 2.0)
+            );
+        }
+    }
+}
+
+#[test]
+fn role_exact_payloads_preserve_values_at_every_header_alignment() {
+    verify_role_exact_payload_alignment(DeviceType::Cpu);
+}
+
+#[cfg(feature = "metal")]
+#[test]
+#[ignore = "requires native Metal execution"]
+fn metal_role_exact_payloads_preserve_values_at_every_header_alignment() {
+    verify_role_exact_payload_alignment(DeviceType::Gpu);
+}
+
 #[test]
 fn local_dependency_submission_retains_exact_outputs_and_executor_under_bound() {
     use eredu_core::BoundedCompletion as _;

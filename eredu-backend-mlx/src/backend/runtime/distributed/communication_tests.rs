@@ -6,30 +6,30 @@ use std::{
 };
 
 use eredu_core::{
-    checkpoint::TensorDtype, BoundedSubmissionOutcome, CollectiveGroupId, Completion as _,
-    ParallelTopology,
+    BoundedSubmissionOutcome, CollectiveGroupId, Completion as _, ParallelTopology,
+    checkpoint::TensorDtype,
 };
 use eredu_runtime::{
-    project_all_communication_manifests, BarrierBackend, BoundaryRoleContract, BroadcastBackend,
-    CommunicationGroupDescriptor, CommunicationGroupRequirements, CommunicationManifest,
-    CommunicationOperation, CommunicationOperationRequirement, CommunicationRouteDescriptor,
-    CommunicationRouteId, CommunicationTensorLimits, DistributedExecutionPhase, EvenGatherBackend,
+    BarrierBackend, BoundaryRoleContract, BroadcastBackend, CommunicationGroupDescriptor,
+    CommunicationGroupRequirements, CommunicationManifest, CommunicationOperation,
+    CommunicationOperationRequirement, CommunicationRouteDescriptor, CommunicationRouteId,
+    CommunicationTensorLimits, DistributedExecutionPhase, EvenGatherBackend,
     FailureAgreementBackend, OpaqueFailureAgreement, PartitionCommitAgreement,
     PartitionCommunication, PointToPointBackend, RealizedCommunicationGroup,
-    RoleExactBoundaryContract, TopologyCommunicationPlan,
+    RoleExactBoundaryContract, TopologyCommunicationPlan, project_all_communication_manifests,
 };
 use safemlx::{
-    distributed::{self, Backend},
     Array, Device, DeviceType, Stream,
+    distributed::{self, Backend},
 };
 
 use crate::{
-    backend::nn::shared::{MlxCommunicationTensorMetadata, MlxNeuralBackend},
     MlxTensor,
+    backend::nn::shared::{MlxCommunicationTensorMetadata, MlxNeuralBackend},
 };
 
-use super::topology::{CommunicationRouteEndpoint, ParallelCommunicators};
 use super::Group;
+use super::topology::{CommunicationRouteEndpoint, ParallelCommunicators};
 
 const WORKER_RANK: &str = "EREDU_FINE_COMMUNICATION_RING_WORKER";
 const MISMATCH_WORKER_RANK: &str = "EREDU_MANIFEST_MISMATCH_RING_WORKER";
@@ -348,14 +348,16 @@ fn point_to_point_worker() {
             )
             .unwrap(),
         ],
-        vec![CommunicationRouteDescriptor::new(
-            CommunicationRouteId::new(41),
-            0,
-            0,
-            1,
-            route_requirement(),
-        )
-        .unwrap()],
+        vec![
+            CommunicationRouteDescriptor::new(
+                CommunicationRouteId::new(41),
+                0,
+                0,
+                1,
+                route_requirement(),
+            )
+            .unwrap(),
+        ],
     )
     .unwrap()
     .with_completion_policy(completion_policy());
@@ -530,17 +532,19 @@ fn failure_agreement_worker() {
     let manifest = CommunicationManifest::new(
         2,
         rank,
-        vec![CommunicationGroupDescriptor::new(
-            group_id,
-            0,
-            vec![0, 1],
-            Some(rank),
-            CommunicationGroupRequirements::new([
-                CommunicationOperationRequirement::failure_agreement(true),
-            ])
+        vec![
+            CommunicationGroupDescriptor::new(
+                group_id,
+                0,
+                vec![0, 1],
+                Some(rank),
+                CommunicationGroupRequirements::new([
+                    CommunicationOperationRequirement::failure_agreement(true),
+                ])
+                .unwrap(),
+            )
             .unwrap(),
-        )
-        .unwrap()],
+        ],
         Vec::new(),
     )
     .unwrap()
@@ -609,14 +613,16 @@ fn manifest_mismatch_worker() {
     let manifest = CommunicationManifest::new(
         2,
         rank,
-        vec![CommunicationGroupDescriptor::new(
-            CollectiveGroupId::new(47),
-            0,
-            vec![0, 1],
-            Some(rank),
-            CommunicationGroupRequirements::new([requirement]).unwrap(),
-        )
-        .unwrap()],
+        vec![
+            CommunicationGroupDescriptor::new(
+                CollectiveGroupId::new(47),
+                0,
+                vec![0, 1],
+                Some(rank),
+                CommunicationGroupRequirements::new([requirement]).unwrap(),
+            )
+            .unwrap(),
+        ],
         Vec::new(),
     )
     .unwrap();
@@ -639,10 +645,14 @@ fn manifest_mismatch_worker() {
         0,
         "manifest corruption reached subgroup realization"
     );
+    assert!(
+        super::group::native_collective_submissions() > 0,
+        "manifest rejection must follow the shared control-plane exchange"
+    );
     assert_eq!(
-        super::group::native_collective_submissions(),
+        super::group::contracted_collective_submissions(),
         0,
-        "manifest corruption reached subgroup or payload collective work"
+        "manifest corruption reached contracted payload collective work"
     );
 }
 
@@ -758,3 +768,6 @@ mod collectives;
 mod contracts;
 mod failure;
 mod routes;
+mod status;
+
+mod ordered_wave;

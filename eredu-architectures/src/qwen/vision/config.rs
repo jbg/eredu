@@ -161,8 +161,10 @@ impl VisionConfig {
 
     /// Resolves one canonical parameter's complete linear format.
     pub fn linear_format(&self, name: &str) -> LinearFormat {
+        let relative = name.strip_prefix("model.visual.").unwrap_or(name);
         self.linear_formats
-            .get(name)
+            .get(relative)
+            .or_else(|| self.linear_formats.get(&format!("model.visual.{relative}")))
             .copied()
             .unwrap_or(LinearFormat::Dense)
     }
@@ -277,6 +279,20 @@ impl VisionConfig {
                 return Err(VisionConfigError::Invalid(
                     "vision linear-format identity must not be empty".into(),
                 ));
+            }
+            let relative = name.strip_prefix("model.visual.").unwrap_or(name);
+            if self
+                .linear_formats
+                .get(relative)
+                .is_some_and(|alias| alias != format)
+                || self
+                    .linear_formats
+                    .get(&format!("model.visual.{relative}"))
+                    .is_some_and(|alias| alias != format)
+            {
+                return Err(VisionConfigError::Invalid(format!(
+                    "conflicting vision linear formats for {name}"
+                )));
             }
             format
                 .validate()

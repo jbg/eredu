@@ -23,7 +23,7 @@ use eredu_checkpoint::{
 
 use super::DecoderConfig;
 
-/// Derives a Muse-Glimmer configuration whose text and vision matrix formats
+/// Derives a Muse-Glimmer configuration whose text and aligned vision matrix formats
 /// reflect load-time quantization instead of checkpoint-specific selections.
 pub fn load_time_quantization(
     args: &DecoderConfig,
@@ -35,8 +35,35 @@ pub fn load_time_quantization(
     target.quantized_weights = None;
     target.quantized_weight_configs = None;
     if let Some(vision) = &mut target.vision_config {
-        vision.weight_quantization = Some(quantization);
+        vision.weight_quantization = None;
         vision.quantized_weight_configs.clear();
+    }
+    if target.vision_config.is_some() {
+        // Derive candidates from the same checked geometry that owns source
+        // admission. Small patch inputs and other unaligned media matrices
+        // remain dense; explicit checkpoint formats are handled separately.
+        let mut tensors = Vec::new();
+        add_safetensors_vision(
+            &target,
+            dimension(target.hidden_size, "text hidden size")?,
+            &mut tensors,
+        )?;
+        let group = usize::try_from(quantization.group_size())
+            .map_err(|_| "negative quantization group size")?;
+        target
+            .vision_config
+            .as_mut()
+            .unwrap()
+            .quantized_weight_configs = tensors
+            .into_iter()
+            .filter(|tensor| {
+                tensor.shape.len() == 2
+                    && tensor.shape[1] > 0
+                    && tensor.shape[1].is_multiple_of(group)
+                    && tensor.shape[1].is_multiple_of(32)
+            })
+            .map(|tensor| (tensor.key, quantization))
+            .collect();
     }
     target.validate().map_err(|error| error.to_string())?;
     Ok(target)
@@ -520,7 +547,7 @@ fn indexed_recipe_target(target: &str, root: &str) -> Result<Option<usize>, Stri
         .map_err(|_| format!("architecture recipe target {target:?} has a non-numeric unit index"))
 }
 
-fn canonical_safetensors_target(source: &str) -> String {
+pub(crate) fn canonical_safetensors_target(source: &str) -> String {
     let canonical = source
         .replace("model.language_model.layers.", "model.layers.")
         .replace("model.language_model.embed_tokens.", "model.embed_tokens.")
@@ -707,12 +734,14 @@ fn add_moe_layout(
             LayoutVariant {
                 id: "packed gate/up bank".into(),
                 tensors: packed,
-                discriminator_keys: vec![packed_gate_up, packed_down],
+                // Both bank layouts require the same down projection. Its
+                // presence does not select either gate/up representation.
+                discriminator_keys: vec![packed_gate_up],
             },
             LayoutVariant {
                 id: "split expert banks".into(),
                 tensors: split,
-                discriminator_keys: vec![split_gate, split_up, split_down],
+                discriminator_keys: vec![split_gate, split_up],
             },
             LayoutVariant {
                 id: "independent experts".into(),
@@ -1076,6 +1105,40 @@ pub fn projector_gguf_plan(args: &DecoderConfig) -> Result<GgufCheckpointPlan, S
     .map_err(|error| error.to_string())
 }
 
+/// Lowers the published spatial patch kernel to the linear patch operator.
+pub fn projector_gguf_recipes<C: RecipeCatalog + ?Sized>(
+    args: &DecoderConfig,
+    catalog: &C,
+) -> Result<BTreeMap<String, DerivedWeightRecipe>, String> {
+    let Some(vision) = args.vision_config.as_ref() else {
+        return Ok(BTreeMap::new());
+    };
+    let target = "model.vision_tower.patch_embedder.patch_embedding.weight";
+    let source = first_existing(catalog, [target.to_owned(), "v.patch_embd.weight".into()])
+        .ok_or_else(|| "Muse-Glimmer projector patch kernel is missing".to_owned())?;
+    let hidden = dimension(vision.hidden_size, "vision hidden size")?;
+    let patch = dimension(vision.patch_size, "vision patch size")?;
+    let width = checked_mul(3, checked_mul(patch, patch, "patch area")?, "patch width")?;
+    let metadata = catalog
+        .tensor_metadata(&source)
+        .map_err(|error| error.to_string())?;
+    if metadata.logical_shape != [hidden, 3, patch, patch]
+        && metadata.logical_shape != [hidden, width]
+    {
+        return Err(format!(
+            "Muse-Glimmer projector patch kernel has invalid shape {:?}",
+            metadata.logical_shape
+        ));
+    }
+    Ok(BTreeMap::from([(
+        target.into(),
+        DerivedWeightRecipe::Reshape {
+            input: Box::new(DerivedWeightRecipe::source(source, TensorSelection::Full)),
+            shape: vec![hidden, width],
+        },
+    )]))
+}
+
 fn safe_alias(
     source: impl Into<String>,
     canonical: impl Into<String>,
@@ -1122,6 +1185,9 @@ pub fn expert_recipes<C: RecipeCatalog + ?Sized>(
 ) -> Result<GatedProductExpertRecipes, String> {
     let root = format!("model.layers.{layer}.mlp.experts");
     let raw = format!("blk.{layer}");
+    let source = |canonical: String, raw: String| {
+        first_existing(catalog, [canonical, raw]).unwrap_or_default()
+    };
     resolve_gated_product_expert_recipes(
         catalog,
         &GatedProductExpertLayoutNames {
@@ -1129,9 +1195,18 @@ pub fn expert_recipes<C: RecipeCatalog + ?Sized>(
             target_down: format!("{root}.down_proj"),
             packed_gate_up: format!("{root}.gate_up_proj"),
             packed_down: format!("{root}.down_proj"),
-            separate_gate: format!("{raw}.ffn_gate_exps.weight"),
-            separate_up: format!("{raw}.ffn_up_exps.weight"),
-            separate_down: format!("{raw}.ffn_down_exps.weight"),
+            separate_gate: source(
+                format!("{root}.gate_proj.weight"),
+                format!("{raw}.ffn_gate_exps.weight"),
+            ),
+            separate_up: source(
+                format!("{root}.up_proj.weight"),
+                format!("{raw}.ffn_up_exps.weight"),
+            ),
+            separate_down: source(
+                format!("{root}.down_proj.weight"),
+                format!("{raw}.ffn_down_exps.weight"),
+            ),
             independent: Vec::new(),
         },
     )
@@ -1331,6 +1406,26 @@ mod tests {
         }
     }
 
+    impl eredu_checkpoint::validation::SafetensorsCatalog for Catalog {
+        fn keys(&self) -> Vec<String> {
+            self.0.keys().cloned().collect()
+        }
+
+        fn metadata(
+            &self,
+            key: &str,
+        ) -> Result<eredu_checkpoint::validation::CatalogTensorMetadata, String> {
+            self.tensor_metadata(key)
+                .map(
+                    |value| eredu_checkpoint::validation::CatalogTensorMetadata {
+                        shape: value.physical_shape,
+                        stored_dtype: value.stored_dtype,
+                    },
+                )
+                .map_err(|error| error.to_string())
+        }
+    }
+
     fn metadata(name: &str, shape: Vec<usize>) -> TensorMetadata {
         TensorMetadata {
             name: name.into(),
@@ -1401,6 +1496,213 @@ mod tests {
             value["text_config"]["norm_topk_prob"] = true.into();
         }
         DecoderConfig::from_hf_value(&value).unwrap()
+    }
+
+    #[test]
+    fn gguf_projector_patch_recipe_preserves_spatial_order_and_exact_geometry() {
+        let mut args = decoder(false);
+        args.weight_convention = super::super::WeightConvention::Gguf;
+        args.vision_config.as_mut().unwrap().temporal_patch_size = 1;
+        let target = "model.vision_tower.patch_embedder.patch_embedding.weight";
+        for source in [target, "v.patch_embd.weight"] {
+            for shape in [vec![4, 3, 2, 2], vec![4, 12]] {
+                let values = (0..48)
+                    .map(|index| (index as f32 * 7.0 - 139.0) / 64.0)
+                    .flat_map(f32::to_le_bytes)
+                    .collect::<Vec<_>>();
+                let directory = tempfile::tempdir().unwrap();
+                let path = directory.path().join("patch.safetensors");
+                let view =
+                    safetensors::tensor::TensorView::new(safetensors::Dtype::F32, shape, &values)
+                        .unwrap();
+                safetensors::tensor::serialize_to_file([(source, view)], None, &path).unwrap();
+                let catalog = eredu_checkpoint::store::SafetensorsWeightStore::open(&path).unwrap();
+                let recipe = projector_gguf_recipes(&args, &catalog)
+                    .unwrap()
+                    .remove(target)
+                    .unwrap();
+                assert_eq!(recipe.infer(&catalog).unwrap().shape, [4, 12]);
+                assert_eq!(recipe.source_keys(), [source]);
+                let read = recipe.prepare_encoded_read(&catalog).unwrap().unwrap();
+                assert_eq!(read.output().shape, [4, 12]);
+                let mut actual = vec![0; values.len()];
+                read.read_into(&mut actual).unwrap();
+                assert_eq!(
+                    actual, values,
+                    "patch channel/spatial order must be preserved"
+                );
+            }
+            let invalid = Catalog(BTreeMap::from([(
+                source.into(),
+                metadata(source, vec![4, 2, 3, 2]),
+            )]));
+            assert!(projector_gguf_recipes(&args, &invalid)
+                .unwrap_err()
+                .contains("invalid shape"));
+        }
+        assert!(projector_gguf_recipes(&args, &Catalog(BTreeMap::new())).is_err());
+        args.vision_config = None;
+        assert!(projector_gguf_recipes(&args, &Catalog(BTreeMap::new()))
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn gguf_expert_recipes_accept_raw_and_prepared_canonical_sources() {
+        for canonical in [false, true] {
+            let mut tensors = BTreeMap::new();
+            let mut keys = Vec::new();
+            for local in ["ffn_gate_exps", "ffn_up_exps", "ffn_down_exps"] {
+                let raw = format!("blk.0.{local}.weight");
+                let key = if canonical {
+                    translate_text_gguf_name(&raw)
+                } else {
+                    raw
+                };
+                tensors.insert(key.clone(), metadata(&key, vec![4, 64, 64]));
+                keys.push(key);
+            }
+            let catalog = Catalog(tensors.clone());
+            let recipes = expert_recipes(&catalog, 0).unwrap();
+            assert_eq!(
+                recipes.target_gate_up,
+                "model.layers.0.mlp.experts.gate_up_proj"
+            );
+            assert_eq!(recipes.target_down, "model.layers.0.mlp.experts.down_proj");
+            assert_eq!(recipes.gate_up.infer(&catalog).unwrap().shape, [4, 128, 64]);
+            assert_eq!(recipes.down.infer(&catalog).unwrap().shape, [4, 64, 64]);
+            let actual = recipes
+                .gate_up
+                .source_keys()
+                .into_iter()
+                .map(str::to_owned)
+                .collect::<BTreeSet<_>>();
+            assert_eq!(actual, keys[..2].iter().cloned().collect());
+            for missing in &keys {
+                let mut incomplete = tensors.clone();
+                incomplete.remove(missing);
+                assert!(expert_recipes(&Catalog(incomplete), 0).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn expert_catalog_admits_complete_layouts_and_rejects_missing_or_mixed_banks() {
+        use eredu_checkpoint::validation::{
+            validate_safetensors_plan, CheckpointIssueKind, CheckpointValidation,
+        };
+        let plan = safetensors_plan(&decoder(true)).unwrap();
+        let layouts = &plan.layout_groups[0].variants;
+        for aliases in [false, true] {
+            let name = |tensor: &SafetensorsTensorConstraint| {
+                if aliases {
+                    tensor.aliases.first().unwrap_or(&tensor.key).clone()
+                } else {
+                    tensor.key.clone()
+                }
+            };
+            for (index, layout) in layouts.iter().enumerate() {
+                let tensors = plan
+                    .common_tensors
+                    .iter()
+                    .chain(&layout.tensors)
+                    .map(|tensor| {
+                        let key = name(tensor);
+                        (key.clone(), metadata(&key, tensor.shape.clone()))
+                    })
+                    .collect::<BTreeMap<_, _>>();
+                assert_eq!(
+                    validate_safetensors_plan(&Catalog(tensors.clone()), &plan),
+                    CheckpointValidation::Exact,
+                    "{} aliases={aliases}",
+                    layout.id
+                );
+
+                let down = layout
+                    .tensors
+                    .iter()
+                    .find(|tensor| tensor.key.contains(".down_proj"))
+                    .unwrap();
+                let mut missing = tensors.clone();
+                missing.remove(&name(down));
+                let CheckpointValidation::Invalid(issues) =
+                    validate_safetensors_plan(&Catalog(missing), &plan)
+                else {
+                    panic!("missing down projection admitted: {}", layout.id);
+                };
+                assert!(issues
+                    .iter()
+                    .any(|issue| issue.kind == CheckpointIssueKind::MissingTensor));
+
+                let other = &layouts[usize::from(index == 0)];
+                let gate = other
+                    .tensors
+                    .iter()
+                    .find(|tensor| tensor.key.contains("gate"))
+                    .unwrap();
+                let key = name(gate);
+                let mut mixed = tensors;
+                assert!(mixed
+                    .insert(key.clone(), metadata(&key, gate.shape.clone()))
+                    .is_none());
+                let CheckpointValidation::Invalid(issues) =
+                    validate_safetensors_plan(&Catalog(mixed), &plan)
+                else {
+                    panic!("mixed expert banks admitted: {}", layout.id);
+                };
+                assert!(issues
+                    .iter()
+                    .any(|issue| issue.kind == CheckpointIssueKind::ConflictingLayout));
+            }
+        }
+    }
+
+    #[test]
+    fn load_time_quantization_preserves_unaligned_media_and_selects_aligned_projections() {
+        for quantization in [
+            WeightQuantization::Affine(eredu_checkpoint::AffineQuantization::new(32, 4).unwrap()),
+            WeightQuantization::MxFp4,
+        ] {
+            let mut source = decoder(false);
+            source.vision_out_hidden_size = 128;
+            source.projector_hidden_size = 32;
+            let vision = source.vision_config.as_mut().unwrap();
+            vision.hidden_size = 32;
+            vision.intermediate_size = 64;
+            vision.projector_hidden_size = 32;
+            // Patch extent is 2 * 3 * 2 * 2 = 24, not a packed block.
+            let patch = "model.vision_tower.patch_embedder.patch_embedding.weight";
+            vision
+                .quantized_weight_configs
+                .insert(patch.into(), quantization);
+            let target = load_time_quantization(&source, quantization).unwrap();
+            let vision = target.vision_config.as_ref().unwrap();
+            assert_eq!(
+                vision.linear_format_for(patch),
+                eredu_checkpoint::LinearFormat::Dense
+            );
+            for aligned in [
+                "model.vision_tower.patch_embedder.position_embedding_table.weight",
+                "model.vision_tower.layers.0.attn.q_proj.weight",
+                "model.vision_tower.layers.0.mlp.fc2.weight",
+                "model.vision_adapter.fc1.weight",
+                "model.vision_projection.weight",
+            ] {
+                assert_eq!(
+                    vision.linear_format_for(aligned),
+                    quantization.into(),
+                    "{aligned}"
+                );
+            }
+            assert_eq!(
+                target.linear_format_for("model.layers.0.self_attn.q_proj.weight"),
+                quantization.into()
+            );
+            assert_ne!(
+                target.architecture_fingerprint(),
+                source.architecture_fingerprint()
+            );
+        }
     }
 
     #[test]

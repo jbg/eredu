@@ -205,7 +205,13 @@ pub(super) fn recipe_value(
             }
         }
         DerivedWeightRecipe::NegLog { input } => {
-            Ok(recipe_value(input, checkpoint, context)?.map(|x| -x.ln()))
+            let value = recipe_value(input, checkpoint, context)?;
+            if value.data.iter().any(|x| !(*x < 0.0)) {
+                return Err(Error::backend(
+                    "negative-log source must be strictly negative",
+                ));
+            }
+            Ok(value.map(|x| (-x).ln()))
         }
         DerivedWeightRecipe::SubtractOne { input } => {
             Ok(recipe_value(input, checkpoint, context)?.map(|x| x - 1.0))
@@ -221,6 +227,41 @@ struct Bind<'a> {
     omitted: &'a BTreeSet<String>,
     bound: BTreeSet<String>,
     error: Option<String>,
+}
+
+pub(super) fn poison_unselected_static(
+    module: &mut impl Parameterized<NumericTensor>,
+    tasks: &[ReplicatedTextMaterializationTask],
+) -> Vec<String> {
+    struct Poison<'a> {
+        selected: BTreeSet<&'a str>,
+        omitted: Vec<String>,
+    }
+    impl<'a> ParameterVisitorMut<'a, NumericTensor> for Poison<'_> {
+        fn visit_mut(&mut self, metadata: ParameterMetadata, value: &'a mut NumericTensor) {
+            if !self.selected.contains(metadata.id.as_str()) {
+                value.data.fill(f32::NAN);
+                self.omitted.push(metadata.id.to_string());
+            }
+        }
+    }
+    let mut visitor = Poison {
+        selected: tasks
+            .iter()
+            .flat_map(|task| {
+                std::iter::once(task.name())
+                    .chain(task.aliases().iter().map(String::as_str))
+                    .chain(
+                        task.output_companions()
+                            .iter()
+                            .map(|companion| companion.name()),
+                    )
+            })
+            .collect(),
+        omitted: Vec::new(),
+    };
+    module.visit_parameters_mut(&mut visitor);
+    visitor.omitted
 }
 
 impl<'a> ParameterVisitorMut<'a, NumericTensor> for Bind<'_> {
@@ -319,6 +360,17 @@ fn values(
     context: &NumericContext,
 ) -> Result<BTreeMap<String, NumericTensor>, Error> {
     let mut values = BTreeMap::new();
+    // Fused physical inputs may be admitted aliases of several distinct derived
+    // outputs. Such a source identity cannot name any one executable output.
+    let mut alias_claims = BTreeMap::<&str, usize>::new();
+    for task in tasks {
+        for name in std::iter::once(task.name())
+            .chain(task.aliases().iter().map(String::as_str))
+            .collect::<BTreeSet<_>>()
+        {
+            *alias_claims.entry(name).or_default() += 1;
+        }
+    }
     for task in tasks {
         let mut value = recipe_value(
             &task.source_recipe().map_err(Error::backend)?,
@@ -374,7 +426,12 @@ fn values(
                 ))
             }
         }
-        for name in std::iter::once(task.name()).chain(task.aliases().iter().map(String::as_str)) {
+        for name in std::iter::once(task.name()).chain(
+            task.aliases()
+                .iter()
+                .map(String::as_str)
+                .filter(|name| *name != task.name() && alias_claims.get(name) == Some(&1)),
+        ) {
             if values.insert(name.to_owned(), value.clone()).is_some() {
                 return Err(Error::backend(format!(
                     "numeric selected payload duplicates {name:?}"
@@ -584,16 +641,39 @@ pub(super) fn addressable_values(
     let mut values = BTreeMap::new();
     let mut bytes = 0;
     for (parameter, binding) in member.parameters().iter().zip(bindings) {
-        if parameter.task().executable() != eredu_checkpoint::LinearFormat::Dense {
-            return Err(Error::backend(
-                "scalar member payload requires a dense executable",
-            ));
-        }
         let recipe = binding.source_recipe();
         let metadata = recipe.infer(checkpoint).map_err(Error::backend)?;
         bytes += eredu_runtime::selected_addressable_parameter_bytes(parameter.task(), &metadata)
             .map_err(Error::backend)?;
-        let value = recipe_value(&recipe, checkpoint, context)?;
+        let mut value = recipe_value(&recipe, checkpoint, context)?;
+        match parameter.task().executable() {
+            eredu_checkpoint::LinearFormat::Dense => {}
+            eredu_checkpoint::LinearFormat::Affine(format)
+                if matches!(
+                    parameter.task().lowering(),
+                    eredu_runtime::WeightLoweringKind::Transform
+                        | eredu_runtime::WeightLoweringKind::DerivedTransform
+                ) =>
+            {
+                // The same scalar affine oracle serves ordinary and independent
+                // banks. Selected byte charges still describe packed storage.
+                let (expanded, scale, bias) = affine_expansion(value, format)?;
+                value = expanded;
+                let companions = parameter.quantization_companions().ok_or_else(|| {
+                    Error::backend("scalar affine member has no companion bindings")
+                })?;
+                values.insert(companions.scale().to_owned(), scale);
+                let bias_name = companions
+                    .affine_bias()
+                    .ok_or_else(|| Error::backend("scalar affine member has no bias binding"))?;
+                values.insert(bias_name.to_owned(), bias);
+            }
+            _ => {
+                return Err(Error::backend(
+                    "scalar member payload does not admit this executable lowering",
+                ));
+            }
+        }
         values.insert(parameter.binding_name().to_owned(), value);
     }
     Ok((values, bytes))

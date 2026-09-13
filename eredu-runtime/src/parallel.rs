@@ -145,12 +145,28 @@ pub enum MemberSharding {
         /// Source tensor axis to partition.
         axis: usize,
     },
+    /// Map shared logical units to physical chunks, retaining a short final chunk.
+    PartitionedChunks {
+        /// Physical source axis.
+        axis: usize,
+        /// Physical elements in each complete logical unit.
+        chunk_size: usize,
+    },
     /// Map the same group-level logical range into each supplied source segment.
     PartitionedSegments {
         /// Source tensor axis containing the fused segments.
         axis: usize,
         /// Ordered, non-overlapping physical source ranges.
         segments: Vec<Range<usize>>,
+    },
+    /// Apply shared logical chunks independently to each fused source segment.
+    PartitionedChunkSegments {
+        /// Physical source axis.
+        axis: usize,
+        /// Ordered, non-overlapping physical source ranges.
+        segments: Vec<Range<usize>>,
+        /// Elements per complete logical unit within each segment.
+        chunk_size: usize,
     },
     /// Partition each supplied source range independently.
     Segmented {
@@ -169,6 +185,7 @@ pub struct ParameterMemberSpec {
     sharding: MemberSharding,
     linear_companion: Option<eredu_nn::LinearCompanionRole>,
     linear_companion_of: Option<String>,
+    linear_row_layout: eredu_nn::LinearRowLayout,
 }
 
 impl ParameterMemberSpec {
@@ -184,10 +201,12 @@ impl ParameterMemberSpec {
             sharding,
             linear_companion: None,
             linear_companion_of: None,
+            linear_row_layout: eredu_nn::LinearRowLayout::Contiguous,
         }
     }
 
     fn with_parameter_metadata(mut self, metadata: &ParameterMetadata) -> Self {
+        self.linear_row_layout = metadata.linear_row_layout;
         self.linear_companion = metadata.linear_companion;
         self.linear_companion_of = metadata
             .linear_companion_of
@@ -199,6 +218,16 @@ impl ParameterMemberSpec {
     fn with_sharding(mut self, sharding: MemberSharding) -> Self {
         self.sharding = sharding;
         self
+    }
+
+    fn with_linear_row_layout(mut self, layout: eredu_nn::LinearRowLayout) -> Self {
+        self.linear_row_layout = layout;
+        self
+    }
+
+    /// Independent row-block origins of the primary encoded weight.
+    pub const fn linear_row_layout(&self) -> eredu_nn::LinearRowLayout {
+        self.linear_row_layout
     }
 
     fn with_linear_companion(mut self, role: eredu_nn::LinearCompanionRole, primary: &str) -> Self {
@@ -300,8 +329,57 @@ impl ParameterGroupSpec {
             }
             has_partitioned_member |= matches!(
                 member.sharding,
-                MemberSharding::Partitioned { .. } | MemberSharding::PartitionedSegments { .. }
+                MemberSharding::Partitioned { .. }
+                    | MemberSharding::PartitionedSegments { .. }
+                    | MemberSharding::PartitionedChunks { .. }
+                    | MemberSharding::PartitionedChunkSegments { .. }
             );
+            let chunks = match member.sharding() {
+                MemberSharding::PartitionedChunks { axis, chunk_size } => {
+                    let extent = member.global_shape().get(*axis).ok_or_else(|| {
+                        ParallelPlanError::InvalidTensor("chunked partition axis is absent".into())
+                    })?;
+                    Some((*chunk_size, vec![*extent]))
+                }
+                MemberSharding::PartitionedChunkSegments {
+                    axis,
+                    segments,
+                    chunk_size,
+                } => {
+                    let extent = member.global_shape().get(*axis).ok_or_else(|| {
+                        ParallelPlanError::InvalidTensor("chunked segment axis is absent".into())
+                    })?;
+                    let mut previous = 0;
+                    for segment in segments {
+                        if segment.start < previous
+                            || segment.start >= segment.end
+                            || segment.end > *extent
+                        {
+                            return Err(ParallelPlanError::InvalidTensor(
+                                "invalid chunked partition segments".into(),
+                            ));
+                        }
+                        previous = segment.end;
+                    }
+                    Some((
+                        *chunk_size,
+                        segments.iter().map(|segment| segment.len()).collect(),
+                    ))
+                }
+                _ => None,
+            };
+            if let Some((width, extents)) = chunks {
+                if width == 0
+                    || extents.is_empty()
+                    || extents.iter().any(|extent| {
+                        *extent == 0 || Some(extent.div_ceil(width)) != partition_units
+                    })
+                {
+                    return Err(ParallelPlanError::InvalidGroup(
+                        "physical chunks do not match the shared logical partition".into(),
+                    ));
+                }
+            }
         }
         if has_partitioned_member != partition_units.is_some() {
             return Err(ParallelPlanError::InvalidGroup(format!(
@@ -628,6 +706,40 @@ pub fn aligned_partition_units(
     elements_per_unit: usize,
     required_alignment: usize,
 ) -> Result<usize, ParallelPlanError> {
+    partition_units(
+        name,
+        semantic_units,
+        elements_per_unit,
+        required_alignment,
+        false,
+    )
+}
+
+/// Returns aligned logical units for an encoding that permits a partial final
+/// block in the complete tensor. An unaligned total is retained as one unit:
+/// equal multi-rank slices would otherwise start inside an encoded block.
+pub fn aligned_partition_units_with_tail(
+    name: &str,
+    semantic_units: usize,
+    elements_per_unit: usize,
+    required_alignment: usize,
+) -> Result<usize, ParallelPlanError> {
+    partition_units(
+        name,
+        semantic_units,
+        elements_per_unit,
+        required_alignment,
+        true,
+    )
+}
+
+fn partition_units(
+    name: &str,
+    semantic_units: usize,
+    elements_per_unit: usize,
+    required_alignment: usize,
+    allow_tail: bool,
+) -> Result<usize, ParallelPlanError> {
     if semantic_units == 0 || elements_per_unit == 0 || required_alignment == 0 {
         return Err(ParallelPlanError::InvalidGroup(format!(
             "{name} aligned partition dimensions must be positive, got units={semantic_units}, width={elements_per_unit}, alignment={required_alignment}"
@@ -636,11 +748,77 @@ pub fn aligned_partition_units(
     let units_per_partition =
         required_alignment / greatest_common_divisor(elements_per_unit, required_alignment);
     if !semantic_units.is_multiple_of(units_per_partition) {
+        if allow_tail {
+            return Ok(1);
+        }
         return Err(ParallelPlanError::InvalidGroup(format!(
             "{name} has {semantic_units} semantic units of width {elements_per_unit}, which cannot form complete alignment-{required_alignment} partitions"
         )));
     }
     Ok(semantic_units / units_per_partition)
+}
+
+/// Replaces uniform physical units with exact per-member chunk widths.
+/// Replicated parameters remain outside the partition. Every supplied physical
+/// width must describe the same logical unit count, including its final tail.
+pub fn partition_parameter_group_chunks(
+    group: ParameterGroupSpec,
+    units: usize,
+    mut width: impl FnMut(&ParameterMemberSpec) -> Result<usize, ParallelPlanError>,
+) -> Result<ParameterGroupSpec, ParallelPlanError> {
+    let mut members = Vec::with_capacity(group.members.len());
+    for member in group.members {
+        let sharding = match member.sharding() {
+            MemberSharding::Partitioned { axis } => MemberSharding::PartitionedChunks {
+                axis: *axis,
+                chunk_size: width(&member)?,
+            },
+            MemberSharding::PartitionedSegments { axis, segments } => {
+                MemberSharding::PartitionedChunkSegments {
+                    axis: *axis,
+                    segments: segments.clone(),
+                    chunk_size: width(&member)?,
+                }
+            }
+            MemberSharding::Replicated => MemberSharding::Replicated,
+            _ => {
+                return Err(ParallelPlanError::InvalidGroup(
+                    "chunk conversion requires a uniform group-level partition".into(),
+                ))
+            }
+        };
+        members.push(member.with_sharding(sharding));
+    }
+    ParameterGroupSpec::partitioned(group.logical_name, group.role, units, members)
+}
+
+/// Maps a logical chunk interval to exact physical coordinates without padding.
+pub fn partition_chunk_range(
+    extent: usize,
+    chunk_size: usize,
+    logical: Range<usize>,
+) -> Result<Range<usize>, ParallelPlanError> {
+    if extent == 0 || chunk_size == 0 || logical.start > logical.end {
+        return Err(ParallelPlanError::InvalidTensor(
+            "invalid physical chunk range".into(),
+        ));
+    }
+    let units = extent.div_ceil(chunk_size);
+    if logical.end > units {
+        return Err(ParallelPlanError::InvalidTensor(
+            "logical chunk range exceeds physical extent".into(),
+        ));
+    }
+    let boundary = |index: usize| {
+        if index == units {
+            Ok(extent)
+        } else {
+            index.checked_mul(chunk_size).ok_or_else(|| {
+                ParallelPlanError::InvalidTensor("physical chunk boundary overflows".into())
+            })
+        }
+    };
+    Ok(boundary(logical.start)?..boundary(logical.end)?)
 }
 
 /// Rewrites semantic dense matrix declarations into their authoritative
@@ -705,7 +883,9 @@ fn partitioned_group_with_preferred_units(
             }
             MemberSharding::Replicated
             | MemberSharding::Equal { .. }
-            | MemberSharding::Balanced { .. } => {}
+            | MemberSharding::Balanced { .. }
+            | MemberSharding::PartitionedChunks { .. }
+            | MemberSharding::PartitionedChunkSegments { .. } => {}
         }
     }
     ParameterGroupSpec::partitioned(logical_name, role, units, members)
@@ -731,6 +911,36 @@ fn remap_linear_segments(
             .collect::<Result<Vec<_>, _>>()
     };
     match sharding {
+        MemberSharding::PartitionedChunks {
+            axis: selected,
+            chunk_size,
+        } if *selected == axis => {
+            if *chunk_size == 0 || !chunk_size.is_multiple_of(divisor) {
+                return Err(ParallelPlanError::InvalidTensor(format!(
+                    "packed companion {name} chunk width {chunk_size} is not aligned to {divisor}"
+                )));
+            }
+            Ok(MemberSharding::PartitionedChunks {
+                axis,
+                chunk_size: chunk_size / divisor,
+            })
+        }
+        MemberSharding::PartitionedChunkSegments {
+            axis: selected,
+            segments,
+            chunk_size,
+        } if *selected == axis => {
+            if *chunk_size == 0 || !chunk_size.is_multiple_of(divisor) {
+                return Err(ParallelPlanError::InvalidTensor(format!(
+                    "packed companion {name} chunk width {chunk_size} is not aligned to {divisor}"
+                )));
+            }
+            Ok(MemberSharding::PartitionedChunkSegments {
+                axis,
+                segments: remap(segments)?,
+                chunk_size: chunk_size / divisor,
+            })
+        }
         MemberSharding::PartitionedSegments {
             axis: selected,
             segments,
@@ -745,6 +955,72 @@ fn remap_linear_segments(
             axis: *selected,
             segments: remap(segments)?,
         }),
+        other => Ok(other.clone()),
+    }
+}
+
+fn remap_fp8_rows(
+    source: &ParameterMemberSpec,
+    layout: eredu_nn::LinearRowLayout,
+    block: usize,
+) -> Result<MemberSharding, ParallelPlanError> {
+    let row_axis = source.global_shape().len() - 2;
+    if layout == eredu_nn::LinearRowLayout::Contiguous {
+        return remap_linear_segments(source.sharding(), row_axis, block, source.target());
+    }
+    let rows = source.global_shape()[row_axis];
+    let remap = |segments: &[Range<usize>]| {
+        segments
+            .iter()
+            .map(|segment| {
+                let boundary = |value| {
+                    layout
+                        .block_boundary(rows, block, value)
+                        .map_err(|error| ParallelPlanError::InvalidTensor(error.to_string()))
+                };
+                Ok(boundary(segment.start)?..boundary(segment.end)?)
+            })
+            .collect::<Result<Vec<_>, ParallelPlanError>>()
+    };
+    match source.sharding() {
+        MemberSharding::PartitionedSegments { axis, segments } if *axis == row_axis => {
+            Ok(MemberSharding::PartitionedSegments {
+                axis: *axis,
+                segments: remap(segments)?,
+            })
+        }
+        MemberSharding::Segmented { axis, segments } if *axis == row_axis => {
+            Ok(MemberSharding::Segmented {
+                axis: *axis,
+                segments: remap(segments)?,
+            })
+        }
+        MemberSharding::PartitionedChunkSegments {
+            axis,
+            segments,
+            chunk_size,
+        } if *axis == row_axis => {
+            if *chunk_size == 0 || !chunk_size.is_multiple_of(block) {
+                return Err(ParallelPlanError::InvalidTensor(
+                    "FP8 row chunk splits a scale block".into(),
+                ));
+            }
+            Ok(MemberSharding::PartitionedChunkSegments {
+                axis: *axis,
+                segments: remap(segments)?,
+                chunk_size: chunk_size / block,
+            })
+        }
+        MemberSharding::Partitioned { axis }
+        | MemberSharding::PartitionedChunks { axis, .. }
+        | MemberSharding::Equal { axis }
+        | MemberSharding::Balanced { axis }
+            if *axis == row_axis =>
+        {
+            Err(ParallelPlanError::InvalidTensor(
+                "independent FP8 row blocks require explicit segment placement".into(),
+            ))
+        }
         other => Ok(other.clone()),
     }
 }
@@ -792,12 +1068,17 @@ fn expand_linear_format_member(
             let columns = usize::try_from(fp8.block_columns)
                 .map_err(|_| invalid(format!("invalid block columns for {name}")))?;
             let mut scale_shape = shape.to_vec();
-            scale_shape[row_axis] = scale_shape[row_axis].div_ceil(rows);
+            scale_shape[row_axis] = declaration
+                .row_layout()
+                .scale_rows(shape[row_axis], rows)
+                .map_err(|error| invalid(error.to_string()))?;
             scale_shape[column_axis] = scale_shape[column_axis].div_ceil(columns);
-            let scale_sharding = remap_linear_segments(source.sharding(), row_axis, rows, name)
+            let scale_sharding = remap_fp8_rows(source, declaration.row_layout(), rows)
                 .and_then(|value| remap_linear_segments(&value, column_axis, columns, name))?;
             Ok(vec![
-                source.clone(),
+                source
+                    .clone()
+                    .with_linear_row_layout(declaration.row_layout()),
                 ParameterMemberSpec::new(scale.id.as_str(), scale_shape, scale_sharding)
                     .with_linear_companion(eredu_nn::LinearCompanionRole::Scale, name),
             ])
@@ -823,11 +1104,37 @@ fn expand_linear_format_member(
             }
             let mut packed = shape.to_vec();
             packed[column_axis] = input / block_values * block_bytes;
-            Ok(vec![ParameterMemberSpec::new(
-                name,
-                packed,
-                remap_linear_segments(source.sharding(), column_axis, block_values, name)?,
-            )])
+            let sharding =
+                remap_linear_segments(source.sharding(), column_axis, block_values, name)?;
+            // Chunk coordinates above are in encoded blocks. GGUF stores byte
+            // rows, so retain byte widths and segment offsets in the placement.
+            let bytes = |blocks: usize| {
+                blocks
+                    .checked_mul(block_bytes)
+                    .ok_or_else(|| invalid(format!("GGUF chunk coordinates for {name} overflow")))
+            };
+            let sharding = match sharding {
+                MemberSharding::PartitionedChunks { axis, chunk_size } if axis == column_axis => {
+                    MemberSharding::PartitionedChunks {
+                        axis,
+                        chunk_size: bytes(chunk_size)?,
+                    }
+                }
+                MemberSharding::PartitionedChunkSegments {
+                    axis,
+                    segments,
+                    chunk_size,
+                } if axis == column_axis => MemberSharding::PartitionedChunkSegments {
+                    axis,
+                    segments: segments
+                        .into_iter()
+                        .map(|segment| Ok(bytes(segment.start)?..bytes(segment.end)?))
+                        .collect::<Result<Vec<_>, ParallelPlanError>>()?,
+                    chunk_size: bytes(chunk_size)?,
+                },
+                other => other,
+            };
+            Ok(vec![ParameterMemberSpec::new(name, packed, sharding)])
         }
         LinearFormat::Affine(_) | LinearFormat::MxFp4 => {
             let quantization = format.weight_quantization().expect("packed format");
@@ -956,6 +1263,7 @@ pub struct LocalTensorLayout<P = TensorPlacement> {
     additional_placements: Vec<TensorPlacement>,
     logical_units: Option<usize>,
     logical_range: Option<Range<usize>>,
+    partition_chunk_size: Option<usize>,
     fell_back_to_replication: bool,
 }
 
@@ -981,6 +1289,7 @@ impl<P> LocalTensorLayout<P> {
             additional_placements: Vec::new(),
             logical_units,
             logical_range,
+            partition_chunk_size: None,
             fell_back_to_replication,
         }
     }
@@ -1037,6 +1346,50 @@ impl<P> LocalTensorLayout<P> {
         self.logical_units
     }
 
+    /// Expands uniform partition units into an architecture-supplied logical
+    /// width. Encoded weights and companions may share one partition unit per
+    /// quantization block, rather than one unit per scalar component.
+    ///
+    /// Missing ranges and explicit chunk mappings are rejected: neither tensor
+    /// shape nor a nonuniform physical partition determines this correspondence.
+    pub fn expanded_logical_range(
+        &self,
+        global_width: usize,
+    ) -> Result<Range<usize>, ParallelPlanError> {
+        let invalid =
+            |reason| ParallelPlanError::InvalidTensor(format!("{}: {reason}", self.logical_name));
+        let units = self
+            .logical_units
+            .filter(|&units| units > 0 && global_width > 0 && global_width.is_multiple_of(units))
+            .ok_or_else(|| invalid("partition units do not uniformly divide the logical width"))?;
+        if self.partition_chunk_size.is_some() {
+            return Err(invalid(
+                "explicit partition chunks require their own logical mapping",
+            ));
+        }
+        let range = self
+            .logical_range
+            .as_ref()
+            .filter(|range| !range.is_empty() && range.end <= units)
+            .ok_or_else(|| invalid("missing or invalid exact partition range"))?;
+        let width = global_width / units;
+        // Both endpoints are bounded by `units`; the expanded endpoints cannot
+        // exceed the caller's representable global width.
+        Ok(range.start * width..range.end * width)
+    }
+
+    /// Retains the physical width of each complete logical partition chunk.
+    /// `None` denotes the existing uniform-unit mapping.
+    pub fn with_partition_chunk_size(mut self, width: Option<usize>) -> Self {
+        self.partition_chunk_size = width;
+        self
+    }
+
+    /// Physical chunk width on the primary partition axis, when declared.
+    pub const fn partition_chunk_size(&self) -> Option<usize> {
+        self.partition_chunk_size
+    }
+
     /// Returns whether permissive planning replicated an unsupported shard.
     pub const fn fell_back_to_replication(&self) -> bool {
         self.fell_back_to_replication
@@ -1048,6 +1401,9 @@ impl<P> LocalTensorLayout<P> {
 pub struct LocalModelLayout<P = TensorPlacement> {
     tensors: BTreeMap<String, LocalTensorLayout<P>>,
 }
+
+mod transform_source;
+pub use transform_source::derive_transform_source_layout;
 
 impl<P> Default for LocalModelLayout<P> {
     fn default() -> Self {
@@ -1107,6 +1463,373 @@ mod tests {
     use eredu_checkpoint::{BlockFp8Format, BlockFp8ScaleEncoding};
 
     use super::*;
+
+    #[test]
+    fn logical_range_expansion_preserves_encoded_component_ownership() {
+        let layout = |units, range| {
+            LocalTensorLayout::new(
+                "expert.intermediate",
+                ParameterRole::ExpertIntermediate,
+                vec![4, 64, 8],
+                vec![4, 32, 8],
+                TensorPlacement::Range {
+                    axis: 1,
+                    start: 32,
+                    end: 64,
+                },
+                units,
+                range,
+                false,
+            )
+        };
+        for units in [2, 4, 64] {
+            assert_eq!(
+                layout(Some(units), Some(units / 2..units))
+                    .expanded_logical_range(64)
+                    .unwrap(),
+                32..64,
+            );
+        }
+        for (units, range) in [
+            (None, None),
+            (Some(0), Some(0..0)),
+            (Some(3), Some(0..1)),
+            (Some(2), None),
+            (Some(2), Some(1..1)),
+            (Some(2), Some(1..3)),
+            (Some(2), Some(2..1)),
+        ] {
+            assert!(layout(units, range).expanded_logical_range(64).is_err());
+        }
+        assert!(layout(Some(2), Some(0..1))
+            .expanded_logical_range(0)
+            .is_err());
+        assert!(layout(Some(2), Some(0..1))
+            .with_partition_chunk_size(Some(32))
+            .expanded_logical_range(64)
+            .is_err());
+        assert_eq!(
+            layout(Some(1), Some(0..1))
+                .expanded_logical_range(usize::MAX)
+                .unwrap(),
+            0..usize::MAX,
+        );
+    }
+
+    #[test]
+    fn fused_fp8_tails_keep_each_scale_partition_and_metadata() {
+        let layout = eredu_nn::LinearRowLayout::equal_partitions(2).unwrap();
+        let group = ParameterGroupSpec::partitioned(
+            "fused",
+            ParameterRole::ExpertIntermediate,
+            3,
+            [ParameterMemberSpec::new(
+                "matrix",
+                [3, 518, 130],
+                MemberSharding::PartitionedChunkSegments {
+                    axis: 1,
+                    segments: vec![0..259, 259..518],
+                    chunk_size: 128,
+                },
+            )],
+        )
+        .unwrap();
+        let expanded = expand_linear_format_parameter_groups(vec![group], |_| {
+            Ok(Some(
+                LinearFormatSpec::scaled(
+                    LinearFormat::E4M3BlockFp8(
+                        BlockFp8Format::new(128, 128, BlockFp8ScaleEncoding::FloatingPoint)
+                            .unwrap(),
+                    ),
+                    eredu_nn::ParameterSpec::trainable("scale").unwrap(),
+                )
+                .unwrap()
+                .with_row_layout(layout)
+                .unwrap(),
+            ))
+        })
+        .unwrap();
+        assert_eq!(expanded[0].partition_units(), Some(3));
+        assert_eq!(expanded[0].members()[0].linear_row_layout(), layout);
+        assert_eq!(expanded[0].members()[1].global_shape(), [3, 6, 2]);
+        assert_eq!(
+            expanded[0].members()[1].sharding(),
+            &MemberSharding::PartitionedChunkSegments {
+                axis: 1,
+                segments: vec![0..3, 3..6],
+                chunk_size: 1,
+            }
+        );
+        let spec = eredu_nn::GroupedProjectionSpec::new(
+            eredu_nn::ParameterSpec::trainable("matrix").unwrap(),
+            None,
+            LinearFormatSpec::scaled(
+                LinearFormat::E4M3BlockFp8(
+                    BlockFp8Format::new(128, 128, BlockFp8ScaleEncoding::FloatingPoint).unwrap(),
+                ),
+                eredu_nn::ParameterSpec::trainable("scale").unwrap(),
+            )
+            .unwrap()
+            .with_row_layout(layout)
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            eredu_nn::ParameterMetadata::from_spec(spec.weight(), true).linear_row_layout,
+            layout
+        );
+    }
+
+    #[test]
+    fn chunk_ranges_retain_short_tails_without_padding_or_overflow() {
+        assert_eq!(partition_chunk_range(259, 128, 0..2).unwrap(), 0..256);
+        assert_eq!(partition_chunk_range(259, 128, 2..3).unwrap(), 256..259);
+        assert_eq!(partition_chunk_range(259, 128, 3..3).unwrap(), 259..259);
+        let units = usize::MAX.div_ceil(128);
+        assert_eq!(
+            partition_chunk_range(usize::MAX, 128, units - 1..units).unwrap(),
+            usize::MAX - 127..usize::MAX
+        );
+        for (extent, width, range) in [
+            (0, 128, 0..1),
+            (259, 0, 0..1),
+            (259, 128, 2..1),
+            (259, 128, 0..4),
+        ] {
+            assert!(partition_chunk_range(extent, width, range).is_err());
+        }
+    }
+
+    #[test]
+    fn fp8_chunk_expansion_preserves_shared_weight_and_scale_ownership() {
+        for encoding in [
+            BlockFp8ScaleEncoding::FloatingPoint,
+            BlockFp8ScaleEncoding::Ue8m0,
+        ] {
+            let group = ParameterGroupSpec::partitioned(
+                "ffn",
+                ParameterRole::FeedForwardIntermediate,
+                1,
+                [
+                    ParameterMemberSpec::new(
+                        "read",
+                        [259, 130],
+                        MemberSharding::Partitioned { axis: 0 },
+                    ),
+                    ParameterMemberSpec::new(
+                        "write",
+                        [130, 259],
+                        MemberSharding::Partitioned { axis: 1 },
+                    ),
+                ],
+            )
+            .unwrap();
+            let group = partition_parameter_group_chunks(group, 3, |_| Ok(128)).unwrap();
+            let format =
+                LinearFormat::E4M3BlockFp8(BlockFp8Format::new(128, 128, encoding).unwrap());
+            let groups = expand_linear_format_parameter_groups(vec![group], |member| {
+                Ok(Some(
+                    LinearFormatSpec::scaled(
+                        format,
+                        eredu_nn::ParameterSpec::trainable(format!("{}_scale", member.target()))
+                            .unwrap(),
+                    )
+                    .unwrap(),
+                ))
+            })
+            .unwrap();
+            assert_eq!(groups[0].partition_units(), Some(3));
+            let members = groups[0].members();
+            assert_eq!(members[1].global_shape(), [3, 2]);
+            assert_eq!(members[3].global_shape(), [2, 3]);
+            for (index, axis, width) in [(0, 0, 128), (1, 0, 1), (2, 1, 128), (3, 1, 1)] {
+                assert_eq!(
+                    members[index].sharding(),
+                    &MemberSharding::PartitionedChunks {
+                        axis,
+                        chunk_size: width
+                    }
+                );
+                let extent = members[index].global_shape()[axis];
+                let first = partition_chunk_range(extent, width, 0..2).unwrap();
+                let last = partition_chunk_range(extent, width, 2..3).unwrap();
+                assert_eq!(first.end, last.start);
+                assert_eq!(last.end, extent);
+            }
+            assert_eq!(members[1].linear_companion_of(), Some("read"));
+            assert_eq!(members[3].linear_companion_of(), Some("write"));
+        }
+    }
+
+    #[test]
+    fn chunk_groups_reject_mismatched_companions_and_segments() {
+        for sharding in [
+            MemberSharding::PartitionedChunks {
+                axis: 0,
+                chunk_size: 0,
+            },
+            MemberSharding::PartitionedChunks {
+                axis: 2,
+                chunk_size: 128,
+            },
+            MemberSharding::PartitionedChunkSegments {
+                axis: 0,
+                segments: vec![],
+                chunk_size: 128,
+            },
+            MemberSharding::PartitionedChunkSegments {
+                axis: 0,
+                segments: vec![0..130, 129..259],
+                chunk_size: 128,
+            },
+            MemberSharding::PartitionedChunkSegments {
+                axis: 0,
+                segments: vec![0..260],
+                chunk_size: 128,
+            },
+        ] {
+            assert!(ParameterGroupSpec::partitioned(
+                "bad",
+                ParameterRole::FeedForwardIntermediate,
+                3,
+                [ParameterMemberSpec::new("weight", [259, 130], sharding)]
+            )
+            .is_err());
+        }
+        assert!(ParameterGroupSpec::partitioned(
+            "bad",
+            ParameterRole::FeedForwardIntermediate,
+            3,
+            [
+                ParameterMemberSpec::new(
+                    "weight",
+                    [259, 130],
+                    MemberSharding::PartitionedChunks {
+                        axis: 0,
+                        chunk_size: 128
+                    }
+                ),
+                ParameterMemberSpec::new(
+                    "scale",
+                    [2, 2],
+                    MemberSharding::PartitionedChunks {
+                        axis: 0,
+                        chunk_size: 1
+                    }
+                ),
+            ]
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn gguf_chunk_expansion_uses_byte_coordinates_for_complete_encoded_blocks() {
+        for (width, sharding, expected) in [
+            (
+                288,
+                MemberSharding::PartitionedChunks {
+                    axis: 1,
+                    chunk_size: 128,
+                },
+                MemberSharding::PartitionedChunks {
+                    axis: 1,
+                    chunk_size: 136,
+                },
+            ),
+            (
+                576,
+                MemberSharding::PartitionedChunkSegments {
+                    axis: 1,
+                    segments: vec![0..288, 288..576],
+                    chunk_size: 128,
+                },
+                MemberSharding::PartitionedChunkSegments {
+                    axis: 1,
+                    segments: vec![0..306, 306..612],
+                    chunk_size: 136,
+                },
+            ),
+        ] {
+            let group = ParameterGroupSpec::partitioned(
+                "packed",
+                ParameterRole::RowProjection,
+                3,
+                [ParameterMemberSpec::new("matrix", [4, width], sharding)],
+            )
+            .unwrap();
+            let groups = expand_linear_format_parameter_groups(vec![group], |_| {
+                Ok(Some(
+                    LinearFormatSpec::unscaled(LinearFormat::GgufIQuant {
+                        ggml_type: eredu_gguf::GgmlType::Q8_0,
+                        endian: eredu_gguf::Endian::Little,
+                    })
+                    .unwrap(),
+                ))
+            })
+            .unwrap();
+            assert_eq!(groups[0].partition_units(), Some(3));
+            assert_eq!(groups[0].members()[0].global_shape(), [4, width / 32 * 34]);
+            assert_eq!(groups[0].members()[0].sharding(), &expected);
+            assert_eq!(partition_chunk_range(306, 136, 2..3).unwrap(), 272..306);
+        }
+    }
+
+    #[test]
+    fn encoded_partial_blocks_remain_whole_partition_units() {
+        for (units, width, alignment, expected) in [
+            (2, 8, 128, 1),
+            (129, 1, 128, 1),
+            (6, 64, 128, 3),
+            (3, 128, 128, 3),
+            (usize::MAX, 128, 128, usize::MAX),
+        ] {
+            assert_eq!(
+                aligned_partition_units_with_tail("encoded", units, width, alignment).unwrap(),
+                expected
+            );
+        }
+        assert!(aligned_partition_units("packed", 129, 1, 128).is_err());
+        for (units, width, alignment) in [(0, 1, 128), (1, 0, 128), (1, 1, 0)] {
+            assert!(aligned_partition_units_with_tail("encoded", units, width, alignment).is_err());
+        }
+        let groups = vec![ParameterGroupSpec::partitioned(
+            "partial",
+            ParameterRole::FeedForwardIntermediate,
+            aligned_partition_units_with_tail("partial", 130, 1, 128).unwrap(),
+            [
+                ParameterMemberSpec::new(
+                    "read",
+                    [130, 129],
+                    MemberSharding::Partitioned { axis: 0 },
+                ),
+                ParameterMemberSpec::new(
+                    "write",
+                    [129, 130],
+                    MemberSharding::Partitioned { axis: 1 },
+                ),
+            ],
+        )
+        .unwrap()];
+        let format = LinearFormat::E4M3BlockFp8(
+            BlockFp8Format::new(128, 128, BlockFp8ScaleEncoding::FloatingPoint).unwrap(),
+        );
+        let expanded = expand_linear_format_parameter_groups(groups, |member| {
+            Ok(Some(
+                LinearFormatSpec::scaled(
+                    format,
+                    eredu_nn::ParameterSpec::trainable(format!("{}_scale", member.target()))
+                        .unwrap(),
+                )
+                .unwrap(),
+            ))
+        })
+        .unwrap();
+        assert_eq!(expanded[0].partition_units(), Some(1));
+        assert_eq!(expanded[0].members()[0].global_shape(), [130, 129]);
+        assert_eq!(expanded[0].members()[1].global_shape(), [2, 2]);
+        assert_eq!(expanded[0].members()[2].global_shape(), [129, 130]);
+        assert_eq!(expanded[0].members()[3].global_shape(), [2, 2]);
+    }
 
     #[test]
     fn groups_reject_duplicate_physical_targets() {

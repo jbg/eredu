@@ -33,10 +33,7 @@ pub(crate) fn validate_continuation(
             "interventions require single-sequence text generation".into(),
         ));
     }
-    let checked = plan
-        .plan()
-        .clone()
-        .admit(discovery, plan.request(), plan.session_id())?;
+    let checked = plan.readmit(discovery)?;
     if checked.identity() != plan.identity() {
         return Err(CaptureError::Invalid(
             "intervention admission differs from loaded source/session capabilities".into(),
@@ -78,6 +75,9 @@ pub struct CaptureObserver<'a, B, F> {
     session: &'a mut CaptureSession,
     backend: B,
     map_error: F,
+    next_prediction: Option<u64>,
+    routed_path: Option<std::borrow::Cow<'a, str>>,
+    routed_error: Option<&'a dyn Fn(eredu_nn::Error) -> eredu_nn::Error>,
 }
 impl<'a, B, F> CaptureObserver<'a, B, F> {
     /// Creates an observer that forwards all value/control hooks to the shared run.
@@ -86,18 +86,117 @@ impl<'a, B, F> CaptureObserver<'a, B, F> {
             session,
             backend,
             map_error,
+            next_prediction: None,
+            routed_path: None,
+            routed_error: None,
+        }
+    }
+
+    /// Records routed-provider failures before crossing the neural error domain.
+    /// The handler must preserve the original cause and performs no native work.
+    pub fn with_routed_error_handler(
+        mut self,
+        handler: &'a dyn Fn(eredu_nn::Error) -> eredu_nn::Error,
+    ) -> Self {
+        self.routed_error = Some(handler);
+        self
+    }
+
+    fn routed_result<R>(&self, result: Result<R, eredu_nn::Error>) -> Result<R, eredu_nn::Error> {
+        result.map_err(|error| match self.routed_error {
+            Some(handler) => handler(error),
+            None => error,
+        })
+    }
+
+    pub(crate) fn with_routed_path(mut self, path: &'a str) -> Self {
+        self.routed_path = Some(std::borrow::Cow::Borrowed(path));
+        self
+    }
+
+    /// Defers step admission to the shared forward's local preparation phase.
+    /// Construction performs no reservation or native work. The actual forward
+    /// supplies its phase; a local admission failure is agreed with peers before
+    /// any observer coordination or model work.
+    pub fn for_step(
+        session: &'a mut CaptureSession,
+        backend: B,
+        prediction: u64,
+        map_error: F,
+    ) -> Self {
+        Self {
+            session,
+            backend,
+            map_error,
+            next_prediction: Some(prediction),
+            routed_path: None,
+            routed_error: None,
         }
     }
 }
 impl<B, E, F> crate::ActivationObserver<B::Tensor, E> for CaptureObserver<'_, B, F>
 where
     B: InterventionBackend,
+    B::Error: Send + Sync,
     F: Fn(CaptureExecutionError<B::Error>) -> E,
 {
+    fn routed_unit_observer(
+        &mut self,
+        path: &str,
+    ) -> Result<Option<&mut dyn crate::RoutedUnitObserver<B::Tensor>>, E> {
+        if !self.session.wants_routed_units(path) && !self.session.wants_routed_interventions(path)
+        {
+            return Ok(None);
+        }
+        if self.routed_path.as_deref() != Some(path) {
+            self.routed_path = Some(std::borrow::Cow::Owned(path.into()));
+        }
+        Ok(Some(self))
+    }
+    fn transactional(&self) -> bool {
+        true
+    }
+    fn prepare_transaction(
+        &mut self,
+        epoch: eredu_core::DistributedCommitEpoch,
+        pass: crate::ExpertPass,
+    ) -> Result<(), E> {
+        match self.next_prediction.take() {
+            Some(prediction) => self
+                .session
+                .prepare_step_transaction(epoch, pass, prediction),
+            None => self.session.prepare_transaction(epoch, pass),
+        }
+        .map_err(|error| (self.map_error)(error.into()))
+    }
+    fn complete_transaction(&mut self, epoch: eredu_core::DistributedCommitEpoch) -> Result<(), E> {
+        self.session
+            .complete_transaction(epoch)
+            .map_err(|error| (self.map_error)(error.into()))
+    }
+    fn finish_transaction(&mut self, epoch: eredu_core::DistributedCommitEpoch, committed: bool) {
+        self.session.finish_transaction(epoch, committed)
+    }
     fn observe(&mut self, path: &str, value: &B::Tensor) -> Result<(), E> {
         self.session
             .observe(&mut self.backend, path, value)
             .map_err(&self.map_error)
+    }
+    fn observe_generated(
+        &mut self,
+        path: &str,
+        prototype: &B::Tensor,
+        source: &eredu_core::capture::GeneratedCaptureSource,
+        generate: &mut dyn FnMut() -> Result<B::Tensor, E>,
+    ) -> Result<(), E> {
+        self.session.observe_generated(
+            &mut self.backend,
+            path,
+            prototype,
+            source,
+            generate,
+            &self.map_error,
+        )
     }
     fn intervene(&mut self, path: &str, value: &B::Tensor) -> Result<Option<B::Tensor>, E> {
         self.session
@@ -128,6 +227,9 @@ where
     }
     fn finish(&mut self) -> Result<(), E> {
         self.session
+            .finish_routed_captures()
+            .map_err(|error| (self.map_error)(error.into()))?;
+        self.session
             .finish_interventions()
             .map_err(|error| (self.map_error)(error.into()))
     }
@@ -142,5 +244,109 @@ where
             }
         });
         result
+    }
+}
+
+impl<B: InterventionBackend, F> crate::RoutedUnitObserver<B::Tensor> for CaptureObserver<'_, B, F>
+where
+    B::Error: Send + Sync,
+{
+    fn intervene(
+        &mut self,
+        batch: &crate::RoutedUnitBatch<'_, B::Tensor>,
+    ) -> Result<Option<B::Tensor>, eredu_nn::Error> {
+        let result = (|| {
+            if batch.origins.is_some() || batch.unit_coordinates.is_some() {
+                return Err(eredu_nn::Error::backend(
+                    "partitioned sparse unit edits require committed distributed receipts",
+                ));
+            }
+            let path = self.routed_path.as_deref().ok_or_else(|| {
+                eredu_nn::Error::backend("missing sparse intervention invocation")
+            })?;
+            let token_offset = batch
+                .source_token(0)
+                .and_then(|n| u64::try_from(n).ok())
+                .ok_or_else(|| {
+                    eredu_nn::Error::backend("sparse intervention token offset overflow")
+                })?;
+            self.session
+                .intervene_routed_units(
+                    &mut self.backend,
+                    path,
+                    &RoutedUnitCaptureSource {
+                        values: batch.units.values,
+                        token_indices: batch.units.token_indices,
+                        selection_indices: batch.units.selection_indices,
+                        coefficients: batch.units.coefficients,
+                        source_groups: batch.source_groups,
+                        token_offset,
+                        global_groups: batch.global_groups,
+                    },
+                )
+                .map_err(eredu_nn::Error::backend_source)
+        })();
+        self.routed_result(result)
+    }
+    fn observe(
+        &mut self,
+        batch: &crate::RoutedUnitBatch<'_, B::Tensor>,
+    ) -> Result<(), eredu_nn::Error> {
+        self.capture_units(batch, false)
+    }
+    fn observe_effective(
+        &mut self,
+        batch: &crate::RoutedUnitBatch<'_, B::Tensor>,
+    ) -> Result<(), eredu_nn::Error> {
+        self.capture_units(batch, true)
+    }
+}
+impl<B: InterventionBackend, F> CaptureObserver<'_, B, F>
+where
+    B::Error: Send + Sync,
+{
+    fn capture_units(
+        &mut self,
+        batch: &crate::RoutedUnitBatch<'_, B::Tensor>,
+        effective: bool,
+    ) -> Result<(), eredu_nn::Error> {
+        let result = self.capture_units_inner(batch, effective);
+        self.routed_result(result)
+    }
+
+    fn capture_units_inner(
+        &mut self,
+        batch: &crate::RoutedUnitBatch<'_, B::Tensor>,
+        effective: bool,
+    ) -> Result<(), eredu_nn::Error> {
+        if batch.origins.is_some() || batch.unit_coordinates.is_some() {
+            return Err(eredu_nn::Error::backend(
+                "partitioned routed-unit capture requires committed distributed receipts",
+            ));
+        }
+        let path = self
+            .routed_path
+            .as_deref()
+            .ok_or_else(|| eredu_nn::Error::backend("missing routed capture invocation"))?;
+        let token_offset = batch
+            .source_token(0)
+            .and_then(|n| u64::try_from(n).ok())
+            .ok_or_else(|| eredu_nn::Error::backend("routed capture token offset overflow"))?;
+        self.session
+            .observe_routed_units(
+                &mut self.backend,
+                path,
+                effective,
+                &RoutedUnitCaptureSource {
+                    values: batch.units.values,
+                    token_indices: batch.units.token_indices,
+                    selection_indices: batch.units.selection_indices,
+                    coefficients: batch.units.coefficients,
+                    source_groups: batch.source_groups,
+                    token_offset,
+                    global_groups: batch.global_groups,
+                },
+            )
+            .map_err(eredu_nn::Error::backend_source)
     }
 }

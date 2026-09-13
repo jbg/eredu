@@ -1,4 +1,58 @@
 #[test]
+fn module_transfer_settles_changed_state_on_success_and_equation_failure() {
+    for fail in [false, true] {
+        let (_dir, store) = fixture_store();
+        let manager = manager(
+            store,
+            OffloadConfig::new(Some(8), Some(0), 1).unwrap(),
+            [spec("a", 8, ResidencyPolicy::Cacheable, MemoryTier::Disk)],
+            [single("a", "a")],
+        );
+        manager.initialize().unwrap();
+        let transfer = manager
+            .acquire_many_with_transfer(&[(id("a"), 1)], MemoryTier::Device)
+            .unwrap();
+        let consumer = cpu_stream();
+        let mut changed = None;
+        let result = crate::backend::runtime::execution::generic::with_module_transfer(
+            transfer,
+            &consumer,
+            |lease| {
+                assert_eq!(state(&manager.report().unwrap(), "a").device_pins(), 1);
+                let next = lease
+                    .device_value("weight")
+                    .unwrap()
+                    .add(Array::from_int(5), &consumer)
+                    .unwrap();
+                changed = Some(next.clone());
+                let outcome = if fail {
+                    Err(crate::backend::error::Error::ArchitectureModel(
+                        "equation failed after state update".into(),
+                    ))
+                } else {
+                    Ok(7)
+                };
+                (outcome, vec![crate::MlxTensor::from(next)])
+            },
+        );
+        if fail {
+            assert!(result
+                .unwrap_err()
+                .to_string()
+                .contains("equation failed after state update"));
+        } else {
+            assert_eq!(result.unwrap(), 7);
+        }
+        assert_eq!(state(&manager.report().unwrap(), "a").device_pins(), 0);
+        assert!(manager.evict(&id("a"), MemoryTier::Device).unwrap());
+        assert_eq!(
+            changed.unwrap().evaluated().unwrap().as_slice::<i32>(),
+            [6, 7]
+        );
+    }
+}
+
+#[test]
 fn caller_owned_transfer_publishes_only_after_exact_completion() {
     let (_dir, store) = fixture_store();
     let manager = manager(

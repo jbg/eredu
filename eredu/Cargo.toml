@@ -36,6 +36,16 @@ path = "examples/intervened_generate.rs"
 required-features = ["mlx"]
 
 [[example]]
+name = "component_reference_probe"
+path = "examples/component_reference_probe.rs"
+required-features = ["mlx"]
+
+[[example]]
+name = "component_sparse_probe"
+path = "examples/component_sparse_probe.rs"
+required-features = ["mlx"]
+
+[[example]]
 name = "controlled_generate"
 path = "examples/controlled_generate.rs"
 required-features = ["mlx"]
@@ -150,3 +160,4 @@ jsonschema = { version = "0.52.0", default-features = false }
 [dev-dependencies]
 anyhow = "1"
 eredu-checkpoint.workspace = true
+eredu-evaluation.workspace = true

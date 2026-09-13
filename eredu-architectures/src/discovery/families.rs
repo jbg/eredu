@@ -1,5 +1,7 @@
+use super::routed_components::{self as routed_units, Site as RoutedUnitSite};
 use super::*;
 use crate::decoder::Config;
+use eredu_core::component::{ComponentResidualWrite, ComponentScalar};
 
 pub(super) fn gguf_composite(
     g: &mut Builder,
@@ -12,24 +14,78 @@ pub(super) fn gguf_composite(
         C::MuseGlimmer(c) => muse(g, c),
         C::Qwen35(c) | C::Qwen35Pending(c) => qwen_hybrid(g, c),
         C::Qwen3Vl(c) => {
-            qwen(g, &c.text);
-            remove_moe_captures(g);
+            qwen_with_deepstack(g, &c.text, c.vision.deepstack_layers().len());
             media(g, "vision");
         }
         C::Qwen3VlPending(c) => {
-            qwen(g, &c.text);
-            remove_moe_captures(g);
+            qwen_with_deepstack(g, &c.text, c.vision.deepstack_layers().len());
             media(g, "vision");
         }
     }
 }
 
+fn prepared_vision_addition(
+    g: &mut Builder,
+    block: &str,
+    previous: &str,
+    path: &str,
+    layer: usize,
+    width: usize,
+) -> String {
+    let addition = format!("{block}.deepstack");
+    g.node(
+        &addition,
+        ArchitectureNodeKind::ResidualAdd,
+        Some(block),
+        Some(path),
+        Some(width),
+    );
+    g.get_mut(&addition).layer_index = Some(layer);
+    g.edge(previous, &addition, ArchitectureEdgeKind::Data);
+    let start = g.descriptor.observations.points.len();
+    g.read_only_observation(
+        &addition,
+        format!("{path}.deepstack.input"),
+        "Residual before adding prepared vision features",
+        axes(width),
+    );
+    for (suffix, meaning) in [
+        (
+            "output",
+            "Prepared vision contribution at decoder positions",
+        ),
+        ("residual", "Residual after adding prepared vision features"),
+    ] {
+        g.component_observation(
+            &addition,
+            format!("{path}.deepstack.{suffix}"),
+            meaning,
+            axes(width),
+        );
+    }
+    for point in &mut g.descriptor.observations.points[start..] {
+        point.decode = false;
+        point.requirements.push(ObservationRequirement::MediaInput);
+    }
+    addition
+}
+
 pub(super) fn dense<C: Config>(g: &mut Builder, c: &C, moe_policy: Option<MoeAttributes>) {
+    dense_with_deepstack(g, c, moe_policy, 0);
+}
+
+fn dense_with_deepstack<C: Config>(
+    g: &mut Builder,
+    c: &C,
+    moe_policy: Option<MoeAttributes>,
+    deepstack_count: usize,
+) {
     let root = c.parameter_root();
     let width = c.hidden_size() as usize;
     let embedding = format!("{root}.embed_tokens");
     let mut previous = g.start(&embedding, width);
     let fields = c.block_parameter_fields();
+    let mut other_writes = Vec::new();
     for (i, policy) in c.attention_schedule().iter().enumerate() {
         let path = format!("{root}.layers.{i}");
         let block = g.block(&previous, i, &path, width);
@@ -53,6 +109,9 @@ pub(super) fn dense<C: Config>(g: &mut Builder, c: &C, moe_policy: Option<MoeAtt
         } else {
             PositionalEncoding::None
         });
+        a.sink_logits = c
+            .learned_attention_sinks()
+            .then(|| format!("{path}.{}.{}", fields.attention, fields.attention_sinks));
         g.get_mut(&op).attention = Some(a);
         post_sublayer_norm(
             g,
@@ -79,8 +138,9 @@ pub(super) fn dense<C: Config>(g: &mut Builder, c: &C, moe_policy: Option<MoeAtt
             c.feed_forward_output_normalization(i),
             width,
         );
-        if let Some(attributes) = &moe_policy {
-            let point = c.routed_observation_points(&path, i);
+        let point = c.routed_observation_points(&path, i);
+        let dense_ffn = point.is_none();
+        if let Some(attributes) = moe_policy.as_ref().filter(|_| !dense_ffn) {
             g.moe(
                 &ff,
                 &format!("{path}.{}", fields.feed_forward),
@@ -91,6 +151,102 @@ pub(super) fn dense<C: Config>(g: &mut Builder, c: &C, moe_policy: Option<MoeAtt
                     .map(|p| p.path()),
                 width,
             );
+        }
+        {
+            super::components::decoder_unit(g, c, i, &path, &op, &ff, dense_ffn);
+            for (node, suffix, meaning, extent, axis) in [
+                (
+                    &op,
+                    "attention.input",
+                    "Normalized attention input",
+                    width,
+                    "hidden",
+                ),
+                (
+                    &op,
+                    "attention.channels",
+                    "Aggregated attention channels after gating, before output projection",
+                    (c.num_attention_heads() * c.head_dim()) as usize,
+                    "component",
+                ),
+                (
+                    &op,
+                    "attention.write",
+                    "Attention affine write before output normalization",
+                    width,
+                    "hidden",
+                ),
+                (
+                    &op,
+                    "attention.output",
+                    "Attention write after output normalization",
+                    width,
+                    "hidden",
+                ),
+                (
+                    &join,
+                    "attention.residual",
+                    "Residual after attention addition",
+                    width,
+                    "hidden",
+                ),
+                (
+                    &ff,
+                    "feed_forward.input",
+                    "Normalized feed-forward input",
+                    width,
+                    "hidden",
+                ),
+                (
+                    &ff,
+                    "feed_forward.units",
+                    "Feed-forward unit values after activation/gating, before down projection",
+                    c.intermediate_size() as usize,
+                    "component",
+                ),
+                (
+                    &ff,
+                    "feed_forward.write",
+                    "Feed-forward affine write before output normalization",
+                    width,
+                    "hidden",
+                ),
+                (
+                    &ff,
+                    if dense_ffn {
+                        "feed_forward.output"
+                    } else {
+                        "feed_forward.contribution"
+                    },
+                    "Complete feed-forward write after output normalization",
+                    width,
+                    "hidden",
+                ),
+                (
+                    &output,
+                    "feed_forward.residual",
+                    "Residual after feed-forward addition, before block normalization",
+                    width,
+                    "hidden",
+                ),
+            ] {
+                if !dense_ffn && suffix == "feed_forward.units" {
+                    continue;
+                }
+                let mut shape = axes(extent);
+                shape[2].name = axis.into();
+                g.component_observation(node, format!("{path}.{suffix}"), meaning, shape);
+            }
+        }
+        if !dense_ffn {
+            other_writes.push(eredu_core::component::ComponentResidualWrite {
+                input: Some(format!("{path}.feed_forward.input")),
+                layer_index: i,
+                node_id: ff.clone(),
+                output: format!("{path}.feed_forward.contribution"),
+                effective_output: format!("{path}.feed_forward.contribution.effective"),
+                residual_scale: eredu_core::component::ComponentScalar::new(1.0),
+            });
         }
         previous = output;
         if let Some(name) = c.block_output_normalization(i) {
@@ -105,6 +261,18 @@ pub(super) fn dense<C: Config>(g: &mut Builder, c: &C, moe_policy: Option<MoeAtt
             g.edge(&previous, &id, ArchitectureEdgeKind::Data);
             previous = id;
         }
+        if i < deepstack_count {
+            let addition = prepared_vision_addition(g, &block, &previous, &path, i, width);
+            other_writes.push(ComponentResidualWrite {
+                input: None,
+                layer_index: i,
+                node_id: addition.clone(),
+                output: format!("{path}.deepstack.output"),
+                effective_output: format!("{path}.deepstack.output.effective"),
+                residual_scale: ComponentScalar::new(1.0),
+            });
+            previous = addition;
+        }
     }
     g.output(
         &previous,
@@ -117,6 +285,12 @@ pub(super) fn dense<C: Config>(g: &mut Builder, c: &C, moe_policy: Option<MoeAtt
         width,
         c.vocabulary_size() as usize,
     );
+    super::components::readout(g, c);
+    g.descriptor
+        .component_readout
+        .as_mut()
+        .expect("shared decoder readout")
+        .other_writes = other_writes;
 }
 
 pub(super) fn nanbeige(g: &mut Builder, c: &crate::nanbeige::ModelArgs) {
@@ -125,7 +299,11 @@ pub(super) fn nanbeige(g: &mut Builder, c: &crate::nanbeige::ModelArgs) {
 }
 
 pub(super) fn qwen(g: &mut Builder, c: &crate::qwen::ModelArgs) {
-    dense(
+    qwen_with_deepstack(g, c, 0);
+}
+
+fn qwen_with_deepstack(g: &mut Builder, c: &crate::qwen::ModelArgs, deepstack_count: usize) {
+    dense_with_deepstack(
         g,
         c,
         (c.num_experts > 0).then(|| {
@@ -137,7 +315,9 @@ pub(super) fn qwen(g: &mut Builder, c: &crate::qwen::ModelArgs) {
                 RoutingScoreTransform::Softmax,
             )
         }),
+        deepstack_count,
     );
+    routed_units::decoder(g, c, |layer| crate::qwen::expert_bank_spec(c, layer));
     if let Ok(spec) = c.routing_spec() {
         for layer in 0..c.num_hidden_layers as usize {
             let unit = format!("{}.layers.{layer}", c.parameter_root);
@@ -169,6 +349,7 @@ pub(super) fn gpt_oss(g: &mut Builder, c: &crate::gpt_oss::ModelArgs) {
             RoutingScoreTransform::SelectedSoftmax,
         )),
     );
+    routed_units::decoder(g, c, |layer| crate::gpt_oss::expert_bank_spec(c, layer));
 }
 
 pub(super) fn qwen_hybrid(g: &mut Builder, parsed: &crate::qwen::hybrid::ParsedHybridConfig) {
@@ -222,43 +403,52 @@ pub(super) fn qwen_hybrid(g: &mut Builder, parsed: &crate::qwen::hybrid::ParsedH
                 ))
             }
         }
-        let (ff, output) = g.sublayer(
-            &block,
-            &join,
-            "feed_forward",
-            &format!("{path}.post_attention_layernorm"),
-            &format!("{path}.mlp"),
-            width,
-            ArchitectureNodeKind::FeedForward,
-        );
-        if c.num_experts > 0 {
-            let mut attrs = moe(
-                c.num_experts,
-                c.num_experts_per_tok,
-                1,
-                c.norm_topk_prob,
-                RoutingScoreTransform::Softmax,
+        let (ff, output) = qwen_hybrid_ffn(g, c, i, &block, &path, &join);
+        super::components::qwen_hybrid::unit(g, c, i, &path, &op, &ff);
+        if parsed
+            .vision
+            .as_ref()
+            .is_some_and(|vision| i < vision.deepstack_layers().len())
+        {
+            let addition = format!("{block}.deepstack");
+            g.node(
+                &addition,
+                ArchitectureNodeKind::ResidualAdd,
+                Some(&block),
+                Some(&path),
+                Some(width),
             );
-            attrs.shared_expert_width = Some(c.shared_expert_intermediate_size as usize);
-            attrs.shared_expert_gated = Some(true);
-            if parsed.vision.is_none() {
-                if let Ok(spec) = c.routing_spec() {
-                    g.routing_control(&ff, &format!("{path}.mlp"), spec, 1, false);
-                }
+            g.get_mut(&addition).layer_index = Some(i);
+            g.edge(&output, &addition, ArchitectureEdgeKind::Data);
+            let first_observation = g.descriptor.observations.points.len();
+            g.read_only_observation(
+                &addition,
+                format!("{path}.deepstack.input"),
+                "Residual before adding prepared vision features",
+                axes(width),
+            );
+            for (suffix, meaning) in [
+                (
+                    "output",
+                    "Prepared vision contribution at decoder positions",
+                ),
+                ("residual", "Residual after adding prepared vision features"),
+            ] {
+                g.component_observation(
+                    &addition,
+                    format!("{path}.deepstack.{suffix}"),
+                    meaning,
+                    axes(width),
+                );
             }
-            g.moe(
-                &ff,
-                &format!("{path}.mlp"),
-                attrs,
-                parsed
-                    .vision
-                    .is_none()
-                    .then(|| format!("{path}.mlp"))
-                    .as_deref(),
-                width,
-            );
+            for point in &mut g.descriptor.observations.points[first_observation..] {
+                point.decode = false;
+                point.requirements.push(ObservationRequirement::MediaInput);
+            }
+            previous = addition;
+        } else {
+            previous = output;
         }
-        previous = output;
     }
     g.output(
         &previous,
@@ -271,12 +461,121 @@ pub(super) fn qwen_hybrid(g: &mut Builder, parsed: &crate::qwen::hybrid::ParsedH
         width,
         c.vocab_size as usize,
     );
+    super::components::qwen_hybrid::readout(g, c);
+    if let Some(vision) = &parsed.vision {
+        let readout = g
+            .descriptor
+            .component_readout
+            .as_mut()
+            .expect("hybrid readout");
+        for layer in 0..vision
+            .deepstack_layers()
+            .len()
+            .min(c.num_hidden_layers as usize)
+        {
+            readout.other_writes.push(ComponentResidualWrite {
+                input: None,
+                layer_index: layer,
+                node_id: format!("decoder.layers.{layer}.deepstack"),
+                output: format!("model.layers.{layer}.deepstack.output"),
+                effective_output: format!("model.layers.{layer}.deepstack.output.effective"),
+                residual_scale: ComponentScalar::new(1.0),
+            });
+        }
+    }
     if c.mtp_num_hidden_layers > 0 {
-        prediction(g, &previous);
+        super::components::qwen_hybrid::prediction::declare(g, c, &previous);
     }
-    if parsed.vision.is_some() {
+    if let Some(vision) = &parsed.vision {
         media(g, "vision");
+        // The primary residual starts after text/media assembly. The embedding
+        // parameter still identifies the token lookup branch of that assembly.
+        for point in &mut g.descriptor.observations.points {
+            if matches!(
+                point.path.as_str(),
+                "readout.embedding" | "readout.embedding.effective"
+            ) {
+                point.node_id = "assembly".into();
+                point.meaning = "Actual assembled text and media input to the decoder".into();
+            }
+        }
+        let paths = ["readout.embedding", "readout.embedding.effective"];
+        g.get_mut("embedding")
+            .observation_paths
+            .retain(|path| !paths.contains(&path.as_str()));
+        for path in paths {
+            g.get_mut("assembly").observation_paths.push(path.into());
+        }
+        for layer in 0..vision
+            .deepstack_layers()
+            .len()
+            .min(c.num_hidden_layers as usize)
+        {
+            g.edge(
+                "vision.projector",
+                &format!("decoder.layers.{layer}.deepstack"),
+                ArchitectureEdgeKind::Data,
+            );
+        }
     }
+}
+
+pub(in crate::discovery) fn qwen_hybrid_ffn(
+    g: &mut Builder,
+    c: &crate::qwen::hybrid::HybridConfig,
+    i: usize,
+    block: &str,
+    path: &str,
+    join: &str,
+) -> (String, String) {
+    let width = c.hidden_size as usize;
+    let (ff, output) = g.sublayer(
+        &block,
+        &join,
+        "feed_forward",
+        &format!("{path}.post_attention_layernorm"),
+        &format!("{path}.mlp"),
+        width,
+        ArchitectureNodeKind::FeedForward,
+    );
+    if c.num_experts > 0 {
+        let mut attrs = moe(
+            c.num_experts,
+            c.num_experts_per_tok,
+            1,
+            c.norm_topk_prob,
+            RoutingScoreTransform::Softmax,
+        );
+        attrs.shared_expert_width = Some(c.shared_expert_intermediate_size as usize);
+        attrs.shared_expert_gated = Some(true);
+        if let Ok(spec) = c.routing_spec() {
+            g.routing_control(&ff, &format!("{path}.mlp"), spec, 1, false);
+        }
+        g.moe(
+            &ff,
+            &format!("{path}.mlp"),
+            attrs,
+            Some(&format!("{path}.mlp")),
+            width,
+        );
+        routed_units::gated(
+            g,
+            RoutedUnitSite {
+                node: &ff,
+                layer: i,
+                routing: &format!("{path}.mlp"),
+                input: Some(format!("{path}.feed_forward.input")),
+                normalization: Some(routed_units::rms(
+                    format!("{path}.post_attention_layernorm.weight"),
+                    c.rms_norm_eps,
+                    1.0,
+                )),
+                residual_scale: Some(ComponentScalar::new(1.0)),
+            },
+            crate::qwen::hybrid::block::expert_bank_spec(c, i),
+        );
+    }
+    (ff, output)
 }
 
 fn prediction(g: &mut Builder, previous: &str) {
@@ -380,10 +679,7 @@ pub(super) fn remaining_safetensors(g: &mut Builder, c: &SafetensorsModelConfig)
         SafetensorsModelConfig::MuseGlimmer(c) => muse(g, c),
         SafetensorsModelConfig::Inkling(c) => inkling(g, c),
         SafetensorsModelConfig::QwenVl(c) => {
-            qwen(g, &c.text);
-            // Conditional traversal emits unit boundaries, but has no normalized
-            // routing hook in its current architecture adapter.
-            remove_moe_captures(g);
+            qwen_with_deepstack(g, &c.text, c.vision.deepstack_layers().len());
             media(g, "vision");
         }
         SafetensorsModelConfig::Moshi(c) => moshi(g, c),
@@ -393,23 +689,6 @@ pub(super) fn remaining_safetensors(g: &mut Builder, c: &SafetensorsModelConfig)
         | SafetensorsModelConfig::GptOss(_)
         | SafetensorsModelConfig::QwenHybrid(_) => unreachable!("handled by caller"),
     }
-}
-
-fn remove_moe_captures(g: &mut Builder) {
-    let nodes = g
-        .descriptor
-        .nodes
-        .iter_mut()
-        .filter(|n| n.kind == ArchitectureNodeKind::MixtureOfExperts)
-        .map(|node| {
-            node.observation_paths.clear();
-            node.id.clone()
-        })
-        .collect::<std::collections::BTreeSet<_>>();
-    g.descriptor
-        .observations
-        .points
-        .retain(|p| !nodes.contains(&p.node_id));
 }
 
 pub(super) fn remaining_gguf(g: &mut Builder, c: &GgufModelConfig) {
@@ -499,7 +778,27 @@ fn lfm2(g: &mut Builder, c: &crate::lfm2::ModelArgs) {
                 ),
                 width,
             );
+            routed_units::gated(
+                g,
+                RoutedUnitSite {
+                    node: &ff,
+                    layer: i,
+                    routing: point
+                        .bank(eredu_runtime::RoutedBankId::new(0))
+                        .unwrap()
+                        .path(),
+                    input: Some(format!("{path}.feed_forward.input")),
+                    normalization: Some(routed_units::rms(
+                        format!("{path}.ffn_norm.weight"),
+                        c.norm_eps,
+                        0.0,
+                    )),
+                    residual_scale: Some(ComponentScalar::new(1.0)),
+                },
+                crate::lfm2::moe::expert_bank_spec(c, i),
+            );
         }
+        super::components::lfm2_unit(g, c, i, &path, &op, &ff);
         previous = output;
     }
     g.output(
@@ -513,6 +812,8 @@ fn lfm2(g: &mut Builder, c: &crate::lfm2::ModelArgs) {
         width,
         c.vocab_size as usize,
     );
+    super::components::lfm2_readout(g, c);
+    super::components::lfm2_other_writes(g, c);
 }
 
 fn kimi(g: &mut Builder, c: &crate::kimi_linear::ModelArgs) {
@@ -601,7 +902,27 @@ fn kimi(g: &mut Builder, c: &crate::kimi_linear::ModelArgs) {
                 ),
                 width,
             );
+            routed_units::gated(
+                g,
+                RoutedUnitSite {
+                    node: &ff,
+                    layer: i,
+                    routing: point
+                        .bank(eredu_runtime::RoutedBankId::new(0))
+                        .unwrap()
+                        .path(),
+                    input: Some(format!("{path}.feed_forward.input")),
+                    normalization: Some(routed_units::rms(
+                        format!("{path}.post_attention_layernorm.weight"),
+                        c.rms_norm_eps,
+                        0.0,
+                    )),
+                    residual_scale: Some(ComponentScalar::new(1.0)),
+                },
+                crate::kimi_linear::moe::expert_bank_spec(c, i),
+            );
         }
+        super::components::kimi_linear::unit(g, c, i, &path, &op, &ff);
         previous = output;
     }
     g.output(
@@ -615,6 +936,7 @@ fn kimi(g: &mut Builder, c: &crate::kimi_linear::ModelArgs) {
         width,
         c.vocab_size as usize,
     );
+    super::components::kimi_linear::readout(g, c);
     if c.num_nextn_predict_layers > 0 {
         prediction(g, &previous);
     }
@@ -623,13 +945,13 @@ fn kimi(g: &mut Builder, c: &crate::kimi_linear::ModelArgs) {
 fn nemotron(g: &mut Builder, c: &crate::nemotron_h::ModelArgs) {
     use crate::nemotron_h::LayerPolicy;
     let width = c.hidden_size as usize;
-    let mut previous = g.start("model.embed_tokens", width);
+    let mut previous = g.start("model.embeddings", width);
     for (i, policy) in c.layer_schedule.iter().enumerate() {
         let path = format!("model.layers.{i}");
         let block = g.block(&previous, i, &path, width);
         let (kind, field) = match policy {
-            LayerPolicy::Mamba => (ArchitectureNodeKind::Mixer, "mixer"),
-            LayerPolicy::SelfAttention(_) => (ArchitectureNodeKind::Attention, "self_attn"),
+            LayerPolicy::Mamba => (ArchitectureNodeKind::Mixer, "mamba"),
+            LayerPolicy::SelfAttention(_) => (ArchitectureNodeKind::Attention, "attention"),
             LayerPolicy::DenseMlp => (ArchitectureNodeKind::FeedForward, "mlp"),
             LayerPolicy::SparseMoe => (ArchitectureNodeKind::MixtureOfExperts, "moe"),
         };
@@ -648,17 +970,18 @@ fn nemotron(g: &mut Builder, c: &crate::nemotron_h::ModelArgs) {
                     mechanism: MixerMechanism::SelectiveStateSpace,
                     recurrent: true,
                     convolution_width: Some(c.conv_kernel as usize),
-                })
+                });
+                super::components::nemotron_other_unit(g, width, &path, &op, "mixer");
             }
             LayerPolicy::SelfAttention(p) => {
-                g.get_mut(&op).attention = Some(attention(
-                    c.num_attention_heads,
-                    c.num_key_value_heads,
-                    c.head_dim,
-                    *p,
-                ))
+                let mut attributes =
+                    attention(c.num_attention_heads, c.num_key_value_heads, c.head_dim, *p);
+                attributes.positional_encoding = Some(PositionalEncoding::None);
+                g.get_mut(&op).attention = Some(attributes);
+                super::components::nemotron_unit(g, c, i, &path, &op, true);
             }
             LayerPolicy::SparseMoe => {
+                super::components::nemotron_other_unit(g, width, &path, &op, "feed_forward");
                 let mut attrs = moe(
                     c.n_routed_experts,
                     c.num_experts_per_tok,
@@ -674,8 +997,25 @@ fn nemotron(g: &mut Builder, c: &crate::nemotron_h::ModelArgs) {
                     Some(&format!("{path}.routing")),
                     width,
                 );
+                super::components::nemotron::shared_units(g, c, i, &path, &op);
+                routed_units::relu2(
+                    g,
+                    RoutedUnitSite {
+                        node: &op,
+                        layer: i,
+                        routing: &format!("{path}.routing"),
+                        input: Some(format!("{path}.feed_forward.input")),
+                        normalization: Some(routed_units::rms(
+                            format!("{path}.norm.weight"),
+                            c.layer_norm_epsilon,
+                            0.0,
+                        )),
+                        residual_scale: Some(ComponentScalar::new(1.0)),
+                    },
+                    crate::nemotron_h::expert_bank_spec(c, i),
+                );
             }
-            LayerPolicy::DenseMlp => {}
+            LayerPolicy::DenseMlp => super::components::nemotron_unit(g, c, i, &path, &op, false),
         }
         previous = output;
     }
@@ -683,70 +1023,26 @@ fn nemotron(g: &mut Builder, c: &crate::nemotron_h::ModelArgs) {
         &previous,
         "model.norm_f",
         if c.tie_word_embeddings {
-            "model.embed_tokens"
+            "model.embeddings"
         } else {
             "lm_head"
         },
         width,
         c.vocab_size as usize,
     );
+    super::components::nemotron_readout(g, c);
     if c.num_nextn_predict_layers > 0 {
-        prediction(g, &previous);
+        super::components::nemotron::prediction::declare(g, c, &previous);
     }
 }
 
 fn deepseek_v3(g: &mut Builder, c: &crate::deepseek::V3Args) {
     let width = c.hidden_size as usize;
     let mut previous = g.start("model.embed_tokens", width);
-    for (i, policy) in c.layer_schedule.iter().enumerate() {
+    for i in 0..c.layer_schedule.len() {
         let path = format!("model.layers.{i}");
         let block = g.block(&previous, i, &path, width);
-        let (op, join) = g.sublayer(
-            &block,
-            &block,
-            "attention",
-            &format!("{path}.input_layernorm"),
-            &format!("{path}.self_attn"),
-            width,
-            ArchitectureNodeKind::Attention,
-        );
-        g.get_mut(&op).attention = Some(AttentionAttributes {
-            mechanism: Some(AttentionMechanism::Latent),
-            recurrent: Some(false),
-            causal: Some(true),
-            query_heads: Some(c.num_attention_heads as usize),
-            key_head_dimension: Some((c.qk_nope_head_dim + c.qk_rope_head_dim) as usize),
-            value_head_dimension: Some(c.v_head_dim as usize),
-            receptive_field: Some(ReceptiveField::Full),
-            positional_encoding: Some(PositionalEncoding::Rotary),
-            ..Default::default()
-        });
-        let (ff, output) = g.sublayer(
-            &block,
-            &join,
-            "feed_forward",
-            &format!("{path}.post_attention_layernorm"),
-            &format!("{path}.mlp"),
-            width,
-            ArchitectureNodeKind::FeedForward,
-        );
-        if *policy == crate::deepseek::LayerPolicy::SparseMoe {
-            let attrs = moe(
-                c.n_routed_experts,
-                c.num_experts_per_tok,
-                c.n_shared_experts,
-                c.norm_topk_prob,
-                RoutingScoreTransform::Sigmoid,
-            );
-            g.moe(
-                &ff,
-                &format!("{path}.mlp"),
-                attrs,
-                Some(&format!("{path}.feed_forward")),
-                width,
-            );
-        }
-        previous = output;
+        previous = deepseek_v3_unit(g, c, i, &path, &block);
     }
     g.output(
         &previous,
@@ -755,23 +1051,119 @@ fn deepseek_v3(g: &mut Builder, c: &crate::deepseek::V3Args) {
         width,
         c.vocab_size as usize,
     );
-    g.catalog_partial("Compressed-attention internal output hooks are not enumerated; coverage varies by selected execution adapter");
+    super::components::deepseek_v3::readout(g, c);
     if c.num_nextn_predict_layers > 0 {
-        prediction(g, &previous);
+        super::components::deepseek_v3::prediction_scopes(g, c, &previous);
     }
+}
+
+pub(super) fn deepseek_v3_unit(
+    g: &mut Builder,
+    c: &crate::deepseek::V3Args,
+    i: usize,
+    path: &str,
+    block: &str,
+) -> String {
+    let width = c.hidden_size as usize;
+    let (op, join) = g.sublayer(
+        block,
+        block,
+        "attention",
+        &format!("{path}.input_layernorm"),
+        &format!("{path}.self_attn"),
+        width,
+        ArchitectureNodeKind::Attention,
+    );
+    g.get_mut(&op).attention = Some(AttentionAttributes {
+        mechanism: Some(AttentionMechanism::Latent),
+        recurrent: Some(false),
+        causal: Some(true),
+        query_heads: Some(c.num_attention_heads as usize),
+        key_head_dimension: Some((c.qk_nope_head_dim + c.qk_rope_head_dim) as usize),
+        value_head_dimension: Some(c.v_head_dim as usize),
+        receptive_field: Some(ReceptiveField::Full),
+        positional_encoding: Some(PositionalEncoding::Rotary),
+        ..Default::default()
+    });
+    let (ff, output) = g.sublayer(
+        block,
+        &join,
+        "feed_forward",
+        &format!("{path}.post_attention_layernorm"),
+        &format!("{path}.mlp"),
+        width,
+        ArchitectureNodeKind::FeedForward,
+    );
+    super::components::deepseek_v3::unit(g, c, i, path, &op, &ff);
+    if c.layer_schedule.get(i) != Some(&crate::deepseek::LayerPolicy::DenseMlp) {
+        let attrs = moe(
+            c.n_routed_experts,
+            c.num_experts_per_tok,
+            c.n_shared_experts,
+            c.norm_topk_prob,
+            RoutingScoreTransform::Sigmoid,
+        );
+        g.moe(
+            &ff,
+            &format!("{path}.mlp"),
+            attrs,
+            Some(&format!("{path}.feed_forward")),
+            width,
+        );
+        routed_units::gated(
+            g,
+            RoutedUnitSite {
+                node: &ff,
+                layer: i,
+                routing: &format!("{path}.feed_forward"),
+                input: Some(format!("{path}.feed_forward.input")),
+                normalization: Some(routed_units::rms(
+                    format!("{path}.post_attention_layernorm.weight"),
+                    c.rms_norm_eps,
+                    0.0,
+                )),
+                residual_scale: Some(ComponentScalar::new(1.0)),
+            },
+            crate::deepseek::v3::expert_bank_spec(c, i),
+        );
+        super::components::deepseek_v3::shared_units(g, c, i, path, &ff);
+    }
+    output
 }
 
 fn deepseek_v4(g: &mut Builder, c: &crate::deepseek::V4Args) {
     let width = c.hidden_size as usize;
     let mut previous = g.start("embed", width);
-    for (i, policy) in c.attention_schedule.iter().enumerate() {
+    for (i, policy) in c
+        .attention_schedule
+        .iter()
+        .take(c.num_hidden_layers as usize)
+        .enumerate()
+    {
         let path = format!("layers.{i}");
         let block = g.block(&previous, i, &path, width);
-        g.get_mut(&block).output_axes = None;
-        for p in &mut g.descriptor.observations.points {
-            if p.node_id == block {
-                p.axes = None;
-            }
+        let mut streams = axes(width);
+        streams.insert(
+            2,
+            TensorAxis {
+                name: "stream".into(),
+                dimension: SymbolicDimension::Known(c.hc_mult as usize),
+            },
+        );
+        g.descriptor
+            .observations
+            .points
+            .retain(|p| p.node_id != block);
+        g.interventions.retain(|p| p.node_id != block);
+        g.get_mut(&block).observation_paths.clear();
+        g.get_mut(&block).output_axes = Some(streams.clone());
+        for boundary in ["input", "output"] {
+            g.component_observation(
+                &block,
+                format!("{path}.{boundary}"),
+                "Actual V4 residual streams at the block boundary",
+                streams.clone(),
+            );
         }
         let op = format!("{block}.attention");
         g.node(
@@ -807,23 +1199,54 @@ fn deepseek_v4(g: &mut Builder, c: &crate::deepseek::V4Args) {
             Some(&format!("{path}.ffn")),
             Some(width),
         );
-        g.get_mut(&ff).moe = Some(moe(
-            c.n_routed_experts,
-            c.num_experts_per_tok,
-            c.n_shared_experts,
-            c.norm_topk_prob,
-            RoutingScoreTransform::SqrtSoftplus,
-        ));
-        g.get_mut(&block).completeness = DescriptionCompleteness::Partial(vec!["Hyper-connection collapse/expansion, compressed-history branches, hash routing, and internal norms are not expanded".into()]);
+        g.moe(
+            &ff,
+            &format!("{path}.ffn"),
+            moe(
+                c.n_routed_experts,
+                c.num_experts_per_tok,
+                c.n_shared_experts,
+                c.norm_topk_prob,
+                RoutingScoreTransform::SqrtSoftplus,
+            ),
+            Some(&format!("{path}.feed_forward")),
+            width,
+        );
+        routed_units::gated(
+            g,
+            RoutedUnitSite {
+                node: &ff,
+                layer: i,
+                routing: &format!("{path}.feed_forward"),
+                input: Some(format!("{path}.feed_forward.input")),
+                normalization: Some(routed_units::rms(
+                    format!("{path}.ffn_norm.weight"),
+                    c.rms_norm_eps,
+                    0.0,
+                )),
+                residual_scale: None,
+            },
+            crate::deepseek::v4::expert_bank_spec(c, i),
+        );
+        super::components::deepseek_v4::unit(g, c, i, &path, &path, &op, &ff);
+        g.get_mut(&block).completeness = DescriptionCompleteness::Partial(vec![
+            "Compressed-history provenance and hash selection policy remain partially described"
+                .into(),
+        ]);
         previous = block;
     }
     g.output(&previous, "norm", "head", width, c.vocab_size as usize);
-    g.partial("DeepSeek V4 block interiors are opaque; attention schedule and expert geometry are retained");
-    g.catalog_partial(
-        "V4 hyper-stream, compressed-index, routing, and prediction hooks are not enumerated",
+    super::components::deepseek_v4::readout(g, c);
+    g.partial(
+        "V4 compressed-history provenance and hash selection policy remain partially described",
     );
+    g.catalog_partial("V4 compressed-index operation details are not fully enumerated");
     if c.num_nextn_predict_layers > 0 {
-        prediction(g, &previous);
+        if c.dspark.is_some() {
+            super::components::deepseek_v4::declare_dspark(g, c, &previous);
+        } else {
+            super::components::deepseek_v4::declare_prediction(g, c, &previous);
+        }
     }
 }
 
@@ -1011,7 +1434,9 @@ fn gemma(g: &mut Builder, c: &crate::gemma4::FamilyConfig) {
                 None,
             );
         }
+        super::components::gemma4::unit(g, text, i);
     }
+    super::components::gemma4::readout(g, text);
 }
 
 fn muse(g: &mut Builder, c: &crate::muse_glimmer::DecoderConfig) {
@@ -1048,7 +1473,9 @@ fn muse(g: &mut Builder, c: &crate::muse_glimmer::DecoderConfig) {
                 )
             }),
         );
+        super::components::muse::unit(g, c, i);
     }
+    super::components::muse::readout(g, c);
 }
 
 fn inkling(g: &mut Builder, c: &crate::inkling::ModelArgs) {
@@ -1101,7 +1528,31 @@ fn inkling(g: &mut Builder, c: &crate::inkling::ModelArgs) {
                 attrs
             }),
         );
+        super::components::inkling::decoder_scalars(
+            g,
+            text,
+            *policy,
+            i,
+            &format!("decoder.{i}"),
+            &format!("model.layers.{i}"),
+        );
+        super::components::inkling::decoder_routed(
+            g,
+            c,
+            i,
+            &format!("decoder.{i}"),
+            &format!("model.layers.{i}"),
+        );
+        super::components::inkling::decoder_transforms(
+            g,
+            text,
+            *policy,
+            &format!("decoder.{i}"),
+            &format!("model.layers.{i}"),
+        );
     }
+    super::components::inkling::target_readout(g, text);
+    super::components::inkling::prediction(g, c);
 }
 
 fn moshi(g: &mut Builder, c: &crate::moshi::MoshiConfig) {
@@ -1211,4 +1662,8 @@ fn k2_horizon(g: &mut Builder, c: &crate::k2_horizon::ModelArgs) {
             }
         }
     }
+    routed_units::decoder(g, c, |layer| {
+        crate::k2_horizon::feed_forward_expert_spec(c, layer)
+    });
+    super::components::k2_horizon::complete(g, c);
 }

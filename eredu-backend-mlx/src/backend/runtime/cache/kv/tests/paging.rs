@@ -358,3 +358,79 @@ fn paged_sliding_cache_discards_invisible_blocks_and_preserves_offsets() {
     );
     assert_eq!(manager.report().unwrap().discarded_sliding_blocks, 1);
 }
+
+#[test]
+#[ignore = "requires MLX runtime execution"]
+fn paged_sliding_returns_complete_submitted_blocks_and_bounded_history() {
+    let context = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+    let stream = context.stream();
+    for key_only in [false, true] {
+        for window in [1, 3, 8] {
+            for block_size in [1, 2, 4] {
+                let options = PagedCacheOptions::new(block_size, 1 << 20, 1 << 20, 1).unwrap();
+                let manager = CacheResidencyManager::new(options).unwrap();
+                let mut cache = if key_only {
+                    PagedKeyValueCache::new_key_only_with_layout(
+                        manager.clone(),
+                        0,
+                        Some(window),
+                        0,
+                        None,
+                    )
+                    .unwrap()
+                } else {
+                    PagedKeyValueCache::new(manager.clone(), 0, Some(window)).unwrap()
+                };
+                let mut history = Vec::new();
+                for tokens in [17, 1, 3, 11, 2] {
+                    let offset = cache.offset();
+                    let source: Vec<f32> = (0..tokens * 2)
+                        .map(|i| 0.25 + (offset * 2 + i) as f32)
+                        .collect();
+                    let keys = Array::from_slice(&source, &[1, 1, 2, tokens])
+                        .transpose_axes(&[0, 1, 3, 2], stream)
+                        .unwrap();
+                    let logical_keys: Vec<f32> = (0..tokens)
+                        .flat_map(|i| [source[i as usize], source[(tokens + i) as usize]])
+                        .collect();
+                    let values = if key_only {
+                        zeros_dtype(&[1, 1, tokens, 0], keys.dtype(), stream).unwrap()
+                    } else {
+                        keys.multiply(Array::from_f32(-2.0), stream).unwrap()
+                    };
+                    let past_tokens = offset.min(window - 1) as usize;
+                    let mut expected = history[history.len() - past_tokens * 2..].to_vec();
+                    expected.extend_from_slice(&logical_keys);
+                    let (visible_keys, visible_values) =
+                        cache.update_and_fetch(keys, values, stream).unwrap();
+                    assert_eq!(cache.offset(), offset + tokens);
+                    assert_eq!(
+                        visible_keys.shape(),
+                        &[1, 1, past_tokens as i32 + tokens, 2]
+                    );
+                    let read = |array: &Array| {
+                        array
+                            .contiguous(false, stream)
+                            .unwrap()
+                            .evaluated()
+                            .unwrap()
+                            .try_to_vec::<f32>()
+                            .unwrap()
+                    };
+                    assert_eq!(read(&visible_keys), expected);
+                    let expected_values = if key_only {
+                        vec![0.0; past_tokens + tokens as usize]
+                    } else {
+                        expected.iter().map(|value| value * -2.0).collect()
+                    };
+                    assert_eq!(read(&visible_values), expected_values);
+                    history.extend(logical_keys);
+                }
+                let report = manager.report().unwrap();
+                assert!(report.discarded_sliding_blocks > 0);
+                assert!(report.current_device_bytes <= manager.options().device_budget_bytes());
+                assert!(report.current_host_bytes <= manager.options().host_budget_bytes());
+            }
+        }
+    }
+}

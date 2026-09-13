@@ -8,6 +8,7 @@ use eredu_nn::{
 };
 
 use super::ModelArgs;
+use crate::decoder::ComponentInstrumentation;
 
 /// Direct or normalized low-rank Kimi query projection.
 #[derive(Debug, Clone, Parameterized)]
@@ -39,10 +40,15 @@ impl<B: BlockwiseAttentionBackend> QueryProjection<B> {
         &mut self,
         input: &B::Tensor,
         context: &<B::Tensor as Tensor>::Context,
+        instrumentation: &mut ComponentInstrumentation<'_, B::Tensor>,
     ) -> Result<B::Tensor, Error> {
         match self {
             Self::Direct(projection) => projection.forward(input, context),
-            Self::LowRank(projection) => projection.forward(input, context),
+            Self::LowRank(projection) => {
+                projection.forward_with_normalized_rank(input, context, |rank, _| {
+                    instrumentation.apply("attention.query.latent", rank)
+                })
+            }
         }
     }
 }
@@ -203,7 +209,14 @@ impl<B: BlockwiseAttentionBackend> KimiLatentAttention<B> {
         cache: Option<&mut C>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
-        self.forward_inner(input, mask, cache, None, context)
+        self.forward_instrumented(
+            input,
+            mask,
+            cache,
+            None,
+            context,
+            &mut ComponentInstrumentation::disabled(),
+        )
     }
 
     /// Executes MLA with a row-parallel output projection.
@@ -215,35 +228,48 @@ impl<B: BlockwiseAttentionBackend> KimiLatentAttention<B> {
         parallel: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
-        self.forward_inner(input, mask, cache, Some(parallel), context)
+        self.forward_instrumented(
+            input,
+            mask,
+            cache,
+            Some(parallel),
+            context,
+            &mut ComponentInstrumentation::disabled(),
+        )
     }
 
-    fn forward_inner<C: CompressedAttentionCache<B::Tensor>>(
+    /// Executes resident or paged MLA with the same latent and channel hooks.
+    pub fn forward_instrumented<C: CompressedAttentionCache<B::Tensor>>(
         &mut self,
         input: &B::Tensor,
         mask: Option<&B::Tensor>,
         cache: Option<&mut C>,
         parallel: Option<&B::ParallelContext>,
         context: &<B::Tensor as Tensor>::Context,
+        instrumentation: &mut ComponentInstrumentation<'_, B::Tensor>,
     ) -> Result<B::Tensor, Error> {
         let batch = input.dim(0);
         let tokens = input.dim(1);
         let offset = cache.as_ref().map_or(0, |cache| cache.offset());
-        let query = self.query.forward(input, context)?.reshape(
-            &[
-                batch,
-                tokens,
-                self.heads,
-                self.nope_dimensions + self.positional_dimensions,
-            ],
-            context,
-        )?;
+        let query = self
+            .query
+            .forward(input, context, instrumentation)?
+            .reshape(
+                &[
+                    batch,
+                    tokens,
+                    self.heads,
+                    self.nope_dimensions + self.positional_dimensions,
+                ],
+                context,
+            )?;
         let queries = query.transpose_axes(&[0, 2, 1, 3], context)?;
         let kv = self.kv_a.forward(input, context)?;
         let latent = self.kv_norm.forward(
             &slice_last(&kv, 0, self.latent_dimensions, context)?,
             context,
         )?;
+        let latent = instrumentation.apply("attention.key_value.latent", latent)?;
         let rotary = slice_last(
             &kv,
             self.latent_dimensions,
@@ -291,7 +317,7 @@ impl<B: BlockwiseAttentionBackend> KimiLatentAttention<B> {
                             &[batch, tokens, self.heads * self.value_dimensions],
                             context,
                         )?;
-                    return self.project_output(&attended, parallel, context);
+                    return self.project_output(attended, parallel, context, instrumentation);
                 }
             }
         };
@@ -314,19 +340,24 @@ impl<B: BlockwiseAttentionBackend> KimiLatentAttention<B> {
             &[batch, tokens, self.heads * self.value_dimensions],
             context,
         )?;
-        self.project_output(&attended, parallel, context)
+        self.project_output(attended, parallel, context, instrumentation)
     }
 
     fn project_output(
         &mut self,
-        attended: &B::Tensor,
+        attended: B::Tensor,
         parallel: Option<&B::ParallelContext>,
         context: &<B::Tensor as Tensor>::Context,
+        instrumentation: &mut ComponentInstrumentation<'_, B::Tensor>,
     ) -> Result<B::Tensor, Error> {
-        match parallel {
-            Some(parallel) => B::row_parallel_linear(&mut self.output, attended, parallel, context),
-            None => self.output.forward(attended, context),
-        }
+        let channels = instrumentation.apply("attention.channels", attended)?;
+        instrumentation.project::<B>(
+            "attention.write_input",
+            &mut self.output,
+            &channels,
+            parallel,
+            context,
+        )
     }
 
     fn reconstruct(

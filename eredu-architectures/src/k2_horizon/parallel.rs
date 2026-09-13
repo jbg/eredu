@@ -5,8 +5,8 @@ use super::{
 };
 use eredu_nn::GroupedNeuralBackend;
 use eredu_runtime::{
-    aligned_partition_units, module_parameter_group, partitioned_module_parameter_group,
-    MemberSharding, ParallelPlanError, ParameterGroupSpec, ParameterRole,
+    module_parameter_group, partitioned_module_parameter_group, MemberSharding, ParallelPlanError,
+    ParameterGroupSpec, ParameterRole,
 };
 
 fn executable_shapes(
@@ -64,17 +64,15 @@ pub fn parameter_description(
                 members(&router, &|_, _| MemberSharding::Replicated),
             )?);
             let experts = format!("{prefix}.mlp.experts");
-            let alignment = crate::linear_format::input_partition_alignment(
-                args.linear_format_for(&format!("{experts}.down_proj")),
-            ) as usize;
-            groups.push(ParameterGroupSpec::partitioned(
+            let output_format = args.linear_format_for(&format!("{experts}.down_proj"));
+            let group = ParameterGroupSpec::partitioned(
                 format!("{experts}.intermediate"),
                 ParameterRole::ExpertIntermediate,
-                aligned_partition_units(
+                crate::linear_format::input_partition_units(
                     &experts,
                     args.moe_intermediate_size as usize,
                     1,
-                    alignment,
+                    output_format,
                 )?,
                 members(&experts, &|name, shape| {
                     if name.ends_with("gate_up_proj") {
@@ -86,24 +84,34 @@ pub fn parameter_description(
                         MemberSharding::Partitioned { axis: 2 }
                     }
                 }),
+            )?;
+            groups.push(crate::linear_format::dense_ffn_partition_tail(
+                group,
+                args.moe_intermediate_size as usize,
+                output_format,
+                |name| args.linear_format_for(name),
             )?);
             if args.num_shared_experts > 0 {
                 let shared = format!("{prefix}.mlp.shared_experts");
-                let alignment = crate::linear_format::input_partition_alignment(
-                    args.linear_format_for(&format!("{shared}.down_proj.weight")),
-                ) as usize;
-                groups.push(ParameterGroupSpec::partitioned(
+                let output_format = args.linear_format_for(&format!("{shared}.down_proj.weight"));
+                let group = ParameterGroupSpec::partitioned(
                     format!("{shared}.intermediate"),
                     ParameterRole::FeedForwardIntermediate,
-                    aligned_partition_units(
+                    crate::linear_format::input_partition_units(
                         &shared,
                         (args.moe_intermediate_size * args.num_shared_experts) as usize,
                         1,
-                        alignment,
+                        output_format,
                     )?,
                     members(&shared, &|name, _| MemberSharding::Partitioned {
                         axis: usize::from(name.ends_with("down_proj.weight")),
                     }),
+                )?;
+                groups.push(crate::linear_format::dense_ffn_partition_tail(
+                    group,
+                    (args.moe_intermediate_size * args.num_shared_experts) as usize,
+                    output_format,
+                    |name| args.linear_format_for(name),
                 )?);
             }
             if args.is_mova_layer(layer) {
@@ -255,7 +263,7 @@ pub fn block_parameter_groups<B: GroupedNeuralBackend>(
             &values.router,
             |_, _| Ok(MemberSharding::Replicated),
         )?);
-        groups.push(partitioned_module_parameter_group::<B::Tensor, _>(
+        let group = partitioned_module_parameter_group::<B::Tensor, _>(
             format!("{prefix}.self_attn.v_experts.output"),
             ParameterRole::ExpertOutput,
             args.num_key_value_heads as usize,
@@ -268,7 +276,11 @@ pub fn block_parameter_groups<B: GroupedNeuralBackend>(
                 }
                 Ok(MemberSharding::Partitioned { axis: 1 })
             },
-        )?);
+        )?;
+        groups.push(
+            crate::decoder::attention_partition::AttentionPartition::new(args, layer)?
+                .apply(group, |name| args.linear_format_for(name))?,
+        );
     }
     match &block.mlp.feed_forward {
         FeedForward::Dense(mlp) => groups.push(crate::decoder::dense_mlp_parallel_parameter_group(
@@ -286,11 +298,10 @@ pub fn block_parameter_groups<B: GroupedNeuralBackend>(
                 |_, _| Ok(MemberSharding::Replicated),
             )?);
             let width = args.moe_intermediate_size as usize;
-            let alignment = crate::linear_format::input_partition_alignment(
-                args.linear_format_for(&format!("{prefix}.mlp.experts.down_proj")),
-            ) as usize;
-            let units = aligned_partition_units(&prefix, width, 1, alignment)?;
-            groups.push(partitioned_module_parameter_group::<B::Tensor, _>(
+            let output_format = args.linear_format_for(&format!("{prefix}.mlp.experts.down_proj"));
+            let units =
+                crate::linear_format::input_partition_units(&prefix, width, 1, output_format)?;
+            let group = partitioned_module_parameter_group::<B::Tensor, _>(
                 format!("{prefix}.mlp.experts.intermediate"),
                 ParameterRole::ExpertIntermediate,
                 units,
@@ -322,15 +333,20 @@ pub fn block_parameter_groups<B: GroupedNeuralBackend>(
                         )))
                     }
                 },
+            )?;
+            groups.push(crate::linear_format::dense_ffn_partition_tail(
+                group,
+                width,
+                output_format,
+                |name| args.linear_format_for(name),
             )?);
             if let Some(shared) = shared {
                 let width = (args.moe_intermediate_size * args.num_shared_experts) as usize;
-                let alignment =
-                    crate::linear_format::input_partition_alignment(args.linear_format_for(
-                        &format!("{prefix}.mlp.shared_experts.down_proj.weight"),
-                    )) as usize;
-                let units = aligned_partition_units(&prefix, width, 1, alignment)?;
-                groups.push(partitioned_module_parameter_group::<B::Tensor, _>(
+                let output_format = args
+                    .linear_format_for(&format!("{prefix}.mlp.shared_experts.down_proj.weight"));
+                let units =
+                    crate::linear_format::input_partition_units(&prefix, width, 1, output_format)?;
+                let group = partitioned_module_parameter_group::<B::Tensor, _>(
                     format!("{prefix}.mlp.shared_experts.intermediate"),
                     ParameterRole::FeedForwardIntermediate,
                     units,
@@ -344,6 +360,12 @@ pub fn block_parameter_groups<B: GroupedNeuralBackend>(
                             },
                         })
                     },
+                )?;
+                groups.push(crate::linear_format::dense_ffn_partition_tail(
+                    group,
+                    width,
+                    output_format,
+                    |name| args.linear_format_for(name),
                 )?);
             }
         }
@@ -387,13 +409,20 @@ pub fn local_block_args(
         let experts = tensor("mlp.experts.gate_up_proj")?;
         local.fields.num_experts = experts.local_shape()[0] as i32;
         local.fields.moe_intermediate_size = (experts.local_shape()[1] / 2) as i32;
+        if args.num_shared_experts > 0 {
+            let shared = tensor("mlp.shared_experts.down_proj.weight")?;
+            local.local_shared_intermediate_size = Some(
+                i32::try_from(shared.local_shape()[1])
+                    .map_err(|error| ParallelPlanError::InvalidTensor(error.to_string()))?,
+            );
+        }
     } else {
         local.fields.intermediate_size = tensor("mlp.gate_proj.weight")?.local_shape()[0] as i32;
     }
     if args.is_mova_layer(layer) {
         let values = tensor("self_attn.v_experts.weight")?;
         local.fields.mova_num_experts = values.local_shape()[0] as i32;
-        // Output ownership follows the same balanced contiguous KV-head partition.
+        // Output ownership follows the same retained contiguous KV-head partition.
         let dimension = values.local_shape()[1] as i32;
         if dimension != k {
             return Err(ParallelPlanError::InvalidTensor(

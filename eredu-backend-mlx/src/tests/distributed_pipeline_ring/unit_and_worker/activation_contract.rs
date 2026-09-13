@@ -29,13 +29,19 @@ fn pipeline_activation_dtype_comes_from_wire_contract_not_weights() {
 enum FixtureFamily {
     K2Dense,
     K2Mova,
+    K2Fp8(bool),
     Llama,
     Mistral,
+    Nanbeige,
     DeepSeek,
+    DeepSeekDense,
+    DeepSeekDenseGguf,
     DeepSeekV4,
     DeepSeekGguf,
     Gemma,
     MuseGlimmer,
+    MuseGlimmerMoe,
+    MuseGlimmerGguf(bool),
     Qwen2,
     Qwen2Gguf,
     Qwen3,
@@ -69,17 +75,37 @@ enum FixtureFamily {
 }
 
 impl FixtureFamily {
+    const fn is_v3(self) -> bool {
+        self.is_dense_v3() || matches!(self, Self::DeepSeek | Self::DeepSeekGguf)
+    }
+
+    const fn is_dense_v3(self) -> bool {
+        matches!(self, Self::DeepSeekDense | Self::DeepSeekDenseGguf)
+    }
+
+    const fn is_k2_fp8(self) -> bool {
+        matches!(self, Self::K2Fp8(_))
+    }
+
     const fn name(self) -> &'static str {
         match self {
             Self::K2Dense => "k2-dense",
             Self::K2Mova => "k2-mova",
+            Self::K2Fp8(false) => "k2-fp8",
+            Self::K2Fp8(true) => "k2-fp8-tail",
             Self::Llama => "llama",
             Self::Mistral => "mistral",
+            Self::Nanbeige => "nanbeige",
             Self::DeepSeek => "deepseek",
+            Self::DeepSeekDense => "deepseek-dense",
+            Self::DeepSeekDenseGguf => "deepseek-dense-gguf",
             Self::DeepSeekV4 => "deepseek-v4",
             Self::DeepSeekGguf => "deepseek-gguf",
             Self::Gemma => "gemma",
             Self::MuseGlimmer => "muse-glimmer",
+            Self::MuseGlimmerMoe => "muse-glimmer-moe",
+            Self::MuseGlimmerGguf(false) => "muse-glimmer-gguf",
+            Self::MuseGlimmerGguf(true) => "muse-glimmer-moe-gguf",
             Self::Qwen2 => "qwen2",
             Self::Qwen2Gguf => "qwen2-gguf",
             Self::Qwen3 => "qwen3",
@@ -117,13 +143,21 @@ impl FixtureFamily {
         for family in [
             Self::K2Dense,
             Self::K2Mova,
+            Self::K2Fp8(false),
+            Self::K2Fp8(true),
             Self::Llama,
             Self::Mistral,
+            Self::Nanbeige,
             Self::DeepSeek,
+            Self::DeepSeekDense,
+            Self::DeepSeekDenseGguf,
             Self::DeepSeekV4,
             Self::DeepSeekGguf,
             Self::Gemma,
             Self::MuseGlimmer,
+            Self::MuseGlimmerMoe,
+            Self::MuseGlimmerGguf(false),
+            Self::MuseGlimmerGguf(true),
             Self::Qwen2,
             Self::Qwen2Gguf,
             Self::Qwen3,
@@ -164,10 +198,13 @@ impl FixtureFamily {
 
     fn layer_count(self) -> usize {
         match self {
-            Self::K2Dense | Self::K2Mova => 3,
+            Self::K2Dense | Self::K2Mova | Self::K2Fp8(_) => 3,
             Self::Llama
             | Self::Mistral
+            | Self::Nanbeige
             | Self::DeepSeek
+            | Self::DeepSeekDense
+            | Self::DeepSeekDenseGguf
             | Self::DeepSeekV4
             | Self::DeepSeekGguf
             | Self::Qwen2
@@ -193,7 +230,9 @@ impl FixtureFamily {
             | Self::Qwen35MoeMultimodal
             | Self::Qwen3Vl
             | Self::Qwen3VlMoe
-            | Self::MuseGlimmer => 2,
+            | Self::MuseGlimmer
+            | Self::MuseGlimmerMoe
+            | Self::MuseGlimmerGguf(_) => 2,
             Self::Gemma | Self::NemotronH | Self::NemotronHGguf => 4,
             Self::Inkling
             | Self::InklingDense
@@ -205,8 +244,8 @@ impl FixtureFamily {
 
     fn stage_range(self, rank: usize) -> std::ops::Range<usize> {
         match (self, rank) {
-            (Self::K2Dense | Self::K2Mova, 0) => 0..2,
-            (Self::K2Dense | Self::K2Mova, 1) => 2..3,
+            (Self::K2Dense | Self::K2Mova | Self::K2Fp8(_), 0) => 0..2,
+            (Self::K2Dense | Self::K2Mova | Self::K2Fp8(_), 1) => 2..3,
             (Self::Gemma, 0) => 0..1,
             (Self::Gemma, 1) => 1..4,
             (Self::NemotronH | Self::NemotronHGguf, 0) => 0..2,
@@ -233,8 +272,9 @@ impl FixtureFamily {
 
     fn expert_layer_count(self, range: std::ops::Range<usize>) -> usize {
         match self {
-            Self::K2Dense => 0,
-            Self::K2Mova => range.filter(|index| *index >= 1).count(),
+            Self::K2Dense | Self::DeepSeekDense | Self::DeepSeekDenseGguf => 0,
+            Self::Nanbeige | Self::MuseGlimmer | Self::MuseGlimmerGguf(false) => 0,
+            Self::K2Mova | Self::K2Fp8(_) => range.filter(|index| *index >= 1).count(),
             Self::DeepSeek
             | Self::DeepSeekGguf
             | Self::Lfm2Moe
@@ -254,13 +294,18 @@ impl FixtureFamily {
 
     fn effective_model_type(self) -> &'static str {
         match self {
-            Self::K2Dense | Self::K2Mova => "k2_horizon",
+            Self::K2Dense | Self::K2Mova | Self::K2Fp8(_) => "k2_horizon",
             Self::Llama => "llama",
             Self::Mistral => "mistral",
-            Self::DeepSeek | Self::DeepSeekGguf => "deepseek_v3",
+            Self::Nanbeige => "nanbeige",
+            Self::DeepSeek | Self::DeepSeekDense | Self::DeepSeekDenseGguf | Self::DeepSeekGguf => {
+                "deepseek_v3"
+            }
             Self::DeepSeekV4 => "deepseek_v4",
             Self::Gemma => "gemma4_text",
-            Self::MuseGlimmer => "muse_glimmer_text",
+            Self::MuseGlimmer | Self::MuseGlimmerMoe | Self::MuseGlimmerGguf(_) => {
+                "muse_glimmer_text"
+            }
             Self::Qwen2 | Self::Qwen2Gguf => "qwen2",
             Self::Qwen3 | Self::Qwen3Gguf => "qwen3",
             Self::Qwen3Moe | Self::Qwen3MoeTied | Self::Qwen3MoeGguf => "qwen3_moe",
@@ -287,10 +332,14 @@ impl FixtureFamily {
             self,
             Self::K2Dense
                 | Self::K2Mova
+                | Self::K2Fp8(_)
                 | Self::Llama
                 | Self::Mistral
+                | Self::Nanbeige
                 | Self::Gemma
                 | Self::MuseGlimmer
+                | Self::MuseGlimmerMoe
+                | Self::MuseGlimmerGguf(_)
                 | Self::Qwen2
                 | Self::Qwen2Gguf
                 | Self::Qwen3
@@ -305,6 +354,8 @@ impl FixtureFamily {
                 | Self::Qwen35ZeroPrediction
                 | Self::Qwen3Vl
                 | Self::DeepSeek
+                | Self::DeepSeekDense
+                | Self::DeepSeekDenseGguf
                 | Self::DeepSeekV4
                 | Self::InklingDense
                 | Self::InklingDenseMultimodal
@@ -340,4 +391,29 @@ impl FixtureFamily {
             _ => 1e-4,
         }
     }
+}
+fn component_fixture_weight(family: FixtureFamily, id: &str) -> bool {
+    if family == FixtureFamily::DeepSeekV4 {
+        return !id.ends_with(".tid2eid")
+            && ![".scales", ".biases", "_scales", "_biases"]
+                .iter()
+                .any(|suffix| id.ends_with(suffix));
+    }
+    id.ends_with(".weight")
+        || (family == FixtureFamily::Gemma
+            && (id.ends_with(".bias") || id.ends_with(".layer_scalar")))
+        || ((family.is_v3()
+            || matches!(
+                family,
+                FixtureFamily::Gemma
+                    | FixtureFamily::MuseGlimmerMoe
+                    | FixtureFamily::Qwen3VlMoe
+                    | FixtureFamily::MuseGlimmerGguf(true)
+                    | FixtureFamily::Qwen3NextMoe
+                    | FixtureFamily::Qwen35Moe
+                    | FixtureFamily::Qwen35MoeMultimodal
+                    | FixtureFamily::KimiLinear
+                    | FixtureFamily::KimiLinearGguf
+            ))
+            && (id.ends_with(".gate_up_proj") || id.ends_with(".down_proj")))
 }

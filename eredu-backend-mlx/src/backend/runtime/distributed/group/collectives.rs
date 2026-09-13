@@ -7,6 +7,47 @@ fn depends_on(value: &Array, dependency: &Array) -> Result<Array> {
         .ok_or_else(|| Exception::custom("MLX depends returned no output"))
 }
 
+/// Completes one slot in a logical subgroup's shared-world participation wave.
+/// Independent lazy branches can otherwise evaluate in a different order on
+/// active and zero-work pipeline stages, matching unrelated native collectives.
+pub(super) fn ordered_world_sum(input: &Array, group: &Group, stream: &Stream) -> Result<Array> {
+    use eredu_core::{
+        BoundedCompletion, BoundedCompletionOutcome, BoundedCompletionWait, Completion,
+    };
+    let started = std::time::Instant::now();
+    let output = native::all_sum(
+        input,
+        &group.native,
+        group.communication_stream(stream.as_ref())?,
+    )?;
+    let completion =
+        crate::backend::runtime::distributed::completion::MlxCommunicationCompletion::submit(
+            [&output],
+            vec![input.clone(), output.clone()],
+            vec![],
+            vec![group.clone()],
+            vec![],
+            vec![stream.clone()],
+        )?;
+    if let Some(policy) = group.completion_policy() {
+        let remaining = policy
+            .timeout()
+            .saturating_sub(started.elapsed())
+            .max(std::time::Duration::from_nanos(1));
+        let wait = BoundedCompletionWait::new(remaining, policy.cancellation())
+            .map_err(|error| Exception::custom(error.to_string()))?;
+        if matches!(
+            completion.wait_bounded(wait)?,
+            BoundedCompletionOutcome::DeadlineExceeded { .. }
+        ) {
+            return Err(Exception::custom("logical world collective exceeded its deadline; native resources retained until completion"));
+        }
+    } else {
+        completion.wait()?;
+    }
+    Ok(output)
+}
+
 pub(super) fn pack_logical_value(
     input: &Array,
     slot: usize,
@@ -34,11 +75,21 @@ fn logical_pair_peer(group: &Group) -> Option<usize> {
 }
 
 fn native_send(input: &Array, destination: usize, group: &Group, stream: &Stream) -> Result<Array> {
-    native::send(input, destination, &group.native, stream)
+    native::send(
+        input,
+        destination,
+        &group.native,
+        group.communication_stream(stream.as_ref())?,
+    )
 }
 
 fn native_recv_like(like: &Array, source: usize, group: &Group, stream: &Stream) -> Result<Array> {
-    native::recv_like(like, source, &group.native, stream)
+    native::recv_like(
+        like,
+        source,
+        &group.native,
+        group.communication_stream(stream.as_ref())?,
+    )
 }
 
 pub(super) fn logical_direct_exchange(
@@ -155,7 +206,7 @@ fn logical_all_sum(input: &Array, group: &Group, stream: &Stream) -> Result<Arra
     }
     let representative = logical.global_ranks[0];
     let packed = pack_logical_value(input, representative, group.native.size(), stream)?;
-    native::all_sum(&packed, &group.native, stream)?.try_index_device(
+    ordered_world_sum(&packed, group, stream)?.try_index_device(
         i32::try_from(representative)
             .map_err(|_| Exception::custom("logical representative does not fit in i32"))?,
         stream,
@@ -185,7 +236,7 @@ fn logical_all_gather_stacked(input: &Array, group: &Group, stream: &Stream) -> 
         ));
     }
     let packed = pack_logical_value(input, group.native.rank(), group.native.size(), stream)?;
-    let gathered = native::all_sum(&packed, &group.native, stream)?;
+    let gathered = ordered_world_sum(&packed, group, stream)?;
     let indices = logical
         .global_ranks
         .iter()
@@ -203,7 +254,11 @@ fn all_sum_unchecked(input: &Array, group: &Group, stream: &Stream) -> Result<Ar
     record_native_collective_submission(group);
     match group.logical {
         Some(_) => logical_all_sum(input, group, stream),
-        None => native::all_sum(input, &group.native, stream),
+        None => native::all_sum(
+            input,
+            &group.native,
+            group.communication_stream(stream.as_ref())?,
+        ),
     }
 }
 
@@ -244,7 +299,17 @@ pub(crate) fn payload_free_all_sum_for(
     if let Some(setup) = &_setup {
         setup.check()?;
     }
-    let output = all_sum_unchecked(token, group, stream.as_ref())?;
+    let output = if operation == CommunicationOperation::FailureAgreement {
+        match super::status::independent_status_sum(token, group, stream.as_ref())? {
+            Some(output) => {
+                record_native_collective_submission(group);
+                output
+            }
+            None => all_sum_unchecked(token, group, stream.as_ref())?,
+        }
+    } else {
+        all_sum_unchecked(token, group, stream.as_ref())?
+    };
     if output.shape() != token.shape() {
         return Err(Exception::custom(format!(
             "{operation:?} completed with shape {:?}, expected {:?}",
@@ -291,7 +356,11 @@ pub(crate) fn all_gather_unchecked(
     record_native_collective_submission(group);
     let stream = stream.as_ref();
     let output = if group.logical.is_none() {
-        native::all_gather(input, &group.native, stream)?
+        native::all_gather(
+            input,
+            &group.native,
+            group.communication_stream(stream.as_ref())?,
+        )?
     } else {
         let stacked = logical_all_gather_stacked(input, group, stream)?;
         if input.ndim() == 0 {
@@ -466,7 +535,7 @@ fn logical_world_all_to_all_v(
         &world_send,
         &world_recv,
         &group.native,
-        stream,
+        group.communication_stream(stream.as_ref())?,
     )?;
     if canonical_order {
         Ok(world_output)
@@ -528,7 +597,13 @@ pub fn all_to_all_v(
     let stream = stream.as_ref();
     record_native_collective_submission(group);
     if group.logical.is_none() {
-        let output = native::all_to_all_v(input, send_counts, recv_counts, &group.native, stream)?;
+        let output = native::all_to_all_v(
+            input,
+            send_counts,
+            recv_counts,
+            &group.native,
+            group.communication_stream(stream.as_ref())?,
+        )?;
         validate_all_to_all_output(&output, input, expected_rows, group)?;
         return Ok(output);
     }
@@ -642,4 +717,37 @@ fn validate_all_to_all_output(
         )));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod ordered_wave_tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "requires native MLX CPU execution; run explicitly"]
+    fn ordered_world_timeout_retains_and_fences_native_group() {
+        use crate::backend::runtime::distributed::completion::{
+            ensure_group_available, force_next_communication_pending,
+            release_forced_pending_orphans,
+        };
+        let native = native::init(false, native::Backend::Ring).unwrap();
+        let policy = CommunicationCompletionPolicy::new(
+            std::time::Duration::from_millis(5),
+            eredu_core::CompletionCancellationMode::QuarantineUntilComplete,
+        )
+        .unwrap();
+        let group = Group::uncontracted(&native).with_completion_policy(policy);
+        let stream = Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
+        let value = Array::from_slice(&[2.0_f32, -3.0], &[2]);
+        force_next_communication_pending();
+        assert!(ordered_world_sum(&value, &group, &stream)
+            .unwrap_err()
+            .what()
+            .contains("native resources retained"));
+        assert!(ensure_group_available(&group).is_err());
+        release_forced_pending_orphans();
+        assert!(ensure_group_available(&group).is_ok());
+        let result = ordered_world_sum(&value, &group, &stream).unwrap();
+        assert_eq!(result.evaluated().unwrap().as_slice::<f32>(), &[2.0, -3.0]);
+    }
 }

@@ -113,6 +113,14 @@ fn setup_deadline_poisons_exact_authority_and_retry_makes_no_native_call() {
                 &stream,
             )
             .expect_err("setup deadline must poison the selected communication authority");
+        let mut source: &(dyn std::error::Error + 'static) = &first;
+        loop {
+            if let Some(native) = source.downcast_ref::<safemlx::error::Exception>() {
+                assert!(native.what().contains("selected deadline"));
+                break;
+            }
+            source = source.source().expect("native setup deadline cause");
+        }
         let retry = OpaqueFailureAgreement
             .agree_phase(
                 &communication,

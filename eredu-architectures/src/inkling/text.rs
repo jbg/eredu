@@ -4,15 +4,16 @@ use eredu_core::AttentionPolicy;
 use eredu_nn::{
     AttentionCache, AttentionRequest, AuxiliaryConvolutionState, CausalDepthwiseConvolution,
     CausalDepthwiseConvolutionSpec, ConvolutionActivation, EmbeddingOperator, EmbeddingSpec, Error,
-    GatedProductGroupLayout, GroupSelection, GroupedGatedProductOperator, GroupedGatedProductSpec,
-    GroupedNeuralBackend, JointGroupSelectionInput, JointGroupSelectionSpec, LinearOperator,
-    LinearSpec, NeuralBackend, NormalizationConstructionSpec, NormalizationOperator, Parameter,
-    ParameterSpec, Parameterized, RelativeAttentionInput, Tensor,
+    GatedProductGroupLayout, GroupSelection, GroupedGatedProductSpec, GroupedNeuralBackend,
+    JointGroupSelectionInput, JointGroupSelectionSpec, LinearOperator, LinearSpec, NeuralBackend,
+    NormalizationConstructionSpec, NormalizationOperator, Parameter, ParameterSpec, Parameterized,
+    RelativeAttentionInput, Tensor,
 };
 use eredu_runtime::{
     ExpertPass, RoutedExpertProvider, RoutedExpertRequest, TensorParallelRoutedExpertProvider,
 };
 
+use crate::decoder::ComponentInstrumentation;
 use crate::linear_format::standard_expert_projection;
 
 use super::{FeedForwardPolicy, LayerPolicy, ModelArgs, TextArgs};
@@ -55,6 +56,9 @@ where
     T: Tensor,
     C: AttentionCache<T>,
 {
+    fn uses_blockwise_attention(&self) -> bool {
+        self.attention.uses_blockwise_attention()
+    }
     fn offset(&self) -> i32 {
         self.attention.offset()
     }
@@ -78,6 +82,13 @@ where
         context: &T::Context,
     ) -> Result<T, Error> {
         self.attention.attention(request, context)
+    }
+    fn relative_attention<B: NeuralBackend<Tensor = T>>(
+        &mut self,
+        request: RelativeAttentionInput<'_, T>,
+        context: &T::Context,
+    ) -> Result<T, Error> {
+        self.attention.relative_attention::<B>(request, context)
     }
 }
 
@@ -264,6 +275,44 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> Attention<B> {
         state: Option<&mut C>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
+        self.forward_instrumented(
+            hidden,
+            state,
+            None,
+            context,
+            &mut ComponentInstrumentation::disabled(),
+        )
+    }
+
+    /// Applies attention with a row-parallel output projection.
+    pub fn forward_parallel<C: AuxiliaryConvolutionState<B::Tensor>>(
+        &mut self,
+        hidden: &B::Tensor,
+        state: Option<&mut C>,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Error>
+    where
+        B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
+    {
+        self.forward_instrumented(
+            hidden,
+            state,
+            Some(parallel),
+            context,
+            &mut ComponentInstrumentation::disabled(),
+        )
+    }
+
+    /// Captures and changes aggregated channels before their actual projection.
+    pub fn forward_instrumented<C: AuxiliaryConvolutionState<B::Tensor>>(
+        &mut self,
+        hidden: &B::Tensor,
+        mut state: Option<&mut C>,
+        parallel: Option<&B::ParallelContext>,
+        context: &<B::Tensor as Tensor>::Context,
+        instrumentation: &mut ComponentInstrumentation<'_, B::Tensor>,
+    ) -> Result<B::Tensor, Error> {
         let batch = hidden.dim(0);
         let sequence = hidden.dim(1);
         let query_offset = state.as_ref().map_or(0, |state| state.offset());
@@ -271,7 +320,11 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> Attention<B> {
         let key = self.key.forward(hidden, context)?;
         let value = self.value.forward(hidden, context)?;
         let relative = self.relative.forward(hidden, context)?;
-        let (key, value, keys, values, key_offset) = if let Some(state) = state {
+        instrumentation.observe("attention.query.projected", &query)?;
+        instrumentation.observe("attention.key.projected", &key)?;
+        instrumentation.observe("attention.value.projected", &value)?;
+        instrumentation.observe("attention.relative.projected", &relative)?;
+        let (key, value, keys, values, key_offset) = if let Some(state) = state.as_deref_mut() {
             let key = residual_convolution(
                 &self.key_convolution,
                 &key,
@@ -324,7 +377,10 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> Attention<B> {
                 .transpose_axes(&[0, 2, 1, 3], context)?;
             (key, value, keys, values, 0)
         };
-        let _ = (key, value);
+        // These are the current positions after causal convolution, before key
+        // head normalization and cache reuse. No historical cache is exported.
+        instrumentation.observe("attention.key.convolved", &key)?;
+        instrumentation.observe("attention.value.convolved", &value)?;
         let queries = self.query_norm.forward(
             &query.reshape(
                 &[batch, sequence, self.query_heads, self.head_dimensions],
@@ -337,133 +393,37 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> Attention<B> {
             &[batch, sequence, self.query_heads, self.relative_dimensions],
             context,
         )?;
-        let profiles = B::Tensor::matmul(&profiles, self.relative_projection.as_ref(), context)?
-            .transpose_axes(&[0, 2, 1, 3], context)?;
+        let profiles = B::Tensor::matmul(&profiles, self.relative_projection.as_ref(), context)?;
+        instrumentation.observe("attention.relative.profiles", &profiles)?;
+        let profiles = profiles.transpose_axes(&[0, 2, 1, 3], context)?;
         debug_assert_eq!(profiles.dim(3), self.relative_extent);
-        let attended = B::relative_attention(
-            RelativeAttentionInput {
-                queries: &queries,
-                keys: &keys,
-                values: &values,
-                profiles: &profiles,
-                query_offset,
-                key_offset,
-                window: self.policy.window().map(|window| window.get() as i32),
-                log_scaling_floor: self.log_scaling_floor,
-                log_scaling_alpha: self.log_scaling_alpha,
-            },
-            context,
-        )?;
-        let attended = attended.transpose_axes(&[0, 2, 1, 3], context)?.reshape(
-            &[batch, sequence, self.query_heads * self.head_dimensions],
-            context,
-        )?;
-        self.output.forward(&attended, context)
-    }
-
-    /// Applies attention with a row-parallel output projection.
-    pub fn forward_parallel<C: AuxiliaryConvolutionState<B::Tensor>>(
-        &mut self,
-        hidden: &B::Tensor,
-        state: Option<&mut C>,
-        parallel: &B::ParallelContext,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<B::Tensor, Error>
-    where
-        B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
-    {
-        let batch = hidden.dim(0);
-        let sequence = hidden.dim(1);
-        let query_offset = state.as_ref().map_or(0, |state| state.offset());
-        let query = self.query.forward(hidden, context)?;
-        let key = self.key.forward(hidden, context)?;
-        let value = self.value.forward(hidden, context)?;
-        let relative = self.relative.forward(hidden, context)?;
-        let (keys, values, key_offset) = if let Some(state) = state {
-            let key = residual_convolution(
-                &self.key_convolution,
-                &key,
-                state.convolution_state(0)?,
-                context,
-            )?;
-            let value = residual_convolution(
-                &self.value_convolution,
-                &value,
-                state.convolution_state(1)?,
-                context,
-            )?;
-            let keys = self.key_norm.forward(
-                &key.reshape(
-                    &[batch, sequence, self.key_value_heads, self.head_dimensions],
-                    context,
-                )?,
-                context,
-            )?;
-            let keys = keys.transpose_axes(&[0, 2, 1, 3], context)?;
-            let values = value
-                .reshape(
-                    &[batch, sequence, self.key_value_heads, self.head_dimensions],
-                    context,
-                )?
-                .transpose_axes(&[0, 2, 1, 3], context)?;
-            let (keys, values) = state.update_for_attention(keys, values, context)?;
-            let key_offset = query_offset + sequence - keys.dim(2);
-            (keys, values, key_offset)
-        } else {
-            let mut key_history = None;
-            let mut value_history = None;
-            let key = residual_convolution(&self.key_convolution, &key, &mut key_history, context)?;
-            let value =
-                residual_convolution(&self.value_convolution, &value, &mut value_history, context)?;
-            let keys = self.key_norm.forward(
-                &key.reshape(
-                    &[batch, sequence, self.key_value_heads, self.head_dimensions],
-                    context,
-                )?,
-                context,
-            )?;
-            let keys = keys.transpose_axes(&[0, 2, 1, 3], context)?;
-            let values = value
-                .reshape(
-                    &[batch, sequence, self.key_value_heads, self.head_dimensions],
-                    context,
-                )?
-                .transpose_axes(&[0, 2, 1, 3], context)?;
-            (keys, values, 0)
+        let request = RelativeAttentionInput {
+            queries: &queries,
+            keys: &keys,
+            values: &values,
+            profiles: &profiles,
+            query_offset,
+            key_offset,
+            window: self.policy.window().map(|window| window.get() as i32),
+            log_scaling_floor: self.log_scaling_floor,
+            log_scaling_alpha: self.log_scaling_alpha,
         };
-        let queries = self.query_norm.forward(
-            &query.reshape(
-                &[batch, sequence, self.query_heads, self.head_dimensions],
-                context,
-            )?,
-            context,
-        )?;
-        let queries = queries.transpose_axes(&[0, 2, 1, 3], context)?;
-        let profiles = relative.reshape(
-            &[batch, sequence, self.query_heads, self.relative_dimensions],
-            context,
-        )?;
-        let profiles = B::Tensor::matmul(&profiles, self.relative_projection.as_ref(), context)?
-            .transpose_axes(&[0, 2, 1, 3], context)?;
-        let attended = B::relative_attention(
-            RelativeAttentionInput {
-                queries: &queries,
-                keys: &keys,
-                values: &values,
-                profiles: &profiles,
-                query_offset,
-                key_offset,
-                window: self.policy.window().map(|window| window.get() as i32),
-                log_scaling_floor: self.log_scaling_floor,
-                log_scaling_alpha: self.log_scaling_alpha,
-            },
-            context,
-        )?;
+        let attended = match state {
+            Some(state) => state.relative_attention::<B>(request, context)?,
+            None => B::relative_attention(request, context)?,
+        };
         let attended = attended.transpose_axes(&[0, 2, 1, 3], context)?.reshape(
             &[batch, sequence, self.query_heads * self.head_dimensions],
             context,
         )?;
-        B::row_parallel_linear(&mut self.output, &attended, parallel, context)
+        let attended = instrumentation.apply("attention.channels", attended)?;
+        instrumentation.project::<B>(
+            "attention.write_input",
+            &mut self.output,
+            &attended,
+            parallel,
+            context,
+        )
     }
 }
 
@@ -529,33 +489,28 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> DenseMlp<B> {
         })
     }
 
-    fn forward(
+    /// Executes dense SwiGLU units and the learned scalar on the canonical path.
+    pub fn forward_instrumented(
         &mut self,
         hidden: &B::Tensor,
+        parallel: Option<&B::ParallelContext>,
         context: &<B::Tensor as Tensor>::Context,
+        instrumentation: &mut ComponentInstrumentation<'_, B::Tensor>,
     ) -> Result<B::Tensor, Error> {
         let gate = self.gate.forward(hidden, context)?;
         let up = self.up.forward(hidden, context)?;
-        let hidden = B::gated_product(gate, up, eredu_nn::GatedProductPolicy::default(), context)?;
-        self.down
-            .forward(&hidden, context)?
-            .multiply(self.global_scale.as_ref(), context)
-    }
-
-    fn forward_parallel(
-        &mut self,
-        hidden: &B::Tensor,
-        parallel: &B::ParallelContext,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<B::Tensor, Error>
-    where
-        B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
-    {
-        let gate = self.gate.forward(hidden, context)?;
-        let up = self.up.forward(hidden, context)?;
-        let hidden = B::gated_product(gate, up, eredu_nn::GatedProductPolicy::default(), context)?;
-        B::row_parallel_linear(&mut self.down, &hidden, parallel, context)?
-            .multiply(self.global_scale.as_ref(), context)
+        let units = B::gated_product(gate, up, eredu_nn::GatedProductPolicy::default(), context)?;
+        let units = instrumentation.apply("feed_forward.units", units)?;
+        let write = instrumentation.project::<B>(
+            "feed_forward.write_input",
+            &mut self.down,
+            &units,
+            parallel,
+            context,
+        )?;
+        let write = instrumentation.apply("feed_forward.projection", write)?;
+        instrumentation.observe("feed_forward.global_scale", self.global_scale.as_ref())?;
+        write.multiply(self.global_scale.as_ref(), context)
     }
 }
 
@@ -654,109 +609,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> SparseMlp<B> 
         })
     }
 
-    fn forward(
-        &mut self,
-        hidden: &B::Tensor,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<B::Tensor, Error> {
-        let routes = B::joint_group_selection(
-            JointGroupSelectionInput::new(
-                hidden,
-                self.router_weight.as_ref(),
-                self.router_bias.as_ref(),
-                self.global_scale.as_ref(),
-                JointGroupSelectionSpec::new(
-                    self.routed_count,
-                    self.shared_count,
-                    self.top_k,
-                    self.coefficient_scale,
-                )?,
-            )?,
-            context,
-        )?;
-        let routed = self.routed_experts.forward_grouped(
-            hidden,
-            &GroupSelection::new(
-                routes.primary_indices().clone(),
-                routes.primary_coefficients().clone(),
-                routes.primary_coefficients().clone(),
-            ),
-            context,
-        )?;
-        let tokens = hidden.shape()[..hidden.shape().len() - 1]
-            .iter()
-            .try_fold(1_i32, |tokens, dimension| tokens.checked_mul(*dimension))
-            .ok_or_else(|| Error::backend("Inkling token count overflowed"))?;
-        let shared_ids = Self::shared_group_indices(tokens, self.shared_count, context)?;
-        let shared = self.shared_experts.forward_grouped(
-            hidden,
-            &GroupSelection::new(
-                shared_ids,
-                routes.always_on_coefficients().clone(),
-                routes.always_on_coefficients().clone(),
-            ),
-            context,
-        )?;
-        routed.add(&shared, context)
-    }
-
-    fn forward_parallel(
-        &mut self,
-        hidden: &B::Tensor,
-        parallel: &B::ParallelContext,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<B::Tensor, Error>
-    where
-        B: eredu_nn::TensorParallelGroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
-    {
-        let routes = B::joint_group_selection(
-            JointGroupSelectionInput::new(
-                hidden,
-                self.router_weight.as_ref(),
-                self.router_bias.as_ref(),
-                self.global_scale.as_ref(),
-                JointGroupSelectionSpec::new(
-                    self.routed_count,
-                    self.shared_count,
-                    self.top_k,
-                    self.coefficient_scale,
-                )?,
-            )?,
-            context,
-        )?;
-        let routed = B::gated_product_groups_tensor_parallel(
-            &mut self.routed_experts,
-            hidden,
-            &GroupSelection::new(
-                routes.primary_indices().clone(),
-                routes.primary_coefficients().clone(),
-                routes.primary_coefficients().clone(),
-            ),
-            B::parallel_size(parallel),
-            context,
-        )?;
-        let tokens = hidden.shape()[..hidden.shape().len() - 1]
-            .iter()
-            .try_fold(1_i32, |tokens, dimension| tokens.checked_mul(*dimension))
-            .ok_or_else(|| Error::backend("Inkling token count overflowed"))?;
-        let shared_ids = Self::shared_group_indices(tokens, self.shared_count, context)?;
-        let shared = B::gated_product_groups_tensor_parallel(
-            &mut self.shared_experts,
-            hidden,
-            &GroupSelection::new(
-                shared_ids,
-                routes.always_on_coefficients().clone(),
-                routes.always_on_coefficients().clone(),
-            ),
-            B::parallel_size(parallel),
-            context,
-        )?;
-        let output =
-            eredu_runtime::combine_tensor_parallel_expert_outputs::<B>(routed, shared, context)?;
-        eredu_runtime::reduce_tensor_parallel_expert_output::<B>(output, parallel, context)
-    }
-
-    fn forward_with_provider<P>(
+    fn forward_with_provider_instrumented<P>(
         &mut self,
         hidden: &B::Tensor,
         layer: usize,
@@ -764,6 +617,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> SparseMlp<B> 
         pass: ExpertPass,
         provider: &mut P,
         context: &<B::Tensor as Tensor>::Context,
+        instrumentation: &mut ComponentInstrumentation<'_, B::Tensor>,
     ) -> Result<B::Tensor, Error>
     where
         P: RoutedExpertProvider<B>,
@@ -789,19 +643,18 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> SparseMlp<B> 
             routes.primary_coefficients().clone(),
             routes.primary_coefficients().clone(),
         );
-        let routed = provider
-            .forward_grouped(
-                &mut self.routed_experts,
-                RoutedExpertRequest {
-                    bank: eredu_runtime::RoutedBankId::new(0),
-                    layer,
-                    input: hidden,
-                    routes: &routed_routes,
-                    pass,
-                },
-                context,
-            )
-            .map_err(Error::backend)?;
+        let routed = instrumentation.routed(
+            "routing",
+            RoutedExpertRequest {
+                unit_observer: None,
+                bank: eredu_runtime::RoutedBankId::new(0),
+                layer: layer,
+                input: hidden,
+                routes: &routed_routes,
+                pass,
+            },
+            |request| provider.forward_grouped(&mut self.routed_experts, request, context),
+        )?;
         let tokens = hidden.shape()[..hidden.shape().len() - 1]
             .iter()
             .try_fold(1_i32, |tokens, dimension| tokens.checked_mul(*dimension))
@@ -812,23 +665,22 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> SparseMlp<B> 
             routes.always_on_coefficients().clone(),
             routes.always_on_coefficients().clone(),
         );
-        let shared = provider
-            .forward_grouped(
-                &mut self.shared_experts,
-                RoutedExpertRequest {
-                    bank: eredu_runtime::RoutedBankId::new(0),
-                    layer: shared_layer,
-                    input: hidden,
-                    routes: &shared_routes,
-                    pass,
-                },
-                context,
-            )
-            .map_err(Error::backend)?;
+        let shared = instrumentation.routed(
+            "shared.routing",
+            RoutedExpertRequest {
+                unit_observer: None,
+                bank: eredu_runtime::RoutedBankId::new(0),
+                layer: shared_layer,
+                input: hidden,
+                routes: &shared_routes,
+                pass,
+            },
+            |request| provider.forward_grouped(&mut self.shared_experts, request, context),
+        )?;
         routed.add(&shared, context)
     }
 
-    fn forward_parallel_with_provider<P>(
+    fn forward_parallel_with_provider_instrumented<P>(
         &mut self,
         hidden: &B::Tensor,
         layer: usize,
@@ -837,6 +689,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> SparseMlp<B> 
         provider: &mut P,
         parallel: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
+        instrumentation: &mut ComponentInstrumentation<'_, B::Tensor>,
     ) -> Result<B::Tensor, Error>
     where
         P: TensorParallelRoutedExpertProvider<B>,
@@ -862,20 +715,25 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> SparseMlp<B> 
             routes.primary_coefficients().clone(),
             routes.primary_coefficients().clone(),
         );
-        let routed = provider
-            .forward_grouped_tensor_parallel(
-                &mut self.routed_experts,
-                RoutedExpertRequest {
-                    bank: eredu_runtime::RoutedBankId::new(0),
-                    layer,
-                    input: hidden,
-                    routes: &routed_routes,
-                    pass,
-                },
-                B::parallel_size(parallel),
-                context,
-            )
-            .map_err(Error::backend)?;
+        let routed = instrumentation.routed(
+            "routing",
+            RoutedExpertRequest {
+                unit_observer: None,
+                bank: eredu_runtime::RoutedBankId::new(0),
+                layer: layer,
+                input: hidden,
+                routes: &routed_routes,
+                pass,
+            },
+            |request| {
+                provider.forward_grouped_tensor_parallel(
+                    &mut self.routed_experts,
+                    request,
+                    B::parallel_size(parallel),
+                    context,
+                )
+            },
+        )?;
         let tokens = hidden.shape()[..hidden.shape().len() - 1]
             .iter()
             .try_fold(1_i32, |tokens, dimension| tokens.checked_mul(*dimension))
@@ -886,20 +744,25 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> SparseMlp<B> 
             routes.always_on_coefficients().clone(),
             routes.always_on_coefficients().clone(),
         );
-        let shared = provider
-            .forward_grouped_tensor_parallel(
-                &mut self.shared_experts,
-                RoutedExpertRequest {
-                    bank: eredu_runtime::RoutedBankId::new(0),
-                    layer: shared_layer,
-                    input: hidden,
-                    routes: &shared_routes,
-                    pass,
-                },
-                B::parallel_size(parallel),
-                context,
-            )
-            .map_err(Error::backend)?;
+        let shared = instrumentation.routed(
+            "shared.routing",
+            RoutedExpertRequest {
+                unit_observer: None,
+                bank: eredu_runtime::RoutedBankId::new(0),
+                layer: shared_layer,
+                input: hidden,
+                routes: &shared_routes,
+                pass,
+            },
+            |request| {
+                provider.forward_grouped_tensor_parallel(
+                    &mut self.shared_experts,
+                    request,
+                    B::parallel_size(parallel),
+                    context,
+                )
+            },
+        )?;
         let output =
             eredu_runtime::combine_routed_expert_tensor_parallel::<B>(routed, shared, context)?;
         eredu_runtime::reduce_routed_expert_tensor_parallel::<B>(output, parallel, context)
@@ -942,8 +805,10 @@ pub(crate) fn localized_expert_bank_specs(
         .map_err(Error::backend)?
         .checked_add(layer)
         .ok_or_else(|| Error::backend("Inkling shared expert layer overflowed"))?;
-    let shared = expert_bank_spec(args, cache_layer)?
-        .with_group_geometry(1, local.moe_intermediate_size())?;
+    let shared = expert_bank_spec(args, cache_layer)?.with_group_geometry(
+        args.text_config.n_shared_experts,
+        local.moe_intermediate_size(),
+    )?;
     Ok((routed, shared))
 }
 
@@ -979,33 +844,7 @@ pub enum FeedForward<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBacken
 }
 
 impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> FeedForward<B> {
-    fn forward(
-        &mut self,
-        hidden: &B::Tensor,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<B::Tensor, Error> {
-        match self {
-            Self::Dense(dense) => dense.forward(hidden, context),
-            Self::Sparse(sparse) => sparse.forward(hidden, context),
-        }
-    }
-
-    fn forward_parallel(
-        &mut self,
-        hidden: &B::Tensor,
-        parallel: &B::ParallelContext,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<B::Tensor, Error>
-    where
-        B: eredu_nn::TensorParallelGroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
-    {
-        match self {
-            Self::Dense(dense) => dense.forward_parallel(hidden, parallel, context),
-            Self::Sparse(sparse) => sparse.forward_parallel(hidden, parallel, context),
-        }
-    }
-
-    fn forward_with_provider<P>(
+    fn forward_with_provider_instrumented<P>(
         &mut self,
         hidden: &B::Tensor,
         layer: usize,
@@ -1013,20 +852,29 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> FeedForward<B
         pass: ExpertPass,
         provider: &mut P,
         context: &<B::Tensor as Tensor>::Context,
+        instrumentation: &mut ComponentInstrumentation<'_, B::Tensor>,
     ) -> Result<B::Tensor, Error>
     where
         P: RoutedExpertProvider<B>,
         P::Error: std::fmt::Display,
     {
         match self {
-            Self::Dense(dense) => dense.forward(hidden, context),
-            Self::Sparse(sparse) => {
-                sparse.forward_with_provider(hidden, layer, shared_layer, pass, provider, context)
+            Self::Dense(dense) => {
+                dense.forward_instrumented(hidden, None, context, instrumentation)
             }
+            Self::Sparse(sparse) => sparse.forward_with_provider_instrumented(
+                hidden,
+                layer,
+                shared_layer,
+                pass,
+                provider,
+                context,
+                instrumentation,
+            ),
         }
     }
 
-    fn forward_parallel_with_provider<P>(
+    fn forward_parallel_with_provider_instrumented<P>(
         &mut self,
         hidden: &B::Tensor,
         layer: usize,
@@ -1035,14 +883,17 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> FeedForward<B
         provider: &mut P,
         parallel: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
+        instrumentation: &mut ComponentInstrumentation<'_, B::Tensor>,
     ) -> Result<B::Tensor, Error>
     where
         P: TensorParallelRoutedExpertProvider<B>,
         P::Error: std::fmt::Display,
     {
         match self {
-            Self::Dense(dense) => dense.forward_parallel(hidden, parallel, context),
-            Self::Sparse(sparse) => sparse.forward_parallel_with_provider(
+            Self::Dense(dense) => {
+                dense.forward_instrumented(hidden, Some(parallel), context, instrumentation)
+            }
+            Self::Sparse(sparse) => sparse.forward_parallel_with_provider_instrumented(
                 hidden,
                 layer,
                 shared_layer,
@@ -1050,6 +901,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> FeedForward<B
                 provider,
                 parallel,
                 context,
+                instrumentation,
             ),
         }
     }
@@ -1188,135 +1040,25 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> DecoderLayer<
         })
     }
 
-    /// Runs one layer and replaces all four bounded convolution histories.
+    /// Runs the canonical layer with all four bounded convolution histories.
     pub fn forward<C: AuxiliaryConvolutionState<B::Tensor>>(
         &mut self,
         hidden: &B::Tensor,
         state: Option<&mut C>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
-        match state {
-            Some(state) => {
-                let normalized = self.input_norm.forward(hidden, context)?;
-                let attention = self
-                    .attention
-                    .forward(&normalized, Some(&mut *state), context)?;
-                let attention = residual_convolution(
-                    &self.attention_convolution,
-                    &attention,
-                    state.convolution_state(2)?,
-                    context,
-                )?;
-                let hidden = hidden.add(&attention, context)?;
-                let normalized = self.post_attention_norm.forward(&hidden, context)?;
-                let feed_forward = self.feed_forward.forward(&normalized, context)?;
-                let feed_forward = residual_convolution(
-                    &self.feed_forward_convolution,
-                    &feed_forward,
-                    state.convolution_state(3)?,
-                    context,
-                )?;
-                hidden.add(&feed_forward, context)
-            }
-            None => {
-                let normalized = self.input_norm.forward(hidden, context)?;
-                let attention = self
-                    .attention
-                    .forward::<NoCache>(&normalized, None, context)?;
-                let mut attention_history = None;
-                let attention = residual_convolution(
-                    &self.attention_convolution,
-                    &attention,
-                    &mut attention_history,
-                    context,
-                )?;
-                let hidden = hidden.add(&attention, context)?;
-                let normalized = self.post_attention_norm.forward(&hidden, context)?;
-                let feed_forward = self.feed_forward.forward(&normalized, context)?;
-                let mut feed_forward_history = None;
-                let feed_forward = residual_convolution(
-                    &self.feed_forward_convolution,
-                    &feed_forward,
-                    &mut feed_forward_history,
-                    context,
-                )?;
-                hidden.add(&feed_forward, context)
-            }
-        }
+        self.forward_with_provider_instrumented(
+            hidden,
+            state,
+            ExpertPass::Prefill,
+            &mut eredu_runtime::ResidentExpertProvider,
+            context,
+            &mut ComponentInstrumentation::disabled(),
+        )
     }
 
-    /// Runs the canonical layer with rank-local projections and TP reductions.
-    pub fn forward_parallel<C: AuxiliaryConvolutionState<B::Tensor>>(
-        &mut self,
-        hidden: &B::Tensor,
-        state: Option<&mut C>,
-        parallel: &B::ParallelContext,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<B::Tensor, Error>
-    where
-        B: eredu_nn::TensorParallelGroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
-    {
-        match state {
-            Some(state) => {
-                let normalized = self.input_norm.forward(hidden, context)?;
-                let attention = self.attention.forward_parallel(
-                    &normalized,
-                    Some(&mut *state),
-                    parallel,
-                    context,
-                )?;
-                let attention = residual_convolution(
-                    &self.attention_convolution,
-                    &attention,
-                    state.convolution_state(2)?,
-                    context,
-                )?;
-                let hidden = hidden.add(&attention, context)?;
-                let normalized = self.post_attention_norm.forward(&hidden, context)?;
-                let feed_forward =
-                    self.feed_forward
-                        .forward_parallel(&normalized, parallel, context)?;
-                let feed_forward = residual_convolution(
-                    &self.feed_forward_convolution,
-                    &feed_forward,
-                    state.convolution_state(3)?,
-                    context,
-                )?;
-                hidden.add(&feed_forward, context)
-            }
-            None => {
-                let normalized = self.input_norm.forward(hidden, context)?;
-                let attention = self.attention.forward_parallel::<NoCache>(
-                    &normalized,
-                    None,
-                    parallel,
-                    context,
-                )?;
-                let mut attention_history = None;
-                let attention = residual_convolution(
-                    &self.attention_convolution,
-                    &attention,
-                    &mut attention_history,
-                    context,
-                )?;
-                let hidden = hidden.add(&attention, context)?;
-                let normalized = self.post_attention_norm.forward(&hidden, context)?;
-                let feed_forward =
-                    self.feed_forward
-                        .forward_parallel(&normalized, parallel, context)?;
-                let mut feed_forward_history = None;
-                let feed_forward = residual_convolution(
-                    &self.feed_forward_convolution,
-                    &feed_forward,
-                    &mut feed_forward_history,
-                    context,
-                )?;
-                hidden.add(&feed_forward, context)
-            }
-        }
-    }
-
-    /// Runs the canonical layer equations through a runtime-owned expert provider.
+    /// Runs the canonical equations through the runtime-owned expert provider.
+    #[allow(clippy::too_many_arguments)]
     pub fn forward_with_provider<C, P>(
         &mut self,
         hidden: &B::Tensor,
@@ -1330,71 +1072,77 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> DecoderLayer<
         P: RoutedExpertProvider<B>,
         P::Error: std::fmt::Display,
     {
-        match state {
-            Some(state) => {
-                let normalized = self.input_norm.forward(hidden, context)?;
-                let attention = self
-                    .attention
-                    .forward(&normalized, Some(&mut *state), context)?;
-                let attention = residual_convolution(
-                    &self.attention_convolution,
-                    &attention,
-                    state.convolution_state(2)?,
-                    context,
-                )?;
-                let hidden = hidden.add(&attention, context)?;
-                let normalized = self.post_attention_norm.forward(&hidden, context)?;
-                let feed_forward = self.feed_forward.forward_with_provider(
-                    &normalized,
-                    self.layer,
-                    self.shared_expert_layer,
-                    pass,
-                    provider,
-                    context,
-                )?;
-                let feed_forward = residual_convolution(
-                    &self.feed_forward_convolution,
-                    &feed_forward,
-                    state.convolution_state(3)?,
-                    context,
-                )?;
-                hidden.add(&feed_forward, context)
-            }
-            None => {
-                let normalized = self.input_norm.forward(hidden, context)?;
-                let attention = self
-                    .attention
-                    .forward::<NoCache>(&normalized, None, context)?;
-                let mut attention_history = None;
-                let attention = residual_convolution(
-                    &self.attention_convolution,
-                    &attention,
-                    &mut attention_history,
-                    context,
-                )?;
-                let hidden = hidden.add(&attention, context)?;
-                let normalized = self.post_attention_norm.forward(&hidden, context)?;
-                let feed_forward = self.feed_forward.forward_with_provider(
-                    &normalized,
-                    self.layer,
-                    self.shared_expert_layer,
-                    pass,
-                    provider,
-                    context,
-                )?;
-                let mut feed_forward_history = None;
-                let feed_forward = residual_convolution(
-                    &self.feed_forward_convolution,
-                    &feed_forward,
-                    &mut feed_forward_history,
-                    context,
-                )?;
-                hidden.add(&feed_forward, context)
-            }
-        }
+        self.forward_with_provider_instrumented(
+            hidden,
+            state,
+            pass,
+            provider,
+            context,
+            &mut ComponentInstrumentation::disabled(),
+        )
     }
 
-    /// Runs the canonical TP layer while runtime owns routed expert residency.
+    /// Runs the canonical equations through the runtime-owned expert provider.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_with_provider_instrumented<C, P>(
+        &mut self,
+        hidden: &B::Tensor,
+        state: Option<&mut C>,
+        pass: ExpertPass,
+        provider: &mut P,
+        context: &<B::Tensor as Tensor>::Context,
+        instrumentation: &mut ComponentInstrumentation<'_, B::Tensor>,
+    ) -> Result<B::Tensor, Error>
+    where
+        C: AuxiliaryConvolutionState<B::Tensor>,
+        P: RoutedExpertProvider<B>,
+        P::Error: std::fmt::Display,
+    {
+        let layer = self.layer;
+        let shared = self.shared_expert_layer;
+        self.forward_with_operators(
+            hidden,
+            state,
+            None,
+            context,
+            instrumentation,
+            |feed_forward, normalized, instrumentation| {
+                feed_forward.forward_with_provider_instrumented(
+                    normalized,
+                    layer,
+                    shared,
+                    pass,
+                    provider,
+                    context,
+                    instrumentation,
+                )
+            },
+        )
+    }
+
+    /// Runs the canonical layer with all four bounded convolution histories.
+    pub fn forward_parallel<C: AuxiliaryConvolutionState<B::Tensor>>(
+        &mut self,
+        hidden: &B::Tensor,
+        state: Option<&mut C>,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Error>
+    where
+        B: eredu_nn::TensorParallelGroupedNeuralBackend,
+    {
+        self.forward_parallel_with_provider_instrumented(
+            hidden,
+            state,
+            ExpertPass::Prefill,
+            &mut eredu_runtime::ResidentExpertProvider,
+            parallel,
+            context,
+            &mut ComponentInstrumentation::disabled(),
+        )
+    }
+
+    /// Runs the canonical equations through the runtime-owned expert provider.
     #[allow(clippy::too_many_arguments)]
     pub fn forward_parallel_with_provider<C, P>(
         &mut self,
@@ -1410,101 +1158,109 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> DecoderLayer<
         P: TensorParallelRoutedExpertProvider<B>,
         P::Error: std::fmt::Display,
     {
-        match state {
-            Some(state) => {
-                let normalized = self.input_norm.forward(hidden, context)?;
-                let attention = self.attention.forward_parallel(
-                    &normalized,
-                    Some(&mut *state),
-                    parallel,
-                    context,
-                )?;
-                let attention = residual_convolution(
-                    &self.attention_convolution,
-                    &attention,
-                    state.convolution_state(2)?,
-                    context,
-                )?;
-                let hidden = hidden.add(&attention, context)?;
-                let normalized = self.post_attention_norm.forward(&hidden, context)?;
-                let feed_forward = self.feed_forward.forward_parallel_with_provider(
-                    &normalized,
-                    self.layer,
-                    self.shared_expert_layer,
+        self.forward_parallel_with_provider_instrumented(
+            hidden,
+            state,
+            pass,
+            provider,
+            parallel,
+            context,
+            &mut ComponentInstrumentation::disabled(),
+        )
+    }
+
+    /// Runs the canonical equations through the runtime-owned expert provider.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_parallel_with_provider_instrumented<C, P>(
+        &mut self,
+        hidden: &B::Tensor,
+        state: Option<&mut C>,
+        pass: ExpertPass,
+        provider: &mut P,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+        instrumentation: &mut ComponentInstrumentation<'_, B::Tensor>,
+    ) -> Result<B::Tensor, Error>
+    where
+        C: AuxiliaryConvolutionState<B::Tensor>,
+        P: TensorParallelRoutedExpertProvider<B>,
+        P::Error: std::fmt::Display,
+    {
+        let layer = self.layer;
+        let shared = self.shared_expert_layer;
+        self.forward_with_operators(
+            hidden,
+            state,
+            Some(parallel),
+            context,
+            instrumentation,
+            |feed_forward, normalized, instrumentation| {
+                feed_forward.forward_parallel_with_provider_instrumented(
+                    normalized,
+                    layer,
+                    shared,
                     pass,
                     provider,
                     parallel,
                     context,
-                )?;
-                let feed_forward = residual_convolution(
-                    &self.feed_forward_convolution,
-                    &feed_forward,
-                    state.convolution_state(3)?,
-                    context,
-                )?;
-                hidden.add(&feed_forward, context)
-            }
-            None => {
-                let normalized = self.input_norm.forward(hidden, context)?;
-                let attention = self.attention.forward_parallel::<NoCache>(
-                    &normalized,
-                    None,
-                    parallel,
-                    context,
-                )?;
-                let mut attention_history = None;
-                let attention = residual_convolution(
-                    &self.attention_convolution,
-                    &attention,
-                    &mut attention_history,
-                    context,
-                )?;
-                let hidden = hidden.add(&attention, context)?;
-                let normalized = self.post_attention_norm.forward(&hidden, context)?;
-                let feed_forward = self.feed_forward.forward_parallel_with_provider(
-                    &normalized,
-                    self.layer,
-                    self.shared_expert_layer,
-                    pass,
-                    provider,
-                    parallel,
-                    context,
-                )?;
-                let mut feed_forward_history = None;
-                let feed_forward = residual_convolution(
-                    &self.feed_forward_convolution,
-                    &feed_forward,
-                    &mut feed_forward_history,
-                    context,
-                )?;
-                hidden.add(&feed_forward, context)
-            }
-        }
+                    instrumentation,
+                )
+            },
+        )
     }
-}
 
-/// Uninhabited cache adapter used by stateless prefill calls.
-#[derive(Debug, Clone)]
-struct NoCache;
-
-impl<T: Tensor> AttentionCache<T> for NoCache {
-    fn offset(&self) -> i32 {
-        0
-    }
-    fn max_size(&self) -> Option<i32> {
-        None
-    }
-    fn update_for_attention(&mut self, _: T, _: T, _: &T::Context) -> Result<(T, T), Error> {
-        unreachable!("stateless Inkling attention never updates NoCache")
-    }
-    fn attention(&mut self, _: AttentionRequest<'_, T>, _: &T::Context) -> Result<T, Error> {
-        unreachable!("stateless Inkling attention never calls NoCache")
-    }
-}
-
-impl<T: Tensor> AuxiliaryConvolutionState<T> for NoCache {
-    fn convolution_state(&mut self, _: u32) -> Result<&mut Option<T>, Error> {
-        unreachable!("stateless Inkling attention never borrows NoCache histories")
+    fn forward_with_operators<C: AuxiliaryConvolutionState<B::Tensor>>(
+        &mut self,
+        hidden: &B::Tensor,
+        mut state: Option<&mut C>,
+        parallel: Option<&B::ParallelContext>,
+        context: &<B::Tensor as Tensor>::Context,
+        instrumentation: &mut ComponentInstrumentation<'_, B::Tensor>,
+        feed_forward: impl FnOnce(
+            &mut FeedForward<B>,
+            &B::Tensor,
+            &mut ComponentInstrumentation<'_, B::Tensor>,
+        ) -> Result<B::Tensor, Error>,
+    ) -> Result<B::Tensor, Error> {
+        let normalized =
+            instrumentation.apply("attention.input", self.input_norm.forward(hidden, context)?)?;
+        let attention = self.attention.forward_instrumented(
+            &normalized,
+            state.as_deref_mut(),
+            parallel,
+            context,
+            instrumentation,
+        )?;
+        let attention = instrumentation.apply("attention.write", attention)?;
+        let mut temporary_history = None;
+        let history = match state.as_deref_mut() {
+            Some(state) => state.convolution_state(2)?,
+            None => &mut temporary_history,
+        };
+        let attention =
+            residual_convolution(&self.attention_convolution, &attention, history, context)?;
+        let attention = instrumentation.apply("attention.contribution", attention)?;
+        let hidden =
+            instrumentation.apply("attention.residual", hidden.add(&attention, context)?)?;
+        let normalized = instrumentation.apply(
+            "feed_forward.input",
+            self.post_attention_norm.forward(&hidden, context)?,
+        )?;
+        let feed_forward = feed_forward(&mut self.feed_forward, &normalized, instrumentation)?;
+        let feed_forward = instrumentation.apply("feed_forward.write", feed_forward)?;
+        let mut temporary_history = None;
+        let history = match state.as_deref_mut() {
+            Some(state) => state.convolution_state(3)?,
+            None => &mut temporary_history,
+        };
+        let feed_forward = residual_convolution(
+            &self.feed_forward_convolution,
+            &feed_forward,
+            history,
+            context,
+        )?;
+        let feed_forward = instrumentation.apply("feed_forward.contribution", feed_forward)?;
+        instrumentation.apply("feed_forward.residual", hidden.add(&feed_forward, context)?)
     }
 }
 

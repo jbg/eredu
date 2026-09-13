@@ -1,4 +1,84 @@
 #[test]
+fn exact_unit_sources_share_a_budget_without_confusing_identical_keys() {
+    let (_primary_dir, primary) = fixture_store();
+    let extension_dir = tempfile::tempdir().unwrap();
+    let bytes = [31i32, -7]
+        .into_iter()
+        .flat_map(i32::to_le_bytes)
+        .collect::<Vec<_>>();
+    serialize_to_file(
+        [("a", TensorView::new(Dtype::I32, vec![2], &bytes).unwrap())],
+        None,
+        &extension_dir.path().join("model.safetensors"),
+    )
+    .unwrap();
+    let extension: eredu_checkpoint::store::SharedCheckpointSource =
+        Arc::new(SafetensorsWeightStore::open(extension_dir.path()).unwrap());
+    let plan = OffloadPlan::new(
+        OffloadConfig::new(Some(8), None, 1).unwrap(),
+        [
+            spec("target", 8, ResidencyPolicy::Cacheable, MemoryTier::Disk),
+            spec("extension", 8, ResidencyPolicy::Cacheable, MemoryTier::Disk),
+        ],
+    )
+    .unwrap();
+    let manager = ResidencyManager::new_shared_sources(
+        primary,
+        BTreeMap::from([(id("extension"), extension)]),
+        plan,
+        [single("target", "a"), single("extension", "a")],
+        cpu_stream(),
+        cpu_stream(),
+    )
+    .unwrap();
+    manager.initialize().unwrap();
+    let lease = manager.acquire(&id("target"), MemoryTier::Device).unwrap();
+    assert_eq!(
+        lease
+            .device_value("weight")
+            .unwrap()
+            .evaluated()
+            .unwrap()
+            .as_slice::<i32>(),
+        [1, 2]
+    );
+    assert!(matches!(
+        manager.acquire(&id("extension"), MemoryTier::Device),
+        Err(ResidencyError::Ledger(
+            ResidencyLedgerError::BudgetExhausted { .. }
+        ))
+    ));
+    drop(lease);
+    let lease = manager
+        .acquire(&id("extension"), MemoryTier::Device)
+        .unwrap();
+    assert_eq!(
+        lease
+            .device_value("weight")
+            .unwrap()
+            .evaluated()
+            .unwrap()
+            .as_slice::<i32>(),
+        [31, -7]
+    );
+    let report = manager.report().unwrap();
+    assert_eq!(report.offload().resident_bytes().get(MemoryTier::Device), 8);
+    assert_eq!(report.unit_sources().len(), 1);
+    assert!(!state(&report, "target").device_resident());
+    drop(lease);
+    let lease = manager.acquire(&id("target"), MemoryTier::Device).unwrap();
+    assert_eq!(
+        lease
+            .device_value("weight")
+            .unwrap()
+            .evaluated()
+            .unwrap()
+            .as_slice::<i32>(),
+        [1, 2]
+    );
+}
+
+#[test]
 fn budgets_use_deterministic_policy_then_lru_eviction() {
     let (_dir, store) = fixture_store();
     let manager = manager(

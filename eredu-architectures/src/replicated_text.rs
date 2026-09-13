@@ -41,7 +41,7 @@ struct Lfm2Replicated;
 struct KimiLinearReplicated;
 struct DeepSeekV3DenseReplicated;
 pub(crate) struct NemotronHReplicated;
-struct QwenHybridReplicated;
+pub(crate) struct QwenHybridReplicated;
 
 #[derive(Debug)]
 struct InspectionCheckpointSource {
@@ -166,6 +166,28 @@ impl<B: NeuralBackend> FixedReplicatedFamily<B> for Lfm2Replicated {
     {
         unit.forward(hidden, forward.mask.as_ref(), state, context)
     }
+    fn forward_unit_observed<C, O>(
+        unit: &mut Self::Unit,
+        path: &str,
+        hidden: &B::Tensor,
+        state: &mut C,
+        forward: &ReplicatedForwardContext<B::Tensor>,
+        context: &<B::Tensor as Tensor>::Context,
+        observer: &mut O,
+    ) -> Result<B::Tensor, eredu_nn::Error>
+    where
+        C: AttentionCache<B::Tensor> + eredu_runtime::RuntimeStateComponents<B>,
+        O: eredu_runtime::ActivationObserver<B::Tensor, eredu_nn::Error> + ?Sized,
+    {
+        let mut borrowed = eredu_runtime::BorrowedActivationObserver(observer);
+        unit.forward_instrumented(
+            hidden,
+            forward.mask.as_ref(),
+            state,
+            context,
+            &mut crate::decoder::ComponentInstrumentation::new(path, &mut borrowed),
+        )
+    }
 }
 
 impl<B: eredu_nn::BlockwiseAttentionBackend> CompressedReplicatedFamily<B>
@@ -242,6 +264,28 @@ impl<B: eredu_nn::BlockwiseAttentionBackend> CompressedReplicatedFamily<B>
     {
         unit.forward(hidden, forward.mask.as_ref(), state, context)
     }
+    fn forward_unit_observed<C, O>(
+        unit: &mut Self::Unit,
+        path: &str,
+        hidden: &B::Tensor,
+        state: &mut C,
+        forward: &ReplicatedForwardContext<B::Tensor>,
+        context: &<B::Tensor as Tensor>::Context,
+        observer: &mut O,
+    ) -> Result<B::Tensor, eredu_nn::Error>
+    where
+        C: eredu_nn::CompressedAttentionCache<B::Tensor> + eredu_runtime::RuntimeStateComponents<B>,
+        O: eredu_runtime::ActivationObserver<B::Tensor, eredu_nn::Error> + ?Sized,
+    {
+        let mut borrowed = eredu_runtime::BorrowedActivationObserver(observer);
+        unit.forward_instrumented(
+            hidden,
+            forward.mask.as_ref(),
+            state,
+            context,
+            &mut crate::decoder::ComponentInstrumentation::new(path, &mut borrowed),
+        )
+    }
 }
 
 impl<B: eredu_nn::BlockwiseAttentionBackend> CompressedReplicatedFamily<B>
@@ -302,6 +346,29 @@ impl<B: eredu_nn::BlockwiseAttentionBackend> CompressedReplicatedFamily<B>
         C: eredu_nn::CompressedAttentionCache<B::Tensor> + eredu_runtime::RuntimeStateComponents<B>,
     {
         unit.forward(hidden, forward.mask.as_ref(), Some(state), context)
+    }
+
+    fn forward_unit_observed<C, O>(
+        unit: &mut Self::Unit,
+        path: &str,
+        hidden: &B::Tensor,
+        state: &mut C,
+        forward: &ReplicatedForwardContext<B::Tensor>,
+        context: &<B::Tensor as Tensor>::Context,
+        observer: &mut O,
+    ) -> Result<B::Tensor, eredu_nn::Error>
+    where
+        C: eredu_nn::CompressedAttentionCache<B::Tensor> + eredu_runtime::RuntimeStateComponents<B>,
+        O: eredu_runtime::ActivationObserver<B::Tensor, eredu_nn::Error> + ?Sized,
+    {
+        let mut borrowed = eredu_runtime::BorrowedActivationObserver(observer);
+        unit.forward_instrumented(
+            hidden,
+            forward.mask.as_ref(),
+            Some(state),
+            context,
+            &mut crate::decoder::ComponentInstrumentation::new(path, &mut borrowed),
+        )
     }
 }
 
@@ -372,6 +439,27 @@ impl<B: NeuralBackend> FixedReplicatedFamily<B> for KimiLinearReplicated {
         C: AttentionCache<B::Tensor> + eredu_runtime::RuntimeStateComponents<B>,
     {
         unit.forward(hidden, state, context)
+    }
+    fn forward_unit_observed<C, O>(
+        unit: &mut Self::Unit,
+        path: &str,
+        hidden: &B::Tensor,
+        state: &mut C,
+        _forward: &ReplicatedForwardContext<B::Tensor>,
+        context: &<B::Tensor as Tensor>::Context,
+        observer: &mut O,
+    ) -> Result<B::Tensor, eredu_nn::Error>
+    where
+        C: AttentionCache<B::Tensor> + eredu_runtime::RuntimeStateComponents<B>,
+        O: eredu_runtime::ActivationObserver<B::Tensor, eredu_nn::Error> + ?Sized,
+    {
+        let mut borrowed = eredu_runtime::BorrowedActivationObserver(observer);
+        unit.forward_instrumented(
+            hidden,
+            state,
+            context,
+            &mut crate::decoder::ComponentInstrumentation::new(path, &mut borrowed),
+        )
     }
 }
 
@@ -448,6 +536,28 @@ impl<B: NeuralBackend> FixedReplicatedFamily<B> for NemotronHReplicated {
     {
         unit.forward(hidden, forward.mask.as_ref(), state, context)
     }
+    fn forward_unit_observed<C, O>(
+        unit: &mut Self::Unit,
+        path: &str,
+        hidden: &B::Tensor,
+        state: &mut C,
+        forward: &ReplicatedForwardContext<B::Tensor>,
+        context: &<B::Tensor as Tensor>::Context,
+        observer: &mut O,
+    ) -> Result<B::Tensor, eredu_nn::Error>
+    where
+        C: AttentionCache<B::Tensor> + eredu_runtime::RuntimeStateComponents<B>,
+        O: eredu_runtime::ActivationObserver<B::Tensor, eredu_nn::Error> + ?Sized,
+    {
+        let mut borrowed = eredu_runtime::BorrowedActivationObserver(observer);
+        unit.forward_instrumented(
+            hidden,
+            forward.mask.as_ref(),
+            state,
+            context,
+            &mut crate::decoder::ComponentInstrumentation::new(path, &mut borrowed),
+        )
+    }
 }
 
 impl<B: NeuralBackend> FixedReplicatedFamily<B> for QwenHybridReplicated {
@@ -520,6 +630,28 @@ impl<B: NeuralBackend> FixedReplicatedFamily<B> for QwenHybridReplicated {
         C: AttentionCache<B::Tensor> + eredu_runtime::RuntimeStateComponents<B>,
     {
         unit.forward(hidden, forward.mask.as_ref(), state, context)
+    }
+    fn forward_unit_observed<C, O>(
+        unit: &mut Self::Unit,
+        path: &str,
+        hidden: &B::Tensor,
+        state: &mut C,
+        forward: &ReplicatedForwardContext<B::Tensor>,
+        context: &<B::Tensor as Tensor>::Context,
+        observer: &mut O,
+    ) -> Result<B::Tensor, eredu_nn::Error>
+    where
+        C: AttentionCache<B::Tensor> + eredu_runtime::RuntimeStateComponents<B>,
+        O: eredu_runtime::ActivationObserver<B::Tensor, eredu_nn::Error> + ?Sized,
+    {
+        let mut borrowed = eredu_runtime::BorrowedActivationObserver(observer);
+        unit.forward_instrumented(
+            hidden,
+            forward.mask.as_ref(),
+            state,
+            context,
+            &mut crate::decoder::ComponentInstrumentation::new(path, &mut borrowed),
+        )
     }
 }
 
@@ -1196,7 +1328,7 @@ pub(crate) fn selected_formats(
         .collect()
 }
 
-fn requirement_formats(
+pub(crate) fn requirement_formats(
     requirements: &ReplicatedTextRequirements,
 ) -> HashMap<String, WeightQuantization> {
     requirements
@@ -1211,30 +1343,20 @@ fn requirement_formats(
         .collect()
 }
 
-pub(crate) fn selected_linear_formats(
+pub(crate) fn selected_matrix_formats(
     requirements: &ReplicatedTextRequirements,
     selected: &SelectedReplicatedTextRealization,
 ) -> HashMap<String, LinearFormat> {
-    let linear_weights = requirements
-        .parameters()
-        .iter()
-        .filter(|parameter| {
-            matches!(
-                parameter.role(),
-                ReplicatedTextParameterRole::LinearWeight | ReplicatedTextParameterRole::Embedding
-            )
-        })
-        .map(ReplicatedTextParameterRequirement::name)
-        .collect::<BTreeSet<_>>();
+    let matrices = requirement_matrix_formats(requirements);
     selected
         .parameters()
         .iter()
-        .filter(|parameter| linear_weights.contains(parameter.name()))
+        .filter(|parameter| matrices.contains_key(parameter.name()))
         .map(|parameter| (parameter.name().to_owned(), parameter.executable()))
         .collect()
 }
 
-fn requirement_linear_formats(
+fn requirement_matrix_formats(
     requirements: &ReplicatedTextRequirements,
 ) -> HashMap<String, LinearFormat> {
     requirements
@@ -1441,18 +1563,29 @@ pub(crate) fn selected_deepseek_v3_args(
     args: &crate::deepseek::V3Args,
     selected: &SelectedReplicatedTextRealization,
 ) -> Result<crate::deepseek::V3Args, String> {
-    let formats = selected_formats(selected);
-    if formats.is_empty() {
-        Ok(args.clone())
-    } else {
-        crate::deepseek::v3_with_checkpoint_formats(
-            args,
-            formats
-                .into_iter()
-                .map(|(name, format)| (name, format.into()))
-                .collect(),
-        )
-    }
+    crate::deepseek::v3_with_checkpoint_formats(
+        args,
+        selected
+            .parameters()
+            .iter()
+            .map(|parameter| (parameter.name().to_owned(), parameter.executable()))
+            .collect(),
+    )
+}
+
+pub(crate) fn source_deepseek_v3_args(
+    args: &crate::deepseek::V3Args,
+    selected: &SelectedReplicatedTextRealization,
+) -> Result<crate::deepseek::V3Args, String> {
+    crate::deepseek::v3_with_checkpoint_formats(
+        args,
+        selected
+            .requirements()
+            .parameters()
+            .iter()
+            .map(|parameter| (parameter.name().to_owned(), parameter.native_executable()))
+            .collect(),
+    )
 }
 
 pub(crate) fn selected_deepseek_v4_args(
@@ -1471,6 +1604,21 @@ pub(crate) fn selected_deepseek_v4_args(
                 .collect(),
         )
     }
+}
+
+pub(crate) fn source_deepseek_v4_args(
+    args: &crate::deepseek::V4Args,
+    selected: &SelectedReplicatedTextRealization,
+) -> Result<crate::deepseek::V4Args, String> {
+    crate::deepseek::v4_with_checkpoint_formats(
+        args,
+        selected
+            .requirements()
+            .parameters()
+            .iter()
+            .map(|parameter| (parameter.name().to_owned(), parameter.native_executable()))
+            .collect(),
+    )
 }
 
 trait FixedProfile<B, S, F>
@@ -2196,7 +2344,7 @@ where
     fn into_visitor(self) -> Self::Visitor;
 }
 
-/// Constructs the replicated Nemotron-H target and pairs its extension before backend erasure.
+/// Constructs a replicated prediction target and pairs its extension before backend erasure.
 pub fn dispatch_replicated_prediction_target_architecture<B, M, D>(
     plan: &ArtifactArchitecturePlan,
     selected: SelectedReplicatedTextRealization,
@@ -2217,13 +2365,53 @@ where
 {
     let requirements = selected.requirements().clone();
     let eligible = eligible_config(plan)?;
-    let EligibleConfig::NemotronH(args) = eligible else {
-        return Err(ReplicatedTextIneligibility::Unrelated.into());
-    };
-    validate_plan_identity(&requirements, &EligibleConfig::NemotronH(args))
+    validate_plan_identity(&requirements, &eligible)
         .map_err(ReplicatedTextDispatchError::Architecture)?;
     validate_store_handoff(&requirements, store.as_ref())
         .map_err(ReplicatedTextDispatchError::Architecture)?;
+    let args = match eligible {
+        EligibleConfig::QwenHybrid(args) => {
+            let capability_estimate = crate::capability::qwen_hybrid_text(args)
+                .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
+            let effective_model_type = args.model_type.clone();
+            let source_architecture = selected_uses_transform(&selected)
+                .then(|| {
+                    <MixedState as FixedProfile<B, D::State, QwenHybridReplicated>>::new(
+                        args.clone(),
+                        context,
+                    )
+                })
+                .transpose()
+                .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
+            let args = selected_qwen_hybrid_args(args, &selected)
+                .map_err(ReplicatedTextDispatchError::Architecture)?;
+            let prompt_cache_architecture_identity =
+                crate::qwen::hybrid::prompt_cache_architecture_fingerprint(&args);
+            let architecture =
+                <MixedState as FixedProfile<B, D::State, QwenHybridReplicated>>::new(args, context)
+                    .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?
+                    .with_prediction_capture();
+            let prepared = prepare_architecture_handoff::<B, D::State, _>(
+                architecture,
+                source_architecture,
+                requirements,
+                selected,
+                capability_estimate,
+                effective_model_type,
+                prompt_cache_architecture_identity,
+                context,
+            )
+            .map_err(ReplicatedTextDispatchError::Architecture)?;
+            return visit_replicated_prediction_target_architecture(
+                prepared,
+                extension,
+                store,
+                dispatcher.into_visitor(),
+            );
+        }
+        EligibleConfig::NemotronH(args) => args,
+        _ => return Err(ReplicatedTextIneligibility::Unrelated.into()),
+    };
     let capability_estimate = crate::capability::nemotron_h(args)
         .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
     let effective_model_type = args.model_type.clone();
@@ -2321,38 +2509,22 @@ impl EligibleConfig<'_> {
                 .wire_schema()
                 .map_err(|error| error.to_string()),
             Self::Gemma4(args) => {
-                let auxiliary =
-                    if args.text.hidden_size_per_layer_input > 0 {
-                        let width = usize::try_from(args.text.hidden_size_per_layer_input)
-                            .map_err(|_| "Gemma 4 per-layer input width is not positive")?;
-                        let range = eredu_core::balanced_contiguous_range(
-                            width,
-                            topology.tensor_parallel_size(),
-                            topology.tensor_parallel_rank(),
-                            false,
-                        )
-                        .map_err(|error| error.to_string())?;
-                        vec![eredu_runtime::BoundaryTensorSpec::new(
-                            "per_layer_input",
-                            [
-                                Dim::Batch,
-                                Dim::Sequence,
-                                Dim::Fixed(args.text.num_hidden_layers() as i32),
-                                Dim::Fixed(i32::try_from(range.len()).map_err(|_| {
-                                    "Gemma 4 local per-layer input width exceeds i32"
-                                })?),
-                            ],
-                            eredu_runtime::BoundaryTensorDtype::Activation,
-                        )]
-                    } else {
-                        Vec::new()
-                    };
-                eredu_runtime::BoundaryWireSchema::new(
-                    "gemma4.text",
-                    eredu_runtime::BoundaryTensorSpec::primary_activation(args.text.hidden_size),
-                    auxiliary,
-                )
-                .map_err(|error| error.to_string())
+                let width = if args.text.hidden_size_per_layer_input > 0 {
+                    eredu_core::balanced_contiguous_range(
+                        args.text.hidden_size_per_layer_input as usize,
+                        topology.tensor_parallel_size(),
+                        topology.tensor_parallel_rank(),
+                        false,
+                    )
+                    .map_err(|error| error.to_string())?
+                    .len() as i32
+                } else {
+                    0
+                };
+                let state = crate::gemma4::pipeline::tensor_state_layout(&args.text, topology)?;
+                crate::gemma4::TextBoundarySchema::from_state_layout(&args.text, width, &state)
+                    .wire_schema()
+                    .map_err(|error| error.to_string())
             }
             Self::QwenCompositeHybrid(args) => {
                 let deepstack = args
@@ -2480,10 +2652,9 @@ impl EligibleConfig<'_> {
             Self::DeepSeekV4(args) => {
                 for layer in 0..self.unit_count()? {
                     let expert = crate::deepseek::v4_expert_recipes(source, args, layer)?;
-                    extend(BTreeMap::from([
-                        (expert.target_gate_up, expert.gate_up),
-                        (expert.target_down, expert.down),
-                    ]))?;
+                    extend(crate::deepseek::checkpoint::expert_materialization_recipes(
+                        source, &expert,
+                    )?)?;
                 }
             }
             Self::Gemma4(args) => {
@@ -2510,6 +2681,23 @@ impl EligibleConfig<'_> {
                 }
             }
             Self::MuseGlimmer(args) => {
+                if args.weight_convention == crate::muse_glimmer::WeightConvention::Gguf {
+                    extend(crate::muse_glimmer::checkpoint::projector_gguf_recipes(
+                        args, source,
+                    )?)?;
+                    if args.is_moe() {
+                        let text_layers = usize::try_from(args.num_hidden_layers)
+                            .map_err(|_| "invalid Muse-Glimmer text layer count".to_owned())?;
+                        for layer in 0..text_layers {
+                            let expert = crate::muse_glimmer::expert_recipes(source, layer)?;
+                            extend(BTreeMap::from([
+                                (expert.target_gate_up, expert.gate_up),
+                                (expert.target_down, expert.down),
+                            ]))?;
+                        }
+                    }
+                    return Ok(recipes);
+                }
                 extend(crate::muse_glimmer::static_safetensors_recipes(
                     args, source,
                 )?)?;
@@ -2597,6 +2785,9 @@ impl EligibleConfig<'_> {
     }
 
     fn canonical_parameter_name(&self, name: &str, aliases: &[String]) -> String {
+        if matches!(self, Self::MuseGlimmer(_)) {
+            return crate::muse_glimmer::checkpoint::canonical_safetensors_target(name);
+        }
         if name.contains(".experts.") {
             if let Some(prefix) = name.strip_suffix(".scales") {
                 return format!("{prefix}_scales");
@@ -2928,6 +3119,26 @@ impl EligibleConfig<'_> {
         }
     }
 
+    fn native_format_for_shape(&self, name: &str, shape: &[usize]) -> LinearFormat {
+        if let Self::Gemma4(args) = self {
+            let input = shape
+                .last()
+                .and_then(|&size| i32::try_from(size).ok())
+                .unwrap_or(0);
+            if name.starts_with("model.vision_") || name.starts_with("model.embed_vision.") {
+                return args.vision.as_ref().map_or(LinearFormat::Dense, |config| {
+                    config.linear_format_for(name, input)
+                });
+            }
+            if name.starts_with("model.audio_") || name.starts_with("model.embed_audio.") {
+                return args.audio.as_ref().map_or(LinearFormat::Dense, |config| {
+                    config.linear_format_for(name, input)
+                });
+            }
+        }
+        self.native_format(name)
+    }
+
     fn native_format(&self, name: &str) -> LinearFormat {
         match self {
             Self::Nanbeige(args) => args.weight_quantization_for(name),
@@ -2947,16 +3158,7 @@ impl EligibleConfig<'_> {
             }
             Self::GptOss(args) => args.weight_quantization_for(name),
             Self::DeepSeekV3(args) => return args.linear_format_for(name),
-            Self::DeepSeekV4(args) => {
-                if name.contains(".switch_mlp.") {
-                    return match args.expert_format {
-                        crate::deepseek::ExpertFormat::Dense => LinearFormat::Dense,
-                        crate::deepseek::ExpertFormat::MxFp4 => LinearFormat::MxFp4,
-                        crate::deepseek::ExpertFormat::BlockFp8 => args.linear_format,
-                    };
-                }
-                return args.linear_format_for(name);
-            }
+            Self::DeepSeekV4(args) => return args.linear_format_for(name),
             Self::Gemma4(args) => {
                 if name.starts_with("model.vision_") {
                     return args.vision.as_ref().map_or(LinearFormat::Dense, |config| {
@@ -3006,12 +3208,7 @@ impl EligibleConfig<'_> {
             }
             Self::QwenVl(args) => {
                 if name.starts_with("model.visual.") {
-                    return args
-                        .vision
-                        .linear_formats
-                        .get(name)
-                        .copied()
-                        .unwrap_or(LinearFormat::Dense);
+                    return args.vision.linear_format(name);
                 }
                 return args.text.weight_quantization_for(name).into();
             }
@@ -3020,9 +3217,7 @@ impl EligibleConfig<'_> {
                     return args
                         .vision
                         .as_ref()
-                        .and_then(|vision| vision.linear_formats.get(name))
-                        .copied()
-                        .unwrap_or(LinearFormat::Dense);
+                        .map_or(LinearFormat::Dense, |vision| vision.linear_format(name));
                 }
                 return args.text.linear_format(name);
             }
@@ -3191,12 +3386,7 @@ impl EligibleConfig<'_> {
                 Ok(shapes)
             }
             Self::DeepSeekV4(args) => {
-                let mut shapes = family_linear_parameter_shapes(
-                    crate::deepseek::v4_safetensors_plan(args)
-                        .map_err(|error| error.to_string())?,
-                    |name| Some(args.linear_format_for(name)),
-                    "embed.weight",
-                )?;
+                let mut shapes = crate::deepseek::checkpoint::v4_linear_parameter_shapes(args)?;
                 if args.num_nextn_predict_layers == 0 {
                     insert_grouped_gated_linear_shapes(
                         &mut shapes,
@@ -3221,11 +3411,44 @@ impl EligibleConfig<'_> {
                 Ok(shapes)
             }
             Self::Inkling(args) => {
+                let plan =
+                    crate::inkling::safetensors_plan(args).map_err(|error| error.to_string())?;
+                let canonical = plan
+                    .common_tensors
+                    .iter()
+                    .chain(
+                        plan.layout_groups
+                            .iter()
+                            .flat_map(|group| &group.variants)
+                            .flat_map(|variant| &variant.tensors),
+                    )
+                    .map(|tensor| {
+                        (
+                            tensor.key.clone(),
+                            self.canonical_parameter_name(&tensor.key, &tensor.aliases),
+                        )
+                    })
+                    .collect::<BTreeMap<_, _>>();
+                // Recipe finalization uses canonical targets, so released aliases
+                // must retain the same semantic role and format at both stages.
                 let mut shapes = family_linear_parameter_shapes(
-                    crate::inkling::safetensors_plan(args).map_err(|error| error.to_string())?,
-                    |name| Some(self.native_format(name)),
-                    "model.embed_tokens.weight",
-                )?;
+                    plan,
+                    |name| {
+                        Some(self.native_format(canonical.get(name).map_or(name, String::as_str)))
+                    },
+                    "model.llm.embed.weight",
+                )?
+                .into_iter()
+                .map(|(name, shape)| (canonical.get(&name).cloned().unwrap_or(name), shape))
+                .collect::<BTreeMap<_, _>>();
+                // The relative table and joint-selection router are raw tensor
+                // operators, not backend Linear modules. Their rank alone does
+                // not authorize conversion; both remain floating parameters.
+                shapes.retain(|name, _| {
+                    name != "model.embed_tokens.weight"
+                        && !name.ends_with(".self_attn.rel_proj")
+                        && !name.ends_with(".moe.router.weight")
+                });
                 if args.text_config.has_sparse_moe_layers() {
                     let (plan, _) = inkling_replicated_expert_realization_plan(args)?;
                     insert_grouped_gated_linear_shapes(&mut shapes, &plan)?;
@@ -3233,12 +3456,91 @@ impl EligibleConfig<'_> {
                 Ok(shapes)
             }
             Self::MuseGlimmer(args) => {
-                let mut shapes = family_linear_parameter_shapes(
-                    crate::muse_glimmer::safetensors_plan(args)
-                        .map_err(|error| error.to_string())?,
-                    |name| Some(self.native_format(name)),
-                    "model.embed_tokens.weight",
-                )?;
+                let mut shapes = match args.weight_convention {
+                    crate::muse_glimmer::WeightConvention::HuggingFace => {
+                        let plan = crate::muse_glimmer::safetensors_plan(args)?;
+                        let canonical = plan
+                            .common_tensors
+                            .iter()
+                            .chain(
+                                plan.layout_groups
+                                    .iter()
+                                    .flat_map(|group| &group.variants)
+                                    .flat_map(|variant| &variant.tensors),
+                            )
+                            .map(|tensor| {
+                                (
+                                    tensor.key.clone(),
+                                    self.canonical_parameter_name(&tensor.key, &tensor.aliases),
+                                )
+                            })
+                            .collect::<BTreeMap<_, _>>();
+                        family_linear_parameter_shapes(
+                            plan,
+                            |name| {
+                                Some(self.native_format(
+                                    canonical.get(name).map_or(name, String::as_str),
+                                ))
+                            },
+                            "model.language_model.embed_tokens.weight",
+                        )?
+                        .into_iter()
+                        .map(|(name, shape)| (canonical.get(&name).cloned().unwrap_or(name), shape))
+                        .collect()
+                    }
+                    crate::muse_glimmer::WeightConvention::Gguf => {
+                        // GGUF text admission has no required vision tower. Its
+                        // declared shapes are logical, independent of encoded
+                        // source blocks, and its names have their own translation.
+                        let mut shapes = crate::muse_glimmer::gguf_plan(args)?
+                            .common_tensors
+                            .into_iter()
+                            .filter(|tensor| {
+                                tensor.shape.len() == 2 && tensor.key != "token_embd.weight"
+                            })
+                            .map(|tensor| {
+                                (
+                                    crate::muse_glimmer::translate_text_gguf_name(&tensor.key),
+                                    tensor.shape,
+                                )
+                            })
+                            .collect::<BTreeMap<_, _>>();
+                        if args.vision_config.is_some() {
+                            shapes.extend(
+                                crate::muse_glimmer::projector_gguf_plan(args)?
+                                    .common_tensors
+                                    .into_iter()
+                                    .filter(|tensor| tensor.shape.len() == 2)
+                                    .map(|tensor| {
+                                        (
+                                            crate::muse_glimmer::translate_projector_gguf_name(
+                                                &tensor.key,
+                                            ),
+                                            tensor.shape,
+                                        )
+                                    }),
+                            );
+                            let patch = crate::muse_glimmer::projector_gguf_plan(args)?
+                                .common_tensors
+                                .into_iter()
+                                .find(|tensor| tensor.key == "v.patch_embd.weight")
+                                .expect("projector schema declares its patch kernel");
+                            let width =
+                                patch.shape[1..]
+                                    .iter()
+                                    .try_fold(1usize, |total, dimension| {
+                                        total.checked_mul(*dimension).ok_or_else(|| {
+                                            "Muse-Glimmer patch width overflowed".to_owned()
+                                        })
+                                    })?;
+                            shapes.insert(
+                                crate::muse_glimmer::translate_projector_gguf_name(&patch.key),
+                                vec![patch.shape[0], width],
+                            );
+                        }
+                        shapes
+                    }
+                };
                 if args.is_moe() {
                     insert_grouped_gated_linear_shapes(
                         &mut shapes,
@@ -3253,6 +3555,8 @@ impl EligibleConfig<'_> {
                     |name| Some(self.native_format(name)),
                     "model.language_model.embed_tokens.weight",
                 )?;
+                // The static position table uses a fixed dense embedding lookup.
+                shapes.remove("model.visual.pos_embed.weight");
                 if args.text.is_moe() {
                     insert_grouped_gated_linear_shapes(
                         &mut shapes,
@@ -3269,6 +3573,8 @@ impl EligibleConfig<'_> {
                     |name| Some(self.native_format(name)),
                     "model.embed_tokens.weight",
                 )?;
+                // The static position table uses a fixed dense embedding lookup.
+                shapes.remove("model.visual.pos_embed.weight");
                 if args.text.is_moe() {
                     insert_grouped_gated_linear_shapes(
                         &mut shapes,
@@ -3428,7 +3734,16 @@ fn family_linear_parameter_shapes(
             continue;
         }
         let mut shape = constraint.shape.clone();
-        match native_format(&constraint.key).unwrap_or(LinearFormat::Dense) {
+        // An architecture may retain an unaligned matrix in floating storage
+        // under a family-wide quantization request. Only encoded schema tensors
+        // need their packed dimension expanded into logical coordinates.
+        let format =
+            if constraint.dtype == eredu_checkpoint::schema::StoredDtypeConstraint::Floating {
+                LinearFormat::Dense
+            } else {
+                native_format(&constraint.key).unwrap_or(LinearFormat::Dense)
+            };
+        match format {
             LinearFormat::Affine(format) => {
                 let bits = usize::try_from(format.bits)
                     .map_err(|_| format!("invalid affine bits for {:?}", constraint.key))?;
@@ -3443,6 +3758,17 @@ fn family_linear_parameter_shapes(
                 *packed = packed
                     .checked_mul(8)
                     .ok_or_else(|| format!("invalid MXFP4 geometry for {:?}", constraint.key))?;
+            }
+            LinearFormat::GgufIQuant { ggml_type, .. } => {
+                let invalid = || format!("invalid GGUF block geometry for {:?}", constraint.key);
+                let (values, bytes) = ggml_type.block_and_bytes().map_err(|_| invalid())?;
+                let values = usize::try_from(values).map_err(|_| invalid())?;
+                let bytes = usize::try_from(bytes).map_err(|_| invalid())?;
+                let packed = shape.last_mut().expect("rank checked above");
+                if bytes == 0 || !packed.is_multiple_of(bytes) {
+                    return Err(invalid());
+                }
+                *packed = (*packed / bytes).checked_mul(values).ok_or_else(invalid)?;
             }
             _ => {}
         }
@@ -4030,6 +4356,24 @@ fn replicated_text_requirements_for_structure(
             )
     })
     .map_err(|error| ReplicatedTextRequirementsError::InvalidArchitecture(error.to_string()))?;
+    if let Some(extension) = plan.prediction_extension() {
+        use crate::configuration::PredictionExtensionKind;
+        let roles: &[&str] = match extension.kind() {
+            PredictionExtensionKind::DeepSeekV3Mtp => &["embedding"],
+            // These extensions consume the target vocabulary head.
+            // Every independently executing prediction replica needs its selected
+            // embedding and head shard, including non-output pipeline stages.
+            PredictionExtensionKind::DeepSeekV4Embedded
+            | PredictionExtensionKind::QwenHybridMtp
+            | PredictionExtensionKind::NemotronHMtp => &["embedding", "output"],
+            PredictionExtensionKind::InklingMtp => &["embedding", "embedding_norm", "output"],
+        };
+        requirements = requirements
+            .with_replicated_static_roles(roles.iter().copied())
+            .map_err(|error| {
+                ReplicatedTextRequirementsError::InvalidArchitecture(error.to_string())
+            })?;
+    }
     if let Some((parameters, recipes, outputs)) = auxiliary {
         requirements = requirements
             .with_auxiliary_parameters(parameters, recipes, outputs)
@@ -4143,6 +4487,19 @@ fn prediction_extension_materialization_parameters(
             "prediction extension produced no exact materialization parameters".into(),
         ));
     }
+    let parameters = parameters
+        .into_iter()
+        .map(|parameter| {
+            let residency = crate::prediction_extension::residency::parameter_residency(
+                extension,
+                parameter.name(),
+            )
+            .map_err(|error| {
+                ReplicatedTextRequirementsError::InvalidArchitecture(error.to_string())
+            })?;
+            Ok(parameter.with_auxiliary_residency(residency))
+        })
+        .collect::<Result<_, ReplicatedTextRequirementsError>>()?;
     Ok((parameters, recipes, outputs))
 }
 
@@ -4191,10 +4548,10 @@ fn prediction_extension_recipes(
             for depth in 0..extension.depth() {
                 let expert = crate::deepseek::v4_expert_recipes(source, args, target + depth)
                     .map_err(ReplicatedTextRequirementsError::InvalidArtifact)?;
-                extend(BTreeMap::from([
-                    (expert.target_gate_up, expert.gate_up),
-                    (expert.target_down, expert.down),
-                ]))?;
+                extend(
+                    crate::deepseek::checkpoint::expert_materialization_recipes(source, &expert)
+                        .map_err(ReplicatedTextRequirementsError::InvalidArtifact)?,
+                )?;
             }
         }
         SafetensorsModelConfig::Inkling(args) => {
@@ -4502,19 +4859,19 @@ fn finalize_materialization_parameters_with_recipes(
             )
         } else {
             let role = derived_target_role(target);
-            let native = if role == ReplicatedTextParameterRole::FormatCompanion {
-                LinearFormat::Dense
-            } else {
-                alias_source.map_or_else(
-                    || config.native_format(target),
-                    |source| source.native_executable(),
-                )
-            };
             let mut logical_shape = linear_shapes
                 .get(target)
                 .cloned()
                 .or_else(|| alias_source.map(|source| source.logical_shape().to_vec()))
                 .unwrap_or_else(|| output.shape.clone());
+            let native = if role == ReplicatedTextParameterRole::FormatCompanion {
+                LinearFormat::Dense
+            } else {
+                alias_source.map_or_else(
+                    || config.native_format_for_shape(target, &logical_shape),
+                    |source| source.native_executable(),
+                )
+            };
             if output.dtype == eredu_checkpoint::recipe::RecipeDtype::U32
                 && logical_shape == output.shape
             {
@@ -4599,6 +4956,32 @@ fn finalize_materialization_parameters_with_recipes(
                     ReplicatedTextRequirementsError::InvalidArchitecture(error.to_string())
                 })?;
             }
+        }
+    }
+    for parameter in &mut parameters {
+        let optional_media_transform = match config {
+            EligibleConfig::Gemma4(_) => {
+                parameter.name().starts_with("model.vision_")
+                    || parameter.name().starts_with("model.audio_")
+                    || parameter.name().starts_with("model.embed_vision.")
+                    || parameter.name().starts_with("model.embed_audio.")
+            }
+            EligibleConfig::MuseGlimmer(_) => parameter.name().starts_with("model.vision_"),
+            EligibleConfig::QwenVl(_) => parameter.name().starts_with("model.visual."),
+            _ => false,
+        };
+        if optional_media_transform
+            && matches!(
+                parameter.transform_constraint(),
+                ParameterTransformConstraint::Linear { .. }
+            )
+        {
+            *parameter = parameter
+                .clone()
+                .with_optional_transform_alignment(32)
+                .map_err(|error| {
+                    ReplicatedTextRequirementsError::InvalidArchitecture(error.to_string())
+                })?;
         }
     }
     Ok((
@@ -5122,7 +5505,9 @@ fn safetensors_parameters(
         } else {
             match role {
                 ReplicatedTextParameterRole::LinearWeight
-                | ReplicatedTextParameterRole::Embedding => config.native_format(&canonical),
+                | ReplicatedTextParameterRole::Embedding => {
+                    config.native_format_for_shape(&canonical, &logical_shape)
+                }
                 ReplicatedTextParameterRole::FormatCompanion
                 | ReplicatedTextParameterRole::Normalization
                 | ReplicatedTextParameterRole::LinearBias
@@ -5346,25 +5731,44 @@ fn finish_parameters_with_tied_output(
     config: &EligibleConfig<'_>,
 ) -> Result<Vec<ReplicatedTextParameterRequirement>, ReplicatedTextRequirementsError> {
     if config.tied_embeddings() {
-        parameters.retain(|parameter| parameter.name() != "lm_head.weight");
-        parameters.push(parameter_requirement(
-            "lm_head.weight".into(),
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            None,
-            None,
-            config
-                .embedding_shape()
-                .map_err(ReplicatedTextRequirementsError::InvalidArchitecture)?,
-            LinearFormat::Dense,
-            true,
-            ReplicatedTextParameterRole::LinearWeight,
-            ReplicatedTextParameterOwner::StaticRole("output".into()),
-            ReplicatedTextParameterPresence::Tied {
-                target: config.embedding_name(),
-            },
-        )?);
+        // A redundant checkpoint head is admitted for source validation, but
+        // execution uses the embedding and its own declared companions.
+        let redundant = |parameter: &ReplicatedTextParameterRequirement| {
+            parameter.name() == "lm_head.weight"
+                || parameter
+                    .linear_companion()
+                    .is_some_and(|(_, primary)| primary == "lm_head.weight")
+        };
+        let redundant_sources = parameters
+            .iter()
+            .filter(|parameter| redundant(parameter))
+            .flat_map(|parameter| parameter.sources().iter().cloned())
+            .collect();
+        parameters.retain(|parameter| !redundant(parameter));
+        parameters.push(
+            parameter_requirement(
+                "lm_head.weight".into(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                None,
+                None,
+                config
+                    .embedding_shape()
+                    .map_err(ReplicatedTextRequirementsError::InvalidArchitecture)?,
+                LinearFormat::Dense,
+                true,
+                ReplicatedTextParameterRole::LinearWeight,
+                ReplicatedTextParameterOwner::StaticRole("output".into()),
+                ReplicatedTextParameterPresence::Tied {
+                    target: config.embedding_name(),
+                },
+            )?
+            .with_admitted_redundant_sources(redundant_sources)
+            .map_err(|error| {
+                ReplicatedTextRequirementsError::InvalidArchitecture(error.to_string())
+            })?,
+        );
     }
     finish_parameters(parameters)
 }
@@ -5416,7 +5820,11 @@ fn parameter_requirement(
     .map_err(|error| ReplicatedTextRequirementsError::InvalidArchitecture(error.to_string()))?;
     if transformable {
         let name = requirement.name();
-        let (scale, bias) = if name.contains(".experts.") && !name.ends_with(".weight") {
+        let grouped = !name.ends_with(".weight")
+            && (name.contains(".experts.")
+                || name.ends_with(".gate_up_proj")
+                || name.ends_with(".down_proj"));
+        let (scale, bias) = if grouped {
             (format!("{name}_scales"), format!("{name}_biases"))
         } else {
             let prefix = name.strip_suffix(".weight").unwrap_or(name);
@@ -5508,6 +5916,52 @@ fn parameter_owner(config: &EligibleConfig<'_>, name: &str) -> ReplicatedTextPar
             return ReplicatedTextParameterOwner::ExecutionUnit {
                 group: config.execution_group().into(),
                 unit: layer,
+            };
+        }
+    }
+    if let EligibleConfig::MuseGlimmer(args) = config {
+        if let Some(consumers) =
+            crate::muse_glimmer::parallel::vision_static_consumer_units(args, name)
+        {
+            return ReplicatedTextParameterOwner::StaticUnitConsumers {
+                role: "vision".into(),
+                consumers: consumers
+                    .map(|unit| {
+                        (
+                            crate::muse_glimmer::model::VISION_EXECUTION_GROUP.into(),
+                            unit,
+                        )
+                    })
+                    .collect(),
+            };
+        }
+    }
+    let vision = match config {
+        EligibleConfig::QwenVl(args) => {
+            Some((&args.vision, crate::qwen::vl::VISION_EXECUTION_GROUP))
+        }
+        EligibleConfig::QwenCompositeHybrid(args) => args
+            .vision
+            .as_ref()
+            .map(|vision| (vision, crate::qwen::hybrid::VISION_EXECUTION_GROUP)),
+        _ => None,
+    };
+    if let Some((vision, group)) = vision {
+        let consumer = if name.starts_with("model.visual.merger.") {
+            vision.layer_count().checked_sub(1)
+        } else if let Some(rest) = name.strip_prefix("model.visual.deepstack_merger_list.") {
+            rest.split('.')
+                .next()
+                .and_then(|index| index.parse::<usize>().ok())
+                .and_then(|index| vision.deepstack_layers().get(index).copied())
+                .and_then(|unit| usize::try_from(unit).ok())
+        } else {
+            None
+        };
+        if let Some(unit) = consumer {
+            return ReplicatedTextParameterOwner::StaticUnitConsumers {
+                role: "vision".into(),
+                consumers: vec![(group.into(), unit)],
             };
         }
     }
@@ -5773,6 +6227,19 @@ impl PartialEq for CompositeTextRequirements {
 }
 
 impl CompositeTextRequirements {
+    pub(crate) fn with_state_layout(
+        mut self,
+        layout: eredu_runtime::StateLayout,
+    ) -> Result<Self, eredu_runtime::ReplicatedTextContractError> {
+        self.execution = self.execution.with_state_layout(layout.clone())?;
+        self.routed = self
+            .routed
+            .map(|routed| routed.with_state_layout(layout.clone()))
+            .transpose()?;
+        self.state_layout = layout;
+        Ok(self)
+    }
+
     /// The normalized artifact inspection that authoritatively selected these
     /// requirements.
     ///
@@ -6462,18 +6929,8 @@ impl CompositeConfig<'_> {
                     graph,
                     counts,
                     vec![
-                        media(
-                            ArchitectureGroupKind::VisionEncoder,
-                            args.vision
-                                .as_ref()
-                                .map_or_else(Vec::new, |_| vec!["vision", "vision_projection"]),
-                        ),
-                        media(
-                            ArchitectureGroupKind::AudioEncoder,
-                            args.audio
-                                .as_ref()
-                                .map_or_else(Vec::new, |_| vec!["audio", "audio_projection"]),
-                        ),
+                        crate::gemma4::pipeline::media_transport(args, 0),
+                        crate::gemma4::pipeline::media_transport(args, 1),
                         decoder,
                     ],
                 )
@@ -6546,7 +7003,7 @@ impl CompositeConfig<'_> {
                         args.num_hidden_layers as usize,
                     ],
                     vec![
-                        media(ArchitectureGroupKind::VisionEncoder, vec!["vision"]),
+                        crate::muse_glimmer::model::vision_group_transport(args),
                         crate::transport::decoder(),
                     ],
                 )
@@ -6667,6 +7124,12 @@ pub(crate) fn partitioned_boundary_schema(
         | (None, Some(GgufModelConfig::K2Horizon(args))) => EligibleConfig::K2Horizon(args),
         (Some(SafetensorsModelConfig::Qwen(args)), None) if args.is_moe() => {
             EligibleConfig::Qwen(args)
+        }
+        (Some(SafetensorsModelConfig::QwenHybrid(args)), None)
+        | (None, Some(GgufModelConfig::QwenHybrid(args)))
+            if args.vision.is_none() && args.text.mtp_num_hidden_layers == 0 =>
+        {
+            EligibleConfig::QwenHybrid(&args.text)
         }
         (Some(SafetensorsModelConfig::Lfm2(args)), None) if args.has_sparse_moe_layers() => {
             EligibleConfig::Lfm2(args)
@@ -7310,9 +7773,9 @@ where
     let config = composite_config(retained.architecture_plan())
         .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?
         .ok_or(ReplicatedTextIneligibility::Unrelated)?;
-    let source_linear_formats = requirement_linear_formats(requirements.execution());
+    let source_linear_formats = requirement_matrix_formats(requirements.execution());
     let target_linear_formats =
-        selected_linear_formats(requirements.execution(), selected.execution());
+        selected_matrix_formats(requirements.execution(), selected.execution());
     let source_formats = requirement_formats(requirements.execution());
     let target_formats = selected_formats(selected.execution());
     let has_transform = selected_uses_transform(selected.execution());
@@ -7626,9 +8089,9 @@ where
     let config = composite_config(retained.architecture_plan())
         .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?
         .ok_or(ReplicatedTextIneligibility::Unrelated)?;
-    let source_linear_formats = requirement_linear_formats(requirements.execution());
+    let source_linear_formats = requirement_matrix_formats(requirements.execution());
     let target_linear_formats =
-        selected_linear_formats(requirements.execution(), selected.execution());
+        selected_matrix_formats(requirements.execution(), selected.execution());
     let source_formats = requirement_formats(requirements.execution());
     let target_formats = selected_formats(selected.execution());
     let has_transform = selected_uses_transform(selected.execution());
@@ -8045,6 +8508,284 @@ mod tests {
         })
     }
 
+    fn muse_config() -> serde_json::Value {
+        serde_json::json!({
+            "model_type": "muse_glimmer", "architectures": ["MuseGlimmerForConditionalGeneration"],
+            "image_token_id": 30, "video_token_id": 29, "out_hidden_size": 128, "projector_hidden_size": 32,
+            "vision_config": { "model_type": "muse_glimmer_vision", "hidden_act": "gelu",
+                "hidden_size": 32, "intermediate_size": 64, "num_attention_heads": 4,
+                "num_hidden_layers": 1, "patch_size": 2, "patch_temporal": 1, "merge_size": 2,
+                "pos_emb_height": 2, "pos_emb_width": 2, "max_position_embeddings": 4,
+                "layer_norm_eps": 1e-5, "layer_types": ["full_attention"],
+                "rope_parameters": {"rope_theta": 10000.0, "rope_type": "default"} },
+            "text_config": { "model_type": "muse_glimmer_text", "hidden_size": 64,
+                "num_hidden_layers": 1, "intermediate_size": 128, "num_attention_heads": 4,
+                "num_key_value_heads": 2, "head_dim": 16, "vocab_size": 64,
+                "max_position_embeddings": 128, "rms_norm_eps": 1e-5, "post_norm_eps": 1e-8,
+                "rope_parameters": {"rope_theta": 10000.0, "rope_type": "default"},
+                "layer_types": ["full_attention"], "layer_rope_theta": [0.0], "sliding_window": 16,
+                "tie_word_embeddings": false, "hidden_activation": "silu",
+                "qk_scale_factor": 1.3, "output_multiplier": 1.9, "final_logit_softcapping": 7.0 }
+        })
+    }
+
+    fn qwen_vl_config() -> serde_json::Value {
+        serde_json::json!({
+            "model_type":"qwen3_vl", "image_token_id":61, "video_token_id":62, "tie_word_embeddings":false,
+            "text_config":{"model_type":"qwen3_vl_text","hidden_size":64,"num_hidden_layers":1,
+                "intermediate_size":64,"num_attention_heads":4,"num_key_value_heads":2,"head_dim":16,
+                "rms_norm_eps":0.000001,"vocab_size":64,"max_position_embeddings":128,
+                "rope_scaling":{"mrope_section":[4,2,2]}},
+            "vision_config":{"depth":1,"hidden_size":32,"intermediate_size":64,"num_heads":4,
+                "num_position_embeddings":16,"in_channels":3,"patch_size":2,"spatial_merge_size":2,
+                "temporal_patch_size":2,"out_hidden_size":64,"deepstack_visual_indexes":[0]}
+        })
+    }
+
+    #[test]
+    fn qwen_vl_packed_text_and_projector_keep_logical_linear_geometry() {
+        let args = crate::qwen::vl::model_args_from_config_value(&qwen_vl_config()).unwrap();
+        let (_root, inspection) = inspected_config(qwen_vl_config());
+        let requirements = composite_text_requirements(&inspection).unwrap();
+        let matrices = requirement_matrix_formats(requirements.execution());
+        let embedding = "model.language_model.embed_tokens.weight";
+        assert_eq!(matrices[embedding], LinearFormat::Dense);
+        assert!(!matrices.contains_key("model.language_model.norm.weight"));
+        assert!(!matrices.contains_key("model.visual.pos_embed.weight"));
+        let logical = EligibleConfig::QwenVl(&args)
+            .linear_parameter_shapes()
+            .unwrap();
+        for ggml_type in [eredu_gguf::GgmlType::Q8_0, eredu_gguf::GgmlType::IQ4NL] {
+            let format = WeightQuantization::GgufIQuant {
+                ggml_type,
+                endian: eredu_gguf::Endian::Little,
+            };
+            let formats = matrices
+                .keys()
+                .map(|name| (name.clone(), format.into()))
+                .collect();
+            let packed = qwen_vl_with_formats(&args, formats).unwrap();
+            assert_eq!(packed.text.weight_quantization_for(embedding), Some(format));
+            assert_eq!(
+                EligibleConfig::QwenVl(&packed)
+                    .linear_parameter_shapes()
+                    .unwrap(),
+                logical
+            );
+
+            // A partial encoded block must fail before a lowering can advertise
+            // a truncated logical matrix to the execution mechanism.
+            let mut plan = crate::qwen::vl::safetensors_plan(&packed).unwrap();
+            let matrix = plan
+                .common_tensors
+                .iter_mut()
+                .find(|tensor| tensor.key == "model.visual.blocks.0.attn.qkv.weight")
+                .unwrap();
+            *matrix.shape.last_mut().unwrap() += 1;
+            assert!(family_linear_parameter_shapes(
+                plan,
+                |_| Some(format.into()),
+                "model.language_model.embed_tokens.weight"
+            )
+            .unwrap_err()
+            .contains("GGUF block geometry"));
+        }
+    }
+
+    #[test]
+    fn qwen_vl_media_transform_admission_matches_load_time_configuration() {
+        let value = qwen_vl_config();
+        let args = crate::qwen::vl::model_args_from_config_value(&value).unwrap();
+        let (_root, inspection) = inspected_config(value);
+        let requirements = composite_text_requirements(&inspection).unwrap();
+        let position = requirements
+            .execution()
+            .parameters()
+            .iter()
+            .find(|p| p.name() == "model.visual.pos_embed.weight")
+            .unwrap();
+        assert_eq!(position.role(), ReplicatedTextParameterRole::Other);
+        assert_eq!(
+            position.transform_constraint(),
+            ParameterTransformConstraint::None
+        );
+        for quantization in [
+            WeightQuantization::Affine(eredu_checkpoint::AffineQuantization::new(32, 4).unwrap()),
+            WeightQuantization::Affine(eredu_checkpoint::AffineQuantization::new(64, 4).unwrap()),
+            WeightQuantization::MxFp4,
+        ] {
+            let target = crate::qwen::vl::load_time_quantization(&args, quantization).unwrap();
+            let request = match quantization {
+                WeightQuantization::Affine(format) => eredu_core::QuantizationRequest::Affine {
+                    group_size: format.group_size as u32,
+                    bits: format.bits as u8,
+                },
+                WeightQuantization::MxFp4 => eredu_core::QuantizationRequest::MxFp4,
+                _ => unreachable!(),
+            };
+            let mut checked = 0;
+            for parameter in requirements.execution().parameters().iter().filter(|p| {
+                p.name().starts_with("model.visual.")
+                    && p.role() == ReplicatedTextParameterRole::LinearWeight
+            }) {
+                let selected = parameter
+                    .transform_target(request)
+                    .unwrap()
+                    .map_or(parameter.native_executable(), |target| target.executable());
+                assert_eq!(
+                    selected,
+                    target.vision.linear_format(parameter.name()),
+                    "{}",
+                    parameter.name()
+                );
+                checked += 1;
+            }
+            assert!(checked >= 8);
+        }
+    }
+
+    #[test]
+    fn muse_media_transform_admission_matches_load_time_configuration() {
+        let value = muse_config();
+        let args = crate::muse_glimmer::DecoderConfig::from_hf_value(&value).unwrap();
+        let (_root, inspection) = inspected_config(value);
+        let requirements = composite_text_requirements(&inspection).unwrap();
+        let down = requirements
+            .execution()
+            .parameters()
+            .iter()
+            .find(|p| p.name() == "model.layers.0.mlp.down_proj.weight")
+            .unwrap();
+        assert_eq!(down.logical_shape(), &[64, 128]);
+        assert_eq!(
+            down.transform_companions(),
+            Some((
+                "model.layers.0.mlp.down_proj.scales",
+                "model.layers.0.mlp.down_proj.biases"
+            ))
+        );
+        assert!(down
+            .sources()
+            .iter()
+            .any(|source| source == "model.language_model.layers.0.mlp.down_proj.weight"));
+        for quantization in [
+            WeightQuantization::Affine(eredu_checkpoint::AffineQuantization::new(32, 4).unwrap()),
+            WeightQuantization::Affine(eredu_checkpoint::AffineQuantization::new(64, 4).unwrap()),
+            WeightQuantization::MxFp4,
+        ] {
+            let target = crate::muse_glimmer::load_time_quantization(&args, quantization).unwrap();
+            let request = match quantization {
+                WeightQuantization::Affine(format) => eredu_core::QuantizationRequest::Affine {
+                    group_size: format.group_size as u32,
+                    bits: format.bits as u8,
+                },
+                WeightQuantization::MxFp4 => eredu_core::QuantizationRequest::MxFp4,
+                _ => unreachable!("fixture only requests load-time affine or MXFP4"),
+            };
+            let mut checked = 0;
+            for parameter in requirements.execution().parameters().iter().filter(|p| {
+                p.name().starts_with("model.vision_")
+                    && p.role() == ReplicatedTextParameterRole::LinearWeight
+            }) {
+                let selected = parameter
+                    .transform_target(request)
+                    .unwrap()
+                    .map_or(parameter.native_executable(), |target| target.executable());
+                assert_eq!(
+                    selected,
+                    target
+                        .vision_config
+                        .as_ref()
+                        .unwrap()
+                        .linear_format_for(parameter.name()),
+                    "{}",
+                    parameter.name()
+                );
+                checked += 1;
+            }
+            assert!(checked >= 10);
+        }
+    }
+
+    #[test]
+    fn muse_gguf_logical_geometry_does_not_require_a_vision_source() {
+        let mut args = crate::muse_glimmer::DecoderConfig::from_hf_value(&muse_config()).unwrap();
+        args.weight_convention = crate::muse_glimmer::WeightConvention::Gguf;
+        let shapes = EligibleConfig::MuseGlimmer(&args)
+            .linear_parameter_shapes()
+            .unwrap();
+        assert_eq!(
+            shapes["model.vision_tower.patch_embedder.patch_embedding.weight"],
+            [32, 12]
+        );
+        args.vision_config = None;
+        let (_, _, transports) = CompositeConfig::Muse(&args).graph_and_units().unwrap();
+        assert!(transports[0].first_owner_static_roles.is_empty());
+        assert_eq!(
+            transports[0],
+            crate::muse_glimmer::model::vision_group_transport(&args)
+        );
+        let shapes = EligibleConfig::MuseGlimmer(&args)
+            .linear_parameter_shapes()
+            .unwrap();
+        assert_eq!(shapes["model.layers.0.self_attn.q_proj.weight"], [64, 64]);
+        assert_eq!(shapes["model.layers.0.self_attn.k_proj.weight"], [32, 64]);
+        assert_eq!(shapes["model.layers.0.mlp.down_proj.weight"], [64, 128]);
+        assert_eq!(shapes["lm_head.weight"], [64, 64]);
+        assert!(!shapes.contains_key("model.embed_tokens.weight"));
+        assert!(!shapes.contains_key("model.layers.0.self_attn.q_norm.weight"));
+    }
+
+    #[test]
+    fn muse_gguf_projector_does_not_add_text_expert_layers() {
+        let mut value = muse_config();
+        value["text_config"]["intermediate_size"] = 0.into();
+        value["text_config"]["moe_intermediate_size"] = 64.into();
+        value["text_config"]["num_experts"] = 4.into();
+        value["text_config"]["num_experts_per_tok"] = 2.into();
+        value["text_config"]["norm_topk_prob"] = true.into();
+        let mut args = crate::muse_glimmer::DecoderConfig::from_hf_value(&value).unwrap();
+        args.weight_convention = crate::muse_glimmer::WeightConvention::Gguf;
+        let mut metadata = BTreeMap::new();
+        for (name, shape) in [
+            ("v.patch_embd.weight", vec![32, 3, 2, 2]),
+            ("blk.0.ffn_gate_exps.weight", vec![4, 64, 64]),
+            ("blk.0.ffn_up_exps.weight", vec![4, 64, 64]),
+            ("blk.0.ffn_down_exps.weight", vec![4, 64, 64]),
+        ] {
+            metadata.insert(
+                name.into(),
+                eredu_checkpoint::store::TensorMetadata {
+                    name: name.into(),
+                    physical_shape: shape.clone(),
+                    encoded_byte_len: shape.iter().product::<usize>() as u64 * 4,
+                    logical_shape: shape,
+                    stored_dtype: StoredDtype::F32,
+                    backing_shard: None,
+                },
+            );
+        }
+        let mut source = InspectionCheckpointSource {
+            recipes: Default::default(),
+            metadata,
+            backend: eredu_checkpoint::store::WeightStoreBackend::Gguf,
+        };
+        let selected = EligibleConfig::MuseGlimmer(&args);
+        assert_eq!(selected.unit_count().unwrap(), 2);
+        let recipes = selected.derived_recipes(&source).unwrap();
+        assert_eq!(recipes.len(), 3);
+        assert_eq!(
+            recipes["model.layers.0.mlp.experts.gate_up_proj"]
+                .infer(&source as &dyn eredu_checkpoint::store::CheckpointSource)
+                .unwrap()
+                .shape(),
+            &[4, 128, 64]
+        );
+        assert!(recipes.contains_key("model.vision_tower.patch_embedder.patch_embedding.weight"));
+        source.metadata.remove("blk.0.ffn_up_exps.weight");
+        assert!(selected.derived_recipes(&source).is_err());
+    }
+
     fn gemma4_config() -> serde_json::Value {
         serde_json::json!({
             "model_type":"gemma4", "tie_word_embeddings":false,
@@ -8059,6 +8800,97 @@ mod tests {
                 "top_k_experts":1, "moe_intermediate_size":8
             }
         })
+    }
+
+    #[test]
+    fn gemma_media_formats_preserve_unaligned_projection_geometry() {
+        let value: serde_json::Value = serde_json::from_slice(
+            br#"{
+            "model_type":"gemma4_unified", "image_token_id":42, "audio_token_id":43, "text_config": {
+                "model_type":"gemma4_text", "hidden_size":64, "num_hidden_layers":2,
+                "intermediate_size":128, "num_attention_heads":4, "num_key_value_heads":2,
+                "head_dim":16, "rms_norm_eps":0.00001, "vocab_size":64,
+                "max_position_embeddings":64, "layer_types":["full_attention","full_attention"]
+            }, "vision_config": {
+                "hidden_size":64, "intermediate_size":128, "num_hidden_layers":2,
+                "num_attention_heads":4, "num_key_value_heads":2, "head_dim":16,
+                "patch_size":2, "pooling_kernel_size":2, "position_embedding_size":4,
+                "rms_norm_eps":0.00001
+            }, "audio_config": {
+                "hidden_size":64, "num_hidden_layers":2, "num_attention_heads":4,
+                "output_proj_dims":48, "conv_kernel_size":3, "attention_chunk_size":4,
+                "attention_context_left":5, "attention_context_right":0,
+                "attention_invalid_logits_value":-1000000000.0, "attention_logit_cap":50.0,
+                "residual_weight":0.5, "rms_norm_eps":0.00001, "subsampling_conv_channels":[4,8]
+            }
+        }"#,
+        )
+        .unwrap();
+        let family =
+            crate::gemma4::FamilyConfig::from_hf_json(&serde_json::to_vec(&value).unwrap())
+                .unwrap();
+        let (_root, inspection) = inspected_config(value);
+        let requirements = composite_text_requirements(&inspection).unwrap();
+        for format in [
+            WeightQuantization::Affine(eredu_checkpoint::AffineQuantization::new(32, 4).unwrap()),
+            WeightQuantization::MxFp4,
+        ] {
+            let target = crate::gemma4::load_time_quantization(&family, format).unwrap();
+            let eligible = EligibleConfig::Gemma4(&target);
+            let request = match format {
+                WeightQuantization::Affine(format) => eredu_core::QuantizationRequest::Affine {
+                    group_size: format.group_size as u32,
+                    bits: format.bits as u8,
+                },
+                WeightQuantization::MxFp4 => eredu_core::QuantizationRequest::MxFp4,
+                _ => unreachable!(),
+            };
+            let mut checked = 0;
+            for parameter in requirements
+                .execution()
+                .parameters()
+                .iter()
+                .filter(|parameter| {
+                    (parameter.name().starts_with("model.vision_")
+                        || parameter.name().starts_with("model.embed_vision.")
+                        || parameter.name().starts_with("model.audio_")
+                        || parameter.name().starts_with("model.embed_audio."))
+                        && parameter.role() == ReplicatedTextParameterRole::LinearWeight
+                })
+            {
+                let selected = parameter
+                    .transform_target(request)
+                    .unwrap()
+                    .map_or(parameter.native_executable(), |target| target.executable());
+                assert_eq!(
+                    selected,
+                    eligible.native_format_for_shape(parameter.name(), parameter.logical_shape()),
+                    "{}",
+                    parameter.name()
+                );
+                checked += 1;
+            }
+            assert!(checked >= 8);
+            let shapes = eligible.linear_parameter_shapes().unwrap();
+            let patch = "model.vision_tower.patch_embedder.input_proj.weight";
+            let projector = "model.embed_vision.embedding_projection.weight";
+            assert_eq!(shapes[patch], [64, 12]);
+            assert_eq!(
+                eligible.native_format_for_shape(patch, &shapes[patch]),
+                LinearFormat::Dense
+            );
+            assert_eq!(shapes[projector], [64, 64]);
+            assert_eq!(
+                eligible.native_format_for_shape(projector, &shapes[projector]),
+                format.into()
+            );
+            let audio_projector = "model.embed_audio.embedding_projection.weight";
+            assert_eq!(shapes[audio_projector], [64, 48]);
+            assert_eq!(
+                eligible.native_format_for_shape(audio_projector, &shapes[audio_projector]),
+                LinearFormat::Dense
+            );
+        }
     }
 
     #[test]
@@ -8814,15 +9646,16 @@ mod tests {
         )
         .unwrap()
         .with_completion_policy(partitioned_test_completion_policy());
-        let error = crate::partitioned_execution::dispatch_partitioned_admission(
+        let admission = crate::partitioned_execution::dispatch_partitioned_admission(
             &inspection,
             request,
             CollectPartitionedAdmission,
         )
-        .unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("dense DeepSeek-V3 has no exact neutral partition constructor"));
+        .unwrap();
+        let CollectedPartitionedAdmission::Direct(admission) = admission else {
+            panic!("dense V3 must retain a direct selection without expert mechanisms");
+        };
+        assert!(admission.execution().grouped_operations().is_empty());
     }
 
     #[test]
@@ -8950,30 +9783,33 @@ mod tests {
             .requirements()
             .operations();
         assert_eq!(operations.len(), 4);
-        assert_eq!(
-            operations[0].operation(),
-            eredu_runtime::CommunicationOperation::AllReduceSum
-        );
-        assert_eq!(
-            operations[1].operation(),
-            eredu_runtime::CommunicationOperation::AllGatherUneven
-        );
-        assert_eq!(
-            operations[2].operation(),
-            eredu_runtime::CommunicationOperation::Broadcast
-        );
-        assert_eq!(
-            operations[3].operation(),
-            eredu_runtime::CommunicationOperation::FailureAgreement
-        );
-        let incomplete = eredu_runtime::CommunicationCapabilities::new([operations[0].clone()])
-            .unwrap()
-            .with_completion_capabilities(
-                eredu_runtime::CommunicationCompletionCapabilities::new([
-                    eredu_core::CompletionCancellationMode::QuarantineUntilComplete,
-                ])
-                .unwrap(),
+        for expected in [
+            eredu_runtime::CommunicationOperation::AllReduceSum,
+            eredu_runtime::CommunicationOperation::AllGatherUneven,
+            eredu_runtime::CommunicationOperation::Broadcast,
+            eredu_runtime::CommunicationOperation::FailureAgreement,
+        ] {
+            assert!(
+                operations
+                    .iter()
+                    .any(|operation| operation.operation() == expected),
+                "missing {expected:?}"
             );
+        }
+        let incomplete = eredu_runtime::CommunicationCapabilities::new([operations
+            .iter()
+            .find(|operation| {
+                operation.operation() == eredu_runtime::CommunicationOperation::AllReduceSum
+            })
+            .unwrap()
+            .clone()])
+        .unwrap()
+        .with_completion_capabilities(
+            eredu_runtime::CommunicationCompletionCapabilities::new([
+                eredu_core::CompletionCancellationMode::QuarantineUntilComplete,
+            ])
+            .unwrap(),
+        );
         assert!(incomplete
             .validate_manifest(requirements.communication())
             .unwrap_err()
@@ -9054,6 +9890,7 @@ mod tests {
             [
                 eredu_runtime::CommunicationOperation::AllGatherEven,
                 eredu_runtime::CommunicationOperation::VariableAllToAll,
+                eredu_runtime::CommunicationOperation::FailureAgreement,
             ]
         );
     }

@@ -44,6 +44,15 @@ where
     A::StaticModules: Clone,
     A::Error: std::fmt::Display,
 {
+    fn prediction_residency(
+        &mut self,
+    ) -> Result<
+        crate::composition::mlx::replicated_text::prediction::parameters::PredictionResidency,
+        Error,
+    > {
+        Ok(Default::default())
+    }
+
     fn finish<D>(
         self,
         completed: CompletedReplicatedText<A, S, D>,
@@ -96,6 +105,17 @@ where
             MlxEmbeddedPredictionMaterializer,
         > + 'static,
 {
+    fn prediction_residency(
+        &mut self,
+    ) -> Result<
+        crate::composition::mlx::replicated_text::prediction::parameters::PredictionResidency,
+        Error,
+    > {
+        crate::composition::mlx::replicated_text::prediction::parameters::residency::<A, P>(
+            &mut self.prediction.extension,
+        )
+    }
+
     fn finish<D>(
         self,
         completed: CompletedReplicatedText<A, S, D>,
@@ -144,13 +164,21 @@ where
         A::StaticModules: Clone,
         A::Error: std::fmt::Display,
     {
-        let prediction = SelectedPrediction {
+        let mut prediction = SelectedPrediction {
             extension,
             selected: self.selected,
         };
-        CompletedReplicatedText::new(prepared, store, self.stream, self.weights_stream)?
-            .with_prediction(prediction, self.capability)
-            .map(|model| Box::new(model) as Box<dyn ErasedReplicatedTextExecutable>)
+        let residency =
+            super::super::prediction::parameters::residency::<A, _>(&mut prediction.extension)?;
+        CompletedReplicatedText::new_with_residency(
+            prepared,
+            store,
+            self.stream,
+            self.weights_stream,
+            residency,
+        )?
+        .with_prediction(prediction, self.capability)
+        .map(|model| Box::new(model) as Box<dyn ErasedReplicatedTextExecutable>)
     }
 }
 

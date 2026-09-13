@@ -34,8 +34,8 @@ use eredu_core::SpeculativeCapability;
 use eredu_runtime::CacheResidencyPolicy;
 
 use super::{
-    execution::{decode_model, prefill_model},
-    Executable, MlxBackend, MlxCompletion, MlxDistributedSession, MlxModel,
+    execution::prefill_model, Executable, MlxBackend, MlxCompletion, MlxDistributedSession,
+    MlxModel,
 };
 
 pub(crate) mod bounded_capture;
@@ -48,6 +48,7 @@ mod text_snapshot;
 pub(super) use crate::backend::submission_recovery as recovery;
 
 pub use generation::{MlxTextGenerationState, MlxTextSamplingState};
+pub(in crate::composition::mlx) use model_session::SpeculativePartitionBinding;
 pub use model_session::{MlxModelInput, MlxModelSession, MlxNativeTextState};
 pub use output_completion::{
     MlxModelOutput, MlxSessionCompletion, MlxTextCompletion, MlxTextToken,

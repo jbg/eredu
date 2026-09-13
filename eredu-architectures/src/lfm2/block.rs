@@ -10,7 +10,8 @@ use eredu_nn::{
 use eredu_runtime::RuntimeStateComponents;
 
 use crate::decoder::{
-    Attention, AttentionInput, DecoderProjectionOperator, TensorParallelProjectionOperator,
+    Attention, AttentionInput, ComponentInstrumentation, DecoderProjectionOperator,
+    TensorParallelProjectionOperator,
 };
 
 use super::{FeedForward, ModelArgs, OperatorPolicy};
@@ -101,7 +102,7 @@ impl<B: NeuralBackend> ReplicatedBlock<B> {
                         context,
                     )
                 };
-                TokenMixer::Attention(Attention::from_parts(
+                let mut mixer = Attention::from_parts(
                     args.num_attention_heads,
                     args.num_key_value_heads,
                     head_dim,
@@ -121,7 +122,7 @@ impl<B: NeuralBackend> ReplicatedBlock<B> {
                     Some(norm("k_layernorm")?),
                     Some(B::rotary(
                         RotarySpec {
-                            arithmetic: eredu_nn::RotaryArithmetic::Native,
+                            arithmetic: eredu_nn::RotaryArithmetic::InputProducts,
                             dimensions: head_dim,
                             base: args.rope.theta,
                             traditional: false,
@@ -130,7 +131,11 @@ impl<B: NeuralBackend> ReplicatedBlock<B> {
                         context,
                     )?),
                     attention.sliding_window_i32().map_err(Error::backend)?,
-                )?)
+                )?;
+                // Match the released equation's input-dtype score and
+                // probability boundaries, including low-precision inference.
+                mixer.arithmetic = eredu_nn::AttentionArithmetic::InputScores;
+                TokenMixer::Attention(mixer)
             }
         };
         let normalization = |field: &str| {
@@ -167,33 +172,48 @@ impl<B: NeuralBackend> ReplicatedBlock<B> {
     where
         C: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
     {
-        let normalized = self.operator_norm.forward(hidden, context)?;
-        let mixed = match &mut self.mixer {
-            TokenMixer::Attention(attention) => attention.forward(
-                AttentionInput {
-                    hidden: &normalized,
-                    mask,
-                    cache: Some(&mut *state),
-                    allow_sliding_prefill: true,
-                    rotary_position: None,
-                },
-                context,
-            )?,
-            TokenMixer::ShortConvolution(convolution) => {
-                let role = StateTensorRole::Convolution { slot: 0 };
-                let result = {
-                    let history = state.fixed_component(role).map_err(Error::backend)?;
-                    convolution.forward(&normalized, history.as_ref(), context)?
-                };
-                *state.fixed_component(role).map_err(Error::backend)? = result.history;
-                state.advance_fixed(hidden.dim(1)).map_err(Error::backend)?;
-                result.output
-            }
-        };
-        let hidden = hidden.add(&mixed, context)?;
+        self.forward_instrumented(
+            hidden,
+            mask,
+            state,
+            context,
+            &mut ComponentInstrumentation::disabled(),
+        )
+    }
+
+    pub(crate) fn forward_instrumented<C>(
+        &mut self,
+        hidden: &B::Tensor,
+        mask: Option<&B::Tensor>,
+        state: &mut C,
+        context: &<B::Tensor as Tensor>::Context,
+        instrumentation: &mut ComponentInstrumentation<'_, B::Tensor>,
+    ) -> Result<B::Tensor, Error>
+    where
+        C: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
+    {
+        let hidden = forward_mixer::<B, C>(
+            &mut self.mixer,
+            &mut self.operator_norm,
+            hidden,
+            mask,
+            state,
+            None,
+            context,
+            instrumentation,
+        )?;
         let normalized = self.feed_forward_norm.forward(&hidden, context)?;
-        let feed_forward = self.feed_forward.forward(&normalized, context)?;
-        hidden.add(&feed_forward, context)
+        let normalized = instrumentation.apply("feed_forward.input", normalized)?;
+        let feed_forward =
+            self.feed_forward
+                .forward_instrumented(&normalized, None, context, instrumentation)?;
+        finish_feed_forward::<B>(
+            &hidden,
+            feed_forward,
+            "feed_forward.output",
+            context,
+            instrumentation,
+        )
     }
 }
 
@@ -293,7 +313,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> Block<B> {
                         context,
                     )
                 };
-                TokenMixer::Attention(Attention::from_parts(
+                let mut mixer = Attention::from_parts(
                     geometry.query_heads,
                     geometry.key_value_heads,
                     head_dim,
@@ -317,7 +337,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> Block<B> {
                     Some(norm("k_layernorm")?),
                     Some(B::rotary(
                         RotarySpec {
-                            arithmetic: eredu_nn::RotaryArithmetic::Native,
+                            arithmetic: eredu_nn::RotaryArithmetic::InputProducts,
                             dimensions: head_dim,
                             base: args.rope.theta,
                             traditional: false,
@@ -326,7 +346,11 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> Block<B> {
                         context,
                     )?),
                     attention.sliding_window_i32().map_err(Error::backend)?,
-                )?)
+                )?;
+                // Match the released equation's input-dtype score and
+                // probability boundaries, including low-precision inference.
+                mixer.arithmetic = eredu_nn::AttentionArithmetic::InputScores;
+                TokenMixer::Attention(mixer)
             }
         };
         let normalization = |field: &str| {
@@ -366,12 +390,15 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> Block<B> {
     where
         C: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
     {
-        self.forward_with_feed_forward(
+        self.forward_instrumented_with_feed_forward(
             hidden,
             mask,
             state,
             context,
-            |policy, normalized, context| policy.forward_feed_forward(normalized, context),
+            &mut ComponentInstrumentation::disabled(),
+            |policy, normalized, context, instrumentation| {
+                policy.forward_feed_forward_observed(normalized, context, instrumentation)
+            },
         )
     }
 
@@ -392,33 +419,92 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> Block<B> {
             &<B::Tensor as Tensor>::Context,
         ) -> Result<B::Tensor, Error>,
     {
-        let normalized = self.operator_norm.forward(hidden, context)?;
-        let mixed = match &mut self.mixer {
-            TokenMixer::Attention(attention) => attention.forward(
-                AttentionInput {
-                    hidden: &normalized,
-                    mask,
-                    cache: Some(&mut *state),
-                    allow_sliding_prefill: true,
-                    rotary_position: None,
-                },
-                context,
-            )?,
-            TokenMixer::ShortConvolution(convolution) => {
-                let role = StateTensorRole::Convolution { slot: 0 };
-                let result = {
-                    let history = state.fixed_component(role).map_err(Error::backend)?;
-                    convolution.forward(&normalized, history.as_ref(), context)?
-                };
-                *state.fixed_component(role).map_err(Error::backend)? = result.history;
-                state.advance_fixed(hidden.dim(1)).map_err(Error::backend)?;
-                result.output
-            }
-        };
-        let hidden = hidden.add(&mixed, context)?;
+        self.forward_instrumented_with_feed_forward(
+            hidden,
+            mask,
+            state,
+            context,
+            &mut ComponentInstrumentation::disabled(),
+            |policy, normalized, context, _| feed_forward(policy, normalized, context),
+        )
+    }
+
+    /// Executes shared residual equations with actual component boundaries.
+    pub fn forward_instrumented_with_feed_forward<C, F>(
+        &mut self,
+        hidden: &B::Tensor,
+        mask: Option<&B::Tensor>,
+        state: &mut C,
+        context: &<B::Tensor as Tensor>::Context,
+        instrumentation: &mut ComponentInstrumentation<'_, B::Tensor>,
+        feed_forward: F,
+    ) -> Result<B::Tensor, Error>
+    where
+        C: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
+        F: FnOnce(
+            &mut FeedForward<B>,
+            &B::Tensor,
+            &<B::Tensor as Tensor>::Context,
+            &mut ComponentInstrumentation<'_, B::Tensor>,
+        ) -> Result<B::Tensor, Error>,
+    {
+        self.forward_partition_instrumented_with_feed_forward(
+            hidden,
+            mask,
+            state,
+            None,
+            context,
+            instrumentation,
+            feed_forward,
+        )
+    }
+
+    /// Executes shared residual equations with actual component boundaries.
+    pub fn forward_partition_instrumented_with_feed_forward<C, F>(
+        &mut self,
+        hidden: &B::Tensor,
+        mask: Option<&B::Tensor>,
+        state: &mut C,
+        parallel: Option<&B::ParallelContext>,
+        context: &<B::Tensor as Tensor>::Context,
+        instrumentation: &mut ComponentInstrumentation<'_, B::Tensor>,
+        feed_forward: F,
+    ) -> Result<B::Tensor, Error>
+    where
+        C: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
+        F: FnOnce(
+            &mut FeedForward<B>,
+            &B::Tensor,
+            &<B::Tensor as Tensor>::Context,
+            &mut ComponentInstrumentation<'_, B::Tensor>,
+        ) -> Result<B::Tensor, Error>,
+    {
+        let hidden = forward_mixer::<B, C>(
+            &mut self.mixer,
+            &mut self.operator_norm,
+            hidden,
+            mask,
+            state,
+            parallel,
+            context,
+            instrumentation,
+        )?;
         let normalized = self.feed_forward_norm.forward(&hidden, context)?;
-        let feed_forward = feed_forward(&mut self.feed_forward, &normalized, context)?;
-        hidden.add(&feed_forward, context)
+        let normalized = instrumentation.apply("feed_forward.input", normalized)?;
+        let feed_forward = feed_forward(
+            &mut self.feed_forward,
+            &normalized,
+            context,
+            instrumentation,
+        )?;
+        let output_path = if matches!(self.feed_forward, FeedForward::Routed(_)) {
+            // The provider already owns feed_forward.output. This later boundary
+            // is the complete contribution entering residual addition.
+            "feed_forward.contribution"
+        } else {
+            "feed_forward.output"
+        };
+        finish_feed_forward::<B>(&hidden, feed_forward, output_path, context, instrumentation)
     }
 
     /// Executes the same block under tensor-parallel placement.
@@ -434,41 +520,46 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> Block<B> {
         C: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
         B: eredu_nn::TensorParallelGroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
     {
-        let normalized = self.operator_norm.forward(hidden, context)?;
-        let mixed = match &mut self.mixer {
-            TokenMixer::Attention(attention) => attention.forward_parallel(
-                AttentionInput {
-                    hidden: &normalized,
-                    mask,
-                    cache: Some(&mut *state),
-                    allow_sliding_prefill: true,
-                    rotary_position: None,
-                },
-                parallel,
-                context,
-            )?,
-            TokenMixer::ShortConvolution(convolution) => {
-                let role = StateTensorRole::Convolution { slot: 0 };
-                let result = {
-                    let history = state.fixed_component(role).map_err(Error::backend)?;
-                    convolution.forward_parallel(
-                        &normalized,
-                        history.as_ref(),
-                        parallel,
-                        context,
-                    )?
-                };
-                *state.fixed_component(role).map_err(Error::backend)? = result.history;
-                state.advance_fixed(hidden.dim(1)).map_err(Error::backend)?;
-                result.output
-            }
-        };
-        let hidden = hidden.add(&mixed, context)?;
-        let normalized = self.feed_forward_norm.forward(&hidden, context)?;
-        let feed_forward =
-            self.feed_forward
-                .forward_feed_forward_parallel(&normalized, parallel, context)?;
-        hidden.add(&feed_forward, context)
+        self.forward_parallel_observed(
+            hidden,
+            mask,
+            state,
+            parallel,
+            context,
+            &mut ComponentInstrumentation::disabled(),
+        )
+    }
+
+    /// Emits component values consumed by tensor-parallel projections.
+    pub fn forward_parallel_observed<C>(
+        &mut self,
+        hidden: &B::Tensor,
+        mask: Option<&B::Tensor>,
+        state: &mut C,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+        instrumentation: &mut ComponentInstrumentation<'_, B::Tensor>,
+    ) -> Result<B::Tensor, Error>
+    where
+        C: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
+        B: eredu_nn::TensorParallelGroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
+    {
+        self.forward_partition_instrumented_with_feed_forward(
+            hidden,
+            mask,
+            state,
+            Some(parallel),
+            context,
+            instrumentation,
+            |policy, normalized, context, instrumentation| {
+                policy.forward_feed_forward_parallel_observed(
+                    normalized,
+                    parallel,
+                    context,
+                    instrumentation,
+                )
+            },
+        )
     }
 
     /// Executes tensor-partitioned token mixing while delegating feed-forward
@@ -491,40 +582,113 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> Block<B> {
             &<B::Tensor as Tensor>::Context,
         ) -> Result<B::Tensor, Error>,
     {
-        let normalized = self.operator_norm.forward(hidden, context)?;
-        let mixed = match &mut self.mixer {
-            TokenMixer::Attention(attention) => attention.forward_parallel(
-                AttentionInput {
-                    hidden: &normalized,
-                    mask,
-                    cache: Some(&mut *state),
-                    allow_sliding_prefill: true,
-                    rotary_position: None,
-                },
-                parallel,
-                context,
-            )?,
-            TokenMixer::ShortConvolution(convolution) => {
-                let role = StateTensorRole::Convolution { slot: 0 };
-                let result = {
-                    let history = state.fixed_component(role).map_err(Error::backend)?;
-                    convolution.forward_parallel(
+        self.forward_partition_instrumented_with_feed_forward(
+            hidden,
+            mask,
+            state,
+            Some(parallel),
+            context,
+            &mut ComponentInstrumentation::disabled(),
+            |policy, normalized, context, _| feed_forward(policy, normalized, parallel, context),
+        )
+    }
+}
+
+/// Attention and convolution share residual ordering and state ownership; only
+/// attention has scalar aggregated-channel declarations.
+#[allow(clippy::too_many_arguments)]
+fn forward_mixer<B: NeuralBackend, C>(
+    mixer: &mut TokenMixer<B>,
+    normalization: &mut B::Normalization,
+    hidden: &B::Tensor,
+    mask: Option<&B::Tensor>,
+    state: &mut C,
+    parallel: Option<&B::ParallelContext>,
+    context: &<B::Tensor as Tensor>::Context,
+    instrumentation: &mut ComponentInstrumentation<'_, B::Tensor>,
+) -> Result<B::Tensor, Error>
+where
+    C: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
+{
+    let attention = matches!(mixer, TokenMixer::Attention(_));
+    let normalized = normalization.forward(hidden, context)?;
+    let normalized = instrumentation.apply(
+        if attention {
+            "attention.input"
+        } else {
+            "mixer.input"
+        },
+        normalized,
+    )?;
+    let mixed = match mixer {
+        TokenMixer::Attention(attention) => attention.forward_instrumented(
+            AttentionInput {
+                hidden: &normalized,
+                mask,
+                cache: Some(&mut *state),
+                allow_sliding_prefill: true,
+                rotary_position: None,
+            },
+            parallel,
+            context,
+            instrumentation,
+        )?,
+        TokenMixer::ShortConvolution(convolution) => {
+            let role = StateTensorRole::Convolution { slot: 0 };
+            let result = {
+                let history = state.fixed_component(role).map_err(Error::backend)?;
+                match parallel {
+                    Some(parallel) => convolution.forward_parallel(
                         &normalized,
                         history.as_ref(),
                         parallel,
                         context,
-                    )?
-                };
-                *state.fixed_component(role).map_err(Error::backend)? = result.history;
-                state.advance_fixed(hidden.dim(1)).map_err(Error::backend)?;
-                result.output
-            }
-        };
-        let hidden = hidden.add(&mixed, context)?;
-        let normalized = self.feed_forward_norm.forward(&hidden, context)?;
-        let feed_forward = feed_forward(&mut self.feed_forward, &normalized, parallel, context)?;
-        hidden.add(&feed_forward, context)
-    }
+                    )?,
+                    None => convolution.forward(&normalized, history.as_ref(), context)?,
+                }
+            };
+            *state.fixed_component(role).map_err(Error::backend)? = result.history;
+            state.advance_fixed(hidden.dim(1)).map_err(Error::backend)?;
+            result.output
+        }
+    };
+    let mixed = instrumentation.apply(
+        if attention {
+            "attention.write"
+        } else {
+            "mixer.write"
+        },
+        mixed,
+    )?;
+    let mixed = instrumentation.apply(
+        if attention {
+            "attention.output"
+        } else {
+            "mixer.output"
+        },
+        mixed,
+    )?;
+    let hidden = hidden.add(&mixed, context)?;
+    instrumentation.apply(
+        if attention {
+            "attention.residual"
+        } else {
+            "mixer.residual"
+        },
+        hidden,
+    )
+}
+
+fn finish_feed_forward<B: NeuralBackend>(
+    hidden: &B::Tensor,
+    feed_forward: B::Tensor,
+    output_path: &str,
+    context: &<B::Tensor as Tensor>::Context,
+    instrumentation: &mut ComponentInstrumentation<'_, B::Tensor>,
+) -> Result<B::Tensor, Error> {
+    let feed_forward = instrumentation.apply("feed_forward.write", feed_forward)?;
+    let feed_forward = instrumentation.apply(output_path, feed_forward)?;
+    instrumentation.apply("feed_forward.residual", hidden.add(&feed_forward, context)?)
 }
 
 fn short_convolution_spec(

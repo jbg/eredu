@@ -73,6 +73,7 @@ pub struct ResidencyReport {
     units: Vec<UnitResidencyReport>,
     active_window: Vec<OffloadUnitId>,
     weight_store: WeightStoreDiagnostics,
+    unit_sources: BTreeMap<OffloadUnitId, WeightStoreDiagnostics>,
     materialization: Option<WeightMaterializationReport>,
 }
 
@@ -91,6 +92,7 @@ impl ResidencyReport {
             units,
             active_window,
             weight_store,
+            unit_sources: BTreeMap::new(),
             materialization: None,
         }
     }
@@ -118,6 +120,21 @@ impl ResidencyReport {
     /// Returns storage diagnostics, distinct from logical residency telemetry.
     pub const fn weight_store(&self) -> &WeightStoreDiagnostics {
         &self.weight_store
+    }
+
+    /// Diagnostics for units backed by distinct exact source views. Views may
+    /// share physical storage or counters, so these reports are not additive.
+    pub fn unit_sources(&self) -> &BTreeMap<OffloadUnitId, WeightStoreDiagnostics> {
+        &self.unit_sources
+    }
+
+    /// Attaches source-view diagnostics without changing the shared residency ledger.
+    pub fn with_unit_sources(
+        mut self,
+        sources: BTreeMap<OffloadUnitId, WeightStoreDiagnostics>,
+    ) -> Self {
+        self.unit_sources = sources;
+        self
     }
 
     /// Returns bounded load-time materialization telemetry for these units.
@@ -835,6 +852,17 @@ impl ResidencyController {
         plan: OffloadPlan,
         units: impl IntoIterator<Item = OffloadUnit>,
     ) -> Result<Self, ResidencyControllerError> {
+        Self::new_with_catalogs(|_| catalog, plan, units)
+    }
+
+    /// Validates each physical unit against its own retained source catalog,
+    /// while all units consume one residency plan and reservation ledger.
+    /// Identical source keys in different catalogs need not name the same value.
+    pub fn new_with_catalogs<'a, C: RecipeCatalog + ?Sized + 'a>(
+        catalog_for_unit: impl Fn(&OffloadUnitId) -> &'a C,
+        plan: OffloadPlan,
+        units: impl IntoIterator<Item = OffloadUnit>,
+    ) -> Result<Self, ResidencyControllerError> {
         let mut definitions = BTreeMap::new();
         for unit in units {
             let id = unit.id().clone();
@@ -863,6 +891,7 @@ impl ResidencyController {
             let unit = definitions
                 .get(spec.id())
                 .expect("definition identity validated above");
+            let catalog = catalog_for_unit(unit.id());
             let mut total = 0u64;
             for binding in unit.bindings().iter().filter(|binding| !binding.is_alias()) {
                 total = total.checked_add(binding.expected_bytes()).ok_or(
@@ -2135,6 +2164,75 @@ mod tests {
         let (resolved_unit, resolved) = controller.binding_owner(&alias_id, alias).unwrap();
         assert_eq!(resolved_unit, &owner_id);
         assert_eq!(resolved.logical_target(), Some("shared.owner"));
+    }
+
+    #[test]
+    fn controller_uses_exact_unit_catalogs_with_one_shared_budget() {
+        let ids = ["target", "extension"].map(|name| OffloadUnitId::new(name).unwrap());
+        let first = Catalog(BTreeMap::from([(
+            "weight".into(),
+            metadata("weight", vec![1]),
+        )]));
+        let second = Catalog(BTreeMap::from([(
+            "weight".into(),
+            metadata("weight", vec![2]),
+        )]));
+        let units = ids
+            .iter()
+            .zip([4, 8])
+            .map(|(id, bytes)| {
+                OffloadUnit::new(
+                    id.clone(),
+                    [
+                        WeightBinding::new("weight", "weight", TensorSelection::Full, bytes)
+                            .unwrap(),
+                    ],
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let plan = OffloadPlan::new(
+            OffloadConfig::new(Some(8), None, 1).unwrap(),
+            ids.iter().zip([4, 8]).map(|(id, bytes)| {
+                OffloadUnitSpec::new(
+                    id.clone(),
+                    bytes,
+                    ResidencyPolicy::Cacheable,
+                    MemoryTier::Disk,
+                )
+                .unwrap()
+            }),
+        )
+        .unwrap();
+        assert!(matches!(
+            ResidencyController::new(&first, plan.clone(), units.clone()),
+            Err(ResidencyControllerError::BindingByteMismatch { .. })
+        ));
+        let mut controller = ResidencyController::new_with_catalogs(
+            |id| if id == &ids[0] { &first } else { &second },
+            plan,
+            units,
+        )
+        .unwrap();
+        controller.ledger_mut().mark_initialized();
+        let acquisition = controller
+            .plan_acquisition(&ids, MemoryTier::Device)
+            .unwrap();
+        assert!(controller
+            .reserve_acquisition(
+                &acquisition,
+                &[(ids[0].clone(), 4), (ids[1].clone(), 8)],
+                MemoryTier::Device
+            )
+            .is_err());
+        assert_eq!(
+            controller
+                .ledger()
+                .telemetry()
+                .resident_bytes()
+                .get(MemoryTier::Device),
+            0
+        );
     }
 
     #[test]

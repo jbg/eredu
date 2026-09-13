@@ -37,7 +37,7 @@ impl RoutedExpertProvider<B> for Probe {
     fn forward_grouped(
         &mut self,
         _: &mut <B as GroupedNeuralBackend>::GatedProductGroups,
-        request: RoutedExpertRequest<'_, MlxTensor>,
+        request: RoutedExpertRequest<'_, '_, MlxTensor>,
         stream: &Stream,
     ) -> Result<MlxTensor, Self::Error> {
         assert!(
@@ -80,7 +80,7 @@ impl RoutedExpertProvider<B> for Probe {
     fn forward_linear_routed(
         &mut self,
         _: &mut <B as GroupedNeuralBackend>::LinearGroups,
-        _: RoutedExpertRequest<'_, MlxTensor>,
+        _: RoutedExpertRequest<'_, '_, MlxTensor>,
         _: &Stream,
     ) -> Result<MlxTensor, Self::Error> {
         unreachable!()
@@ -89,7 +89,7 @@ impl RoutedExpertProvider<B> for Probe {
     fn forward_relu2_routed(
         &mut self,
         _: &mut <B as GroupedNeuralBackend>::Relu2Groups,
-        _: RoutedExpertRequest<'_, MlxTensor>,
+        _: RoutedExpertRequest<'_, '_, MlxTensor>,
         _: &Stream,
     ) -> Result<MlxTensor, Self::Error> {
         unreachable!()

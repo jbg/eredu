@@ -22,11 +22,7 @@ impl PlannedResidentBank {
         bank: &SelectedRoutedBank,
         exchange: bool,
     ) -> Result<Self, RoutedTextExecutionError> {
-        let routes = bank
-            .routes_by_unit
-            .iter()
-            .map(|(unit, count)| (*unit, if exchange { 1 } else { *count }))
-            .collect::<BTreeMap<_, _>>();
+        let routes = bank.plan.partition_routes(&bank.routes_by_unit, exchange);
         let maximum = routes.values().copied().max().unwrap_or(0);
         Ok(match &bank.plan {
             RoutedGroupedPlan::Gated(plan) => {
@@ -79,6 +75,7 @@ impl PlannedResidentBank {
                     owner_group,
                     plan,
                     routes_by_unit,
+                    partition_unit_coordinates: None,
                 })
             }
             RoutedGroupedPlan::Relu2(plan) => {
@@ -131,14 +128,12 @@ where
         movement: Movement,
         options: eredu_runtime::ParameterBankLoadOptions,
     ) -> Result<Self, RoutedTextExecutionError> {
-        let routes = if exchange {
-            1
-        } else {
-            selected.routes_per_token
-        };
+        let routes = selected
+            .plan
+            .partition_routes(&selected.routes_by_unit, exchange);
         Ok(match &selected.plan {
             RoutedGroupedPlan::Gated(plan) => {
-                Self::Gated(PlannedAddressableGatedProduct::new_partitioned(
+                Self::Gated(PlannedAddressableGatedProduct::new_partitioned_with_routes(
                     selected.owner_group.clone(),
                     plan.clone(),
                     selected.catalog.clone(),
@@ -150,7 +145,7 @@ where
                 )?)
             }
             RoutedGroupedPlan::Relu2(plan) => {
-                Self::Relu2(PlannedAddressableRelu2::new_partitioned(
+                Self::Relu2(PlannedAddressableRelu2::new_partitioned_with_routes(
                     selected.owner_group.clone(),
                     plan.clone(),
                     selected.catalog.clone(),
@@ -162,7 +157,7 @@ where
                 )?)
             }
             RoutedGroupedPlan::Linear(plan) => {
-                Self::Linear(PlannedAddressableLinear::new_partitioned(
+                Self::Linear(PlannedAddressableLinear::new_partitioned_with_routes(
                     selected.owner_group.clone(),
                     plan.clone(),
                     selected.catalog.clone(),
@@ -233,6 +228,15 @@ where
             }
         })
     }
+    /// Borrows the retained generic storage owner.
+    pub fn bank_storage(&self) -> &Bank {
+        match self {
+            Self::Gated(p) => p.bank_storage(),
+            Self::Relu2(p) => p.bank_storage(),
+            Self::Linear(p) => p.bank_storage(),
+        }
+    }
+
     /// Reports one bank without erasing its storage's report type.
     pub fn bank_report(&self) -> Result<Bank::Report, RoutedTextExecutionError> {
         match self {
@@ -251,7 +255,7 @@ where
     fn forward_grouped(
         &mut self,
         resident: &mut B::GatedProductGroups,
-        request: RoutedExpertRequest<'_, B::Tensor>,
+        request: RoutedExpertRequest<'_, '_, B::Tensor>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error> {
         match self {
@@ -269,7 +273,7 @@ where
     fn forward_compact_grouped(
         &mut self,
         resident: &mut B::GatedProductGroups,
-        request: RoutedExpertRequest<'_, B::Tensor>,
+        request: RoutedExpertRequest<'_, '_, B::Tensor>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error> {
         match self {
@@ -287,7 +291,7 @@ where
     fn forward_relu2_routed(
         &mut self,
         resident: &mut B::Relu2Groups,
-        request: RoutedExpertRequest<'_, B::Tensor>,
+        request: RoutedExpertRequest<'_, '_, B::Tensor>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error> {
         match self {
@@ -305,7 +309,7 @@ where
     fn forward_linear_routed(
         &mut self,
         resident: &mut B::LinearGroups,
-        request: RoutedExpertRequest<'_, B::Tensor>,
+        request: RoutedExpertRequest<'_, '_, B::Tensor>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error> {
         match self {
@@ -338,9 +342,14 @@ where
                         "resident linear bank differs from selected plan".into(),
                     ));
                 }
+                if request.unit_observer.is_some() {
+                    return Err(RoutedTextExecutionError::Contract(
+                        eredu_nn::GroupedUnitError::Unavailable.to_string(),
+                    ));
+                }
                 resident
                     .forward_grouped(request.input, request.routes, context)
-                    .map_err(|e| RoutedTextExecutionError::Mechanism(e.to_string()))
+                    .map_err(RoutedTextExecutionError::from_error)
             }
         }
     }
@@ -358,7 +367,7 @@ where
     fn forward_grouped(
         &mut self,
         resident: &mut B::GatedProductGroups,
-        request: RoutedExpertRequest<'_, B::Tensor>,
+        request: RoutedExpertRequest<'_, '_, B::Tensor>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error> {
         match self {
@@ -376,7 +385,7 @@ where
     fn forward_compact_grouped(
         &mut self,
         resident: &mut B::GatedProductGroups,
-        request: RoutedExpertRequest<'_, B::Tensor>,
+        request: RoutedExpertRequest<'_, '_, B::Tensor>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error> {
         match self {
@@ -394,7 +403,7 @@ where
     fn forward_relu2_routed(
         &mut self,
         resident: &mut B::Relu2Groups,
-        request: RoutedExpertRequest<'_, B::Tensor>,
+        request: RoutedExpertRequest<'_, '_, B::Tensor>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error> {
         match self {
@@ -412,7 +421,7 @@ where
     fn forward_linear_routed(
         &mut self,
         resident: &mut B::LinearGroups,
-        request: RoutedExpertRequest<'_, B::Tensor>,
+        request: RoutedExpertRequest<'_, '_, B::Tensor>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error> {
         match self {
@@ -549,6 +558,9 @@ impl RoutedBankRequirements {
         catalog: ExpertResidencyCatalog,
         routes_by_unit: BTreeMap<usize, usize>,
     ) -> Result<Self, RoutedTextRequirementsError> {
+        let plan = plan
+            .with_catalog_distribution(&catalog)
+            .map_err(RoutedTextRequirementsError::Invalid)?;
         macro_rules! validate {
             ($operation:ty, $plan:expr) => {{
                 validate_routes_by_unit::<$operation>($plan, &routes_by_unit)?;
@@ -650,7 +662,7 @@ where
     fn forward_grouped_tensor_parallel(
         &mut self,
         resident: &mut B::GatedProductGroups,
-        request: RoutedExpertRequest<'_, B::Tensor>,
+        request: RoutedExpertRequest<'_, '_, B::Tensor>,
         partitions: usize,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<eredu_runtime::RoutedExpertTensorParallelOutput<B::Tensor>, Self::Error> {
@@ -663,7 +675,7 @@ where
     fn forward_compact_grouped_tensor_parallel(
         &mut self,
         resident: &mut B::GatedProductGroups,
-        request: RoutedExpertRequest<'_, B::Tensor>,
+        request: RoutedExpertRequest<'_, '_, B::Tensor>,
         partitions: usize,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<eredu_runtime::RoutedExpertTensorParallelOutput<B::Tensor>, Self::Error> {
@@ -676,7 +688,7 @@ where
     fn forward_relu2_routed_tensor_parallel(
         &mut self,
         resident: &mut B::Relu2Groups,
-        request: RoutedExpertRequest<'_, B::Tensor>,
+        request: RoutedExpertRequest<'_, '_, B::Tensor>,
         partitions: usize,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<eredu_runtime::RoutedExpertTensorParallelOutput<B::Tensor>, Self::Error> {
@@ -700,7 +712,7 @@ where
     fn forward_grouped_tensor_parallel(
         &mut self,
         resident: &mut B::GatedProductGroups,
-        request: RoutedExpertRequest<'_, B::Tensor>,
+        request: RoutedExpertRequest<'_, '_, B::Tensor>,
         partitions: usize,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<eredu_runtime::RoutedExpertTensorParallelOutput<B::Tensor>, Self::Error> {
@@ -713,7 +725,7 @@ where
     fn forward_compact_grouped_tensor_parallel(
         &mut self,
         resident: &mut B::GatedProductGroups,
-        request: RoutedExpertRequest<'_, B::Tensor>,
+        request: RoutedExpertRequest<'_, '_, B::Tensor>,
         partitions: usize,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<eredu_runtime::RoutedExpertTensorParallelOutput<B::Tensor>, Self::Error> {
@@ -726,7 +738,7 @@ where
     fn forward_relu2_routed_tensor_parallel(
         &mut self,
         resident: &mut B::Relu2Groups,
-        request: RoutedExpertRequest<'_, B::Tensor>,
+        request: RoutedExpertRequest<'_, '_, B::Tensor>,
         partitions: usize,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<eredu_runtime::RoutedExpertTensorParallelOutput<B::Tensor>, Self::Error> {

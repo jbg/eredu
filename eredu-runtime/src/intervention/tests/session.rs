@@ -3,14 +3,14 @@ use std::sync::{Arc, Mutex};
 
 mod checkpoints;
 
-struct Facts {
+pub(super) struct Facts {
     max_index: u64,
     bytes_per_row: u64,
     unavailable: bool,
     calls: Mutex<Vec<u64>>,
 }
 impl Facts {
-    fn new(bytes: u64) -> Self {
+    pub(super) fn new(bytes: u64) -> Self {
         Self {
             max_index: u64::MAX,
             bytes_per_row: bytes,
@@ -20,6 +20,33 @@ impl Facts {
     }
 }
 impl InterventionEstimator for Facts {
+    fn activation_usage(
+        &self,
+        source: &[u64],
+        slice: &ResolvedCaptureSlice,
+        _: &InterventionAction,
+    ) -> Result<CaptureUsage, CaptureError> {
+        let elements = |shape: &[u64]| {
+            shape
+                .iter()
+                .try_fold(1u64, |n, d| n.checked_mul(*d).ok_or(CaptureError::Overflow))
+        };
+        let bytes = elements(source)?
+            .checked_add(
+                elements(&slice.shape)?
+                    .checked_mul(3)
+                    .ok_or(CaptureError::Overflow)?,
+            )
+            .and_then(|n| n.checked_mul(8))
+            .ok_or(CaptureError::Overflow)?;
+        Ok(CaptureUsage {
+            captures: 0,
+            retained_bytes: bytes,
+            host_bytes: bytes,
+            encoded_bytes: 0,
+        })
+    }
+
     fn validate_geometry(
         &self,
         source: &[u64],
@@ -56,7 +83,7 @@ impl InterventionEstimator for Facts {
         })
     }
 }
-fn discovery(plan: &AdmittedInterventionPlan) -> InterventionDiscovery {
+pub(super) fn discovery(plan: &AdmittedInterventionPlan) -> InterventionDiscovery {
     InterventionDiscovery {
         schema_version: 1,
         artifact_identity: plan.artifact_identity().into(),
@@ -86,6 +113,7 @@ fn routed(evidence: bool) -> (AdmittedCapturePlan, AdmittedInterventionPlan) {
         prefill: ObservationSupportStatus::Supported,
         decode: ObservationSupportStatus::Supported,
         conditions: vec![],
+        routed_units: None,
         routing: Some(InterventionRoutingPolicy {
             expert_count: 4,
             top_k: 2,
@@ -319,6 +347,87 @@ fn shared_observer_attributes_routing_failures_and_missing_targets() {
     assert!(matches!(
         session.take_step().unwrap().interventions[0].outcome,
         InterventionOutcome::Failed { .. }
+    ));
+}
+
+#[test]
+fn observer_step_admission_uses_actual_forward_phase_and_defers_all_work() {
+    use crate::ActivationObserver;
+    let (capture, _) = plans(vec![], true);
+    let mut session = CaptureSession::new(capture);
+    {
+        let _observer = CaptureObserver::for_step(
+            &mut session,
+            Backend::default(),
+            0,
+            |error: CaptureExecutionError<<Backend as CaptureBackend>::Error>| error,
+        );
+    }
+    assert_eq!(session.cumulative_usage(), CaptureUsage::default());
+    assert!(session.take_step().is_none());
+    let mut epoch = eredu_core::DistributedCommitEpoch::FIRST;
+    for (pass, phase, prediction, input) in [
+        (
+            crate::ExpertPass::Prefill,
+            CapturePhase::Prefill,
+            0,
+            Value {
+                shape: vec![2, 2],
+                data: vec![1., -3., 5., 7.],
+            },
+        ),
+        (
+            crate::ExpertPass::Decode,
+            CapturePhase::Decode,
+            1,
+            Value {
+                shape: vec![1, 2],
+                data: vec![-2., 4.],
+            },
+        ),
+    ] {
+        let mut observer =
+            CaptureObserver::for_step(&mut session, Backend::default(), prediction, |error| error);
+        observer.prepare_transaction(epoch, pass).unwrap();
+        observer.observe("block.output", &input).unwrap();
+        observer.complete_transaction(epoch).unwrap();
+        observer.finish_transaction(epoch, true);
+        drop(observer);
+        let step = session.take_step().unwrap();
+        assert_eq!((step.phase, step.prediction_index), (phase, prediction));
+        assert_eq!(values(&step.records[0]), &input.data[..2]);
+        epoch = epoch.next().unwrap();
+    }
+}
+
+#[test]
+fn failed_step_admission_retains_epoch_and_cannot_complete() {
+    use crate::ActivationObserver;
+    let (capture, _) = plans(vec![], true);
+    let mut session = CaptureSession::new(capture);
+    // Exhaust cumulative capacity, so begin_step's envelope reservation fails.
+    let capacity = session.plan().plan().limits.cumulative;
+    session.ledger.reserve(capacity).unwrap();
+    let epoch = eredu_core::DistributedCommitEpoch::FIRST;
+    let mut observer =
+        CaptureObserver::for_step(&mut session, Backend::default(), 0, |error| error);
+    assert!(matches!(
+        observer.prepare_transaction(epoch, crate::ExpertPass::Prefill),
+        Err(CaptureExecutionError::Admission(CaptureError::Limit {
+            cumulative: true,
+            ..
+        }))
+    ));
+    assert!(observer.complete_transaction(epoch).is_err());
+    observer.finish_transaction(epoch, false);
+    drop(observer);
+    assert!(session.take_step().is_none());
+    assert!(!session.checkpoint_ready);
+    assert_eq!(session.cumulative_usage(), capacity);
+    let mut retry = CaptureObserver::for_step(&mut session, Backend::default(), 0, |error| error);
+    assert!(matches!(
+        retry.prepare_transaction(epoch, crate::ExpertPass::Prefill),
+        Err(CaptureExecutionError::Admission(CaptureError::Invalid(_)))
     ));
 }
 

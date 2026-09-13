@@ -658,54 +658,19 @@ impl NeuralBackend for MlxNeuralBackend {
                 context,
             ))?;
         }
-        let extent = input.profiles.dim(3);
-        let gather = compute(clip(&distances, (0, extent - 1), context))?;
-        let gather = compute(gather.as_dtype(Dtype::Int32, context))?;
-        let gather = compute(gather.try_index_device((NewAxis, NewAxis, .., ..), context))?;
-        let gather = compute(broadcast_to(
-            &gather,
-            &[batch, heads, query_len, key_len],
-            context,
-        ))?;
-        let mut bias = compute(take_along_axis(
-            input.profiles.as_array(),
-            &gather,
-            -1,
-            context,
-        ))?;
-        let relative_valid = compute(
-            compute(distances.ge(Array::from_int(0), context))?.logical_and(
-                &compute(distances.lt(Array::from_int(extent), context))?,
-                context,
-            ),
+        let relative = compute(
+            crate::backend::nn::relative_attention::RelativeAttentionKernel::new(&input, context),
         )?;
-        bias = compute(r#where(
-            &relative_valid,
-            bias,
-            Array::from_f32(0.0),
+        let bias = compute(relative.bias(
+            i64::from(input.key_offset),
+            i64::from(input.key_offset) + i64::from(key_len),
             context,
         ))?;
-        let mut queries = input.queries.as_array().clone();
-        if input.window.is_none() {
-            if let Some(floor) = input.log_scaling_floor {
-                let positions = compute(arange::<i32, i32>(
-                    input.query_offset + 1,
-                    input.query_offset + query_len + 1,
-                    1,
-                    context,
-                ))?;
-                let positions = compute(positions.as_dtype(Dtype::Float32, context))?;
-                let ratio = compute(positions.divide(Array::from_f32(floor as f32), context))?;
-                let ratio = compute(maximum(ratio, Array::from_f32(1.0), context))?;
-                let tau = compute(ratio.log(context))?;
-                let tau = compute(tau.multiply(Array::from_f32(input.log_scaling_alpha), context))?;
-                let tau = compute(tau.add(Array::from_f32(1.0), context))?;
-                let tau = compute(tau.reshape(&[1, 1, query_len, 1], context))?;
-                queries = compute(queries.multiply(&tau, context))?;
-                bias = compute(bias.multiply(&tau, context))?;
-            }
-        }
-        let scaled = compute(queries.multiply(Array::from_f32(1.0 / dimensions as f32), context))?;
+        let scaled = compute(
+            relative
+                .queries
+                .multiply(Array::from_f32(1.0 / dimensions as f32), context),
+        )?;
         let scores = compute(matmul(
             &scaled,
             &compute(keys.swap_axes(-1, -2, context))?,
@@ -934,7 +899,7 @@ impl NeuralBackend for MlxNeuralBackend {
         context: &Stream,
     ) -> Result<MlxTensor, ComputeError> {
         eredu_nn::operation_geometry::NormalizationGeometry::new(input.shape(), epsilon)?;
-        let output = compute(safemlx::fast::rms_norm(
+        let output = compute(super::super::normalization::input_precision_rms(
             input.as_array(),
             weight.as_array(),
             epsilon,
@@ -994,6 +959,16 @@ impl NeuralBackend for MlxNeuralBackend {
                 .module
                 .forward_row_parallel(input.as_array(), parallel, context),
         )
+    }
+
+    fn row_parallel_linear_with_input_observer(
+        linear: &mut MlxLinear,
+        input: &MlxTensor,
+        parallel: &Group,
+        context: &Stream,
+        observer: Option<&mut dyn eredu_nn::ProjectionInputObserver<MlxTensor>>,
+    ) -> Result<MlxTensor, ComputeError> {
+        linear.forward_observed_input(input, Some(parallel), context, observer)
     }
 
     fn parallel_size(parallel: &Group) -> usize {
@@ -1097,26 +1072,33 @@ impl eredu_nn::DistributedNeuralBackend for MlxNeuralBackend {
         parallel: &Group,
         context: &Stream,
     ) -> Result<MlxTensor, ComputeError> {
+        Self::vocabulary_parallel_project_with_input_observer(
+            linear, input, parallel, context, None,
+        )
+    }
+
+    fn vocabulary_parallel_project_with_input_observer(
+        linear: &mut MlxLinear,
+        input: &MlxTensor,
+        parallel: &Group,
+        context: &Stream,
+        observer: Option<&mut dyn eredu_nn::ProjectionInputObserver<MlxTensor>>,
+    ) -> Result<MlxTensor, ComputeError> {
         let range = linear
             .vocabulary_range
-            .as_ref()
+            .clone()
             .ok_or_else(|| ComputeError::backend("projection has no vocabulary ownership"))?;
-        let local = compute(linear.module.forward(input.as_array(), context))?;
         let widths = range
             .balanced_peer_widths(parallel.size(), parallel.rank())
             .map_err(ComputeError::backend)?;
-        compute_tensor(
-            crate::backend::distributed::all_gather_uneven_axis(
-                &local, -1, &widths, parallel, context,
-            )
-            .map_err(|error| {
-                safemlx::error::Exception::custom(format!(
-                    "vocabulary projection gather failed for local range {:?}, shape {:?}, and widths {widths:?}: {error}",
-                    range.local,
-                    local.shape(),
-                ))
-            }),
-        )
+        let local = linear.forward_with_input_observer(input, context, observer)?;
+        compute_tensor(crate::backend::distributed::all_gather_uneven_axis(
+            local.as_array(),
+            -1,
+            &widths,
+            parallel,
+            context,
+        ))
     }
 
     fn vocabulary_parallel_embedding_project(
@@ -1125,26 +1107,33 @@ impl eredu_nn::DistributedNeuralBackend for MlxNeuralBackend {
         parallel: &Group,
         context: &Stream,
     ) -> Result<MlxTensor, ComputeError> {
+        Self::vocabulary_parallel_embedding_project_with_input_observer(
+            embedding, input, parallel, context, None,
+        )
+    }
+
+    fn vocabulary_parallel_embedding_project_with_input_observer(
+        embedding: &mut MlxEmbedding,
+        input: &MlxTensor,
+        parallel: &Group,
+        context: &Stream,
+        observer: Option<&mut dyn eredu_nn::ProjectionInputObserver<MlxTensor>>,
+    ) -> Result<MlxTensor, ComputeError> {
         let range = embedding
             .vocabulary_range
             .clone()
             .ok_or_else(|| ComputeError::backend("embedding has no vocabulary ownership"))?;
-        let local = compute(embedding.module.as_linear(input.as_array(), context))?;
         let widths = range
             .balanced_peer_widths(parallel.size(), parallel.rank())
             .map_err(ComputeError::backend)?;
-        compute_tensor(
-            crate::backend::distributed::all_gather_uneven_axis(
-                &local, -1, &widths, parallel, context,
-            )
-            .map_err(|error| {
-                safemlx::error::Exception::custom(format!(
-                    "tied vocabulary projection gather failed for local range {:?}, shape {:?}, and widths {widths:?}: {error}",
-                    range.local,
-                    local.shape(),
-                ))
-            }),
-        )
+        let local = embedding.as_linear_with_input_observer(input, context, observer)?;
+        compute_tensor(crate::backend::distributed::all_gather_uneven_axis(
+            local.as_array(),
+            -1,
+            &widths,
+            parallel,
+            context,
+        ))
     }
 
     fn sum_parallel(

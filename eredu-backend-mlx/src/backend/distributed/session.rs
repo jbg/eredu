@@ -14,9 +14,44 @@ pub struct MlxDistributedSession {
     stream: Stream,
     world: NativeGroup,
     pub(super) authority: eredu_runtime::PartitionCommunicationAuthority,
+    preparation: Option<Arc<eredu_runtime::run_preparation::TextPreparationCoordinator>>,
+    parameter_operations:
+        Option<Arc<eredu_runtime::parameter_operations::ParameterOperationCoordinator>>,
 }
 
 impl MlxDistributedSession {
+    /// Completes an already constructed ordinary source graph without a host
+    /// tensor copy. The retained world also fences every logical group sharing
+    /// that native communicator. The nested recovery scope keeps the enclosing
+    /// model submission live until this source reaches native terminal evidence.
+    pub(crate) fn prepare_capture_source(
+        &self,
+        tensor: &MlxTensor,
+        stream: &Stream,
+        wait: eredu_core::BoundedCompletionWait,
+    ) -> Result<eredu_core::BoundedCompletionOutcome, Error> {
+        use eredu_core::BoundedCompletion;
+        self.ensure_active()?;
+        let operation = eredu_runtime::CommunicationOperation::FailureAgreement;
+        let completion = MlxCommunicationCompletion::submit(
+            [tensor.as_array()],
+            vec![tensor.as_array().clone()],
+            vec![],
+            vec![self.communicators.control_world().clone()],
+            vec![],
+            vec![stream.clone()],
+        )
+        .map_err(|error| self.submission_error(error, operation))?;
+        completion
+            .with_authority(
+                self.authority.clone(),
+                operation,
+                eredu_runtime::DistributedExecutionPhase::Execution,
+            )
+            .wait_bounded(wait)
+            .map_err(Into::into)
+    }
+
     /// Creates a session from one already selected architecture-owned manifest.
     pub(crate) fn from_manifest(
         manifest: &eredu_runtime::CommunicationManifest,
@@ -26,13 +61,76 @@ impl MlxDistributedSession {
         let communicators = ParallelCommunicators::from_manifest(manifest, world, stream)?;
         let authority = eredu_runtime::PartitionCommunicationAuthority::from_manifest(manifest)
             .map_err(|error| Error::Parallel(error.to_string()))?;
-        Ok(Self {
+        let preparation = manifest
+            .completion_policy()
+            .map(|policy| {
+                let (retained_bytes, host_bytes) = control_gather_storage(
+                    manifest.world_size(),
+                    eredu_runtime::run_preparation::TEXT_PREPARATION_WORDS,
+                )
+                .ok_or_else(|| Error::Parallel("text preparation native bound overflow".into()))?;
+                eredu_runtime::run_preparation::TextPreparationCoordinator::new(
+                    communicators.session_identity(),
+                    eredu_core::run_preparation::TextPreparationUsage {
+                        attempts: 0,
+                        retained_bytes,
+                        host_bytes,
+                    },
+                    policy.bounded_wait(),
+                )
+                .map(Arc::new)
+                .map_err(Error::from)
+            })
+            .transpose()?;
+        let mut session = Self {
             manifest: Arc::new(manifest.clone()),
             communicators,
             stream: stream.clone(),
             world: world.clone(),
             authority,
+            preparation,
+            parameter_operations: None,
+        };
+        if manifest.completion_policy().is_some() {
+            session.parameter_operations = Some(Arc::new(
+                eredu_runtime::parameter_operations::ParameterOperationCoordinator::new(&session)
+                    .map_err(|error| Error::Parallel(error.to_string()))?,
+            ));
+        }
+        Ok(session)
+    }
+
+    /// Common setup identity retained alongside the actual communication owner.
+    pub fn session_identity(&self) -> eredu_runtime::CommunicationSessionIdentity {
+        self.communicators.session_identity()
+    }
+
+    /// Retained live parameter control owner; model resets do not duplicate it.
+    pub(crate) fn parameter_operations(
+        &self,
+    ) -> Result<
+        Arc<eredu_runtime::parameter_operations::ParameterOperationCoordinator>,
+        eredu_core::parameters::ParameterError,
+    > {
+        self.parameter_operations.clone().ok_or_else(|| {
+            eredu_core::parameters::ParameterError::Unsupported(
+                "parameter operations require selected bounded completion".into(),
+            )
         })
+    }
+
+    /// One identity for this loaded model, shared by corresponding rank sessions.
+    /// Models without selected bounded parameter control retain no identity.
+    pub(crate) fn register_parameter_model(
+        &self,
+    ) -> Result<Option<eredu_runtime::parameter_operations::ParameterModelIdentity>, Error> {
+        if self.parameter_operations.is_none() {
+            return Ok(None);
+        }
+        self.parameter_operations()
+            .and_then(|owner| owner.register_model())
+            .map(Some)
+            .map_err(|error| Error::Parallel(error.to_string()))
     }
 
     /// Exact native world from which the retained communication was realized.
@@ -108,6 +206,8 @@ impl MlxDistributedSession {
             stream,
             world: _,
             authority,
+            preparation: _,
+            parameter_operations: _,
         } = self;
         let (groups, routes) = communicators.into_partition_resources(&manifest)?;
         let communication = eredu_runtime::PartitionCommunication::new_with_authority(
@@ -177,21 +277,73 @@ impl MlxDistributedSession {
             .map_err(|error| Error::Parallel(error.to_string()))
     }
 
+    pub(crate) fn coordinate_speculative_step(
+        &self,
+        local: Vec<eredu_core::SpeculativeScheduleState>,
+    ) -> Result<Vec<eredu_core::SpeculativeScheduleState>, eredu_core::BackendFailure> {
+        let coordinator = self.preparation.as_ref().ok_or_else(|| {
+            eredu_core::BackendFailure::new(
+                eredu_core::BackendFailureKind::Unsupported,
+                eredu_runtime::run_preparation::TextPreparationAgreementError::Admission(
+                    "selected session has no bounded scheduler transport",
+                ),
+            )
+        })?;
+        coordinator
+            .coordinate_speculative_step(self, local)
+            .map_err(eredu_core::BackendFailure::from_error)
+    }
+
+    pub(crate) fn agree_text_preparation(
+        &self,
+        stage: eredu_core::run_preparation::TextPreparationStage,
+        status: eredu_core::run_preparation::TextPreparationStatus,
+    ) -> Result<eredu_core::run_preparation::TextPreparationOutcome, eredu_core::BackendFailure>
+    {
+        let coordinator = self.preparation.as_ref().ok_or_else(|| {
+            eredu_core::BackendFailure::new(
+                eredu_core::BackendFailureKind::Unsupported,
+                eredu_runtime::run_preparation::TextPreparationAgreementError::Admission(
+                    "selected session has no bounded preparation transport",
+                ),
+            )
+        })?;
+        coordinator
+            .agree(self, stage, status)
+            .map_err(eredu_core::BackendFailure::from_error)
+    }
+
+    pub(crate) fn text_preparation_usage(
+        &self,
+    ) -> Result<eredu_core::run_preparation::TextPreparationUsage, eredu_core::BackendFailure> {
+        self.preparation
+            .as_ref()
+            .ok_or_else(|| {
+                eredu_core::BackendFailure::new(
+                    eredu_core::BackendFailureKind::Unsupported,
+                    eredu_runtime::run_preparation::TextPreparationAgreementError::Admission(
+                        "selected session has no bounded preparation transport",
+                    ),
+                )
+            })?
+            .usage()
+            .map_err(eredu_core::BackendFailure::from_error)
+    }
+
     fn submission_error(
         &self,
-        error: impl std::fmt::Display,
+        error: impl std::error::Error + Send + Sync + 'static,
         operation: eredu_runtime::CommunicationOperation,
     ) -> Error {
-        Error::Parallel(
+        Error::Other(Box::new(
             self.authority
-                .submission_error(
+                .submission_failure(
                     error,
                     operation,
                     eredu_runtime::DistributedExecutionPhase::Execution,
                     None,
-                )
-                .to_string(),
-        )
+                ),
+        ))
     }
 
     fn selected_submission(
@@ -477,5 +629,260 @@ impl eredu_core::consensus::BoundedConsensusTransport for MlxDistributedSession 
         output: Self::GatherOutput,
     ) -> Result<Vec<u32>, Self::Error> {
         Ok(output.as_array().evaluated()?.as_slice::<u32>().to_vec())
+    }
+}
+
+impl eredu_runtime::capture::partition::PartitionCaptureTransport for MlxDistributedSession {
+    fn capture_rank(&self) -> usize {
+        self.manifest.rank()
+    }
+
+    fn capture_wait(
+        &self,
+    ) -> Result<eredu_core::BoundedCompletionWait, eredu_core::capture::CaptureError> {
+        self.authority
+            .completion_policy()
+            .map(|policy| policy.bounded_wait())
+            .ok_or_else(|| {
+                eredu_core::capture::CaptureError::Unsupported(
+                    "capture transport needs selected bounded completion".into(),
+                )
+            })
+    }
+
+    fn ensure_capture_active(&self) -> Result<(), eredu_core::BackendFailure> {
+        self.ensure_active()
+            .map_err(eredu_core::BackendFailure::from_error)
+    }
+
+    fn estimate_capture_gather(
+        &self,
+        local_words: usize,
+    ) -> Result<eredu_core::capture::CaptureUsage, eredu_core::capture::CaptureError> {
+        use eredu_core::capture::{CaptureError, CaptureUsage};
+        let (retained_bytes, host_bytes) =
+            control_gather_storage(self.manifest.world_size(), local_words)
+                .ok_or(CaptureError::Overflow)?;
+        Ok(CaptureUsage {
+            retained_bytes,
+            host_bytes,
+            ..Default::default()
+        })
+    }
+
+    fn fail_capture_exchange(
+        &self,
+        error: &eredu_runtime::capture::partition::PartitionCaptureExchangeError,
+    ) {
+        let _ = self.authority.completion_error(
+            error,
+            eredu_runtime::CommunicationOperation::AllGatherEven,
+            eredu_runtime::DistributedExecutionPhase::Execution,
+            None,
+        );
+    }
+}
+
+// Native input/output, conservative staging, and exact completion metadata.
+impl eredu_runtime::parameter_operations::ParameterOperationTransport for MlxDistributedSession {
+    fn parameter_rank(&self) -> usize {
+        self.manifest.rank()
+    }
+    fn parameter_setup(&self) -> eredu_runtime::CommunicationSessionIdentity {
+        self.session_identity()
+    }
+    fn parameter_wait(
+        &self,
+    ) -> Result<eredu_core::BoundedCompletionWait, eredu_core::parameters::ParameterError> {
+        self.authority
+            .completion_policy()
+            .map(|policy| policy.bounded_wait())
+            .ok_or_else(|| {
+                eredu_core::parameters::ParameterError::Unsupported(
+                    "parameter control needs bounded completion".into(),
+                )
+            })
+    }
+    fn estimate_parameter_gather(
+        &self,
+        words: usize,
+    ) -> Result<eredu_core::capture::CaptureUsage, eredu_core::parameters::ParameterError> {
+        let (retained_bytes, host_bytes) =
+            control_gather_storage(self.manifest.world_size(), words)
+                .ok_or(eredu_core::parameters::ParameterError::Overflow)?;
+        Ok(eredu_core::capture::CaptureUsage {
+            retained_bytes,
+            host_bytes,
+            ..Default::default()
+        })
+    }
+    fn ensure_parameter_active(&self) -> Result<(), eredu_core::BackendFailure> {
+        self.ensure_active()
+            .map_err(eredu_core::BackendFailure::from_error)
+    }
+    fn fail_parameter_operation(&self, error: &eredu_core::parameters::ParameterCoordinationError) {
+        let _ = self.authority.completion_error(
+            error,
+            eredu_runtime::CommunicationOperation::AllGatherEven,
+            eredu_runtime::DistributedExecutionPhase::Execution,
+            None,
+        );
+    }
+}
+
+// Native input/output, conservative staging, and exact completion metadata.
+// This prices logical storage and does not promise a physical allocator ceiling.
+fn control_gather_storage(participants: usize, local_words: usize) -> Option<(u64, u64)> {
+    let gathered = local_words.checked_mul(participants)?;
+    i32::try_from(local_words).ok()?;
+    i32::try_from(gathered).ok()?;
+    Some((
+        4096_u64.checked_add(
+            (local_words as u64)
+                .checked_add(gathered as u64)?
+                .checked_mul(8)?,
+        )?,
+        4096_u64.checked_add((gathered as u64).checked_mul(4)?)?,
+    ))
+}
+
+impl eredu_runtime::run_preparation::TextPreparationTransport for MlxDistributedSession {
+    fn preparation_rank(&self) -> usize {
+        self.manifest.rank()
+    }
+    fn ensure_preparation_active(&self) -> Result<(), eredu_core::BackendFailure> {
+        self.ensure_active()
+            .map_err(eredu_core::BackendFailure::from_error)
+    }
+    fn fail_preparation(
+        &self,
+        error: &eredu_runtime::run_preparation::TextPreparationAgreementError,
+    ) {
+        let _ = self.authority.completion_error(
+            error,
+            eredu_runtime::CommunicationOperation::AllGatherEven,
+            eredu_runtime::DistributedExecutionPhase::InputPreparation,
+            None,
+        );
+    }
+}
+
+impl MlxDistributedSession {
+    fn capture_hook_descriptor(
+        &self,
+        members: &[usize],
+    ) -> Result<&eredu_runtime::CommunicationGroupDescriptor, eredu_core::capture::CaptureError>
+    {
+        self.communicators
+            .global_group_descriptors()
+            .iter()
+            .find(|group| {
+                group.members() == members
+                    && group.requirements().operations().iter().any(|operation| {
+                        operation.operation()
+                            == eredu_runtime::CommunicationOperation::FailureAgreement
+                            && operation.exact_completion()
+                    })
+            })
+            .ok_or_else(|| {
+                eredu_core::capture::CaptureError::Unsupported(
+                    "capture hook group has no selected exact failure agreement".into(),
+                )
+            })
+    }
+}
+
+impl eredu_runtime::capture::partition::PartitionCaptureHookTransport for MlxDistributedSession {
+    type HookOutput = crate::backend::runtime::distributed::completion::MlxFailureAgreement;
+
+    fn estimate_capture_hook(
+        &self,
+        members: &[usize],
+    ) -> Result<eredu_core::capture::CaptureUsage, eredu_core::capture::CaptureError> {
+        use eredu_core::capture::{add, mul, CaptureError, CaptureUsage};
+        if members.is_empty()
+            || members.windows(2).any(|pair| pair[0] >= pair[1])
+            || members
+                .iter()
+                .any(|rank| *rank >= self.manifest.world_size())
+        {
+            return Err(CaptureError::Invalid(
+                "capture hook membership exceeds selected world".into(),
+            ));
+        }
+        // A singleton requires no collective or native status tensor.
+        if members.len() == 1 {
+            return Ok(CaptureUsage::default());
+        }
+        let descriptor = self.capture_hook_descriptor(members)?;
+        let independent = crate::backend::runtime::distributed::independent_status_members(
+            self.manifest.world_size(),
+            members,
+        );
+        if !independent {
+            return Err(CaptureError::Unsupported(
+                "selected native subgroup requires a world participation wave for status agreement"
+                    .into(),
+            ));
+        }
+        i32::try_from(members.len()).map_err(|_| CaptureError::Overflow)?;
+        if descriptor.local_index().is_some()
+            && self
+                .communicators
+                .communication_group(descriptor.id())
+                .is_none()
+        {
+            return Err(CaptureError::Invalid(
+                "selected capture hook group was not realized".into(),
+            ));
+        }
+        // Scalar input/output, conservative logical reduction temporaries and
+        // exact event/host-status storage. Private allocator workspace is excluded.
+        Ok(CaptureUsage {
+            retained_bytes: add(8192, mul(members.len() as u64, 256)?)?,
+            host_bytes: add(4096, mul(members.len() as u64, 256)?)?,
+            ..Default::default()
+        })
+    }
+
+    fn submit_capture_hook(
+        &self,
+        members: &[usize],
+        success: bool,
+    ) -> Result<Submission<Self::HookOutput, MlxCommunicationCompletion>, Error> {
+        use eredu_runtime::FailureAgreementBackend;
+        self.ensure_active()?;
+        self.estimate_capture_hook(members)
+            .map_err(|error| Error::Parallel(error.to_string()))?;
+        let descriptor = self
+            .capture_hook_descriptor(members)
+            .map_err(|error| Error::Parallel(error.to_string()))?;
+        let group = self
+            .communicators
+            .communication_group(descriptor.id())
+            .ok_or_else(|| {
+                Error::Parallel("capture hook invoked outside its selected group".into())
+            })?;
+        let operation = eredu_runtime::CommunicationOperation::FailureAgreement;
+        let submission = crate::backend::nn::shared::MlxNeuralBackend::agree_success(
+            success,
+            group,
+            &self.stream,
+        )
+        .map_err(|error| self.submission_error(error, operation))?;
+        Ok(Submission {
+            output: submission.output,
+            completion: submission.completion.with_authority(
+                self.authority.clone(),
+                operation,
+                eredu_runtime::DistributedExecutionPhase::Execution,
+            ),
+        })
+    }
+
+    fn resolve_capture_hook(&self, output: Self::HookOutput) -> Result<bool, Error> {
+        use eredu_runtime::FailureAgreementBackend;
+        crate::backend::nn::shared::MlxNeuralBackend::resolve_failure_agreement(output)
+            .map_err(Into::into)
     }
 }

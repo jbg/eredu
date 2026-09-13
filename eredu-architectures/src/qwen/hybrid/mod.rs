@@ -50,7 +50,9 @@ pub use config::{
 };
 pub use linear_attention::LinearAttention;
 pub use model::{state_identity, ForwardContext, LayeredModel, TargetPartitionInput, Unit};
-pub use mtp::{prompt_token_identity, EmbeddedInput, ForwardMode, PredictionUnit};
+pub use mtp::{
+    prompt_token_identity, EmbeddedInput, ForwardMode, PredictionShared, PredictionUnit,
+};
 pub(crate) use parallel::routed_conditional_partition_local_geometry;
 pub use parallel::{
     conditional_local_geometry, conditional_partition_local_geometry, local_block_config,
@@ -100,6 +102,19 @@ pub fn conditional_expert_realization_plan<
         geometry.as_deref().map(ConditionalLocalGeometry::text),
         topology,
     )
+}
+
+/// Derives the selected text expert bank without constructing native modules.
+pub(crate) fn partition_expert_realization_plan(
+    config: &HybridConfig,
+    geometry: &LocalGeometry,
+    topology: eredu_core::ParallelRankTopology,
+) -> Result<crate::ExpertRealizationPlan<eredu_nn::GroupedGatedProductSpec>, eredu_nn::Error> {
+    geometry
+        .validate_for(config)
+        .map_err(eredu_nn::Error::backend)?;
+    realization_plan(config, Some(geometry), topology)?
+        .ok_or_else(|| eredu_nn::Error::backend("Qwen partition has no routed units"))
 }
 
 fn realization_plan(

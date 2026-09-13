@@ -27,6 +27,8 @@ pub struct PackedGatedProductGroups {
     pub down_iquant: Option<WeightQuantization>,
     /// Whether projections use checkpoint-native block FP8.
     pub native_fp8: bool,
+    /// Architecture-declared independent block origins of the gate/up rows.
+    pub gate_up_row_layout: eredu_nn::LinearRowLayout,
     #[param]
     /// Concatenated gate/up weights shaped `[groups, 2 * intermediate, hidden]`.
     pub gate_up_proj: PhysicalParam<Array>,
@@ -199,6 +201,7 @@ impl PackedGatedProductGroups {
             gate_up_iquant,
             down_iquant,
             native_fp8: false,
+            gate_up_row_layout: eredu_nn::LinearRowLayout::Contiguous,
             gate_up_proj,
             gate_up_proj_bias: if projection_biases[0] {
                 PhysicalParam::<Option<Array>>::unloaded_some(
@@ -239,6 +242,7 @@ impl PackedGatedProductGroups {
     pub fn with_native_fp8(
         mut self,
         format: eredu_checkpoint::BlockFp8Format,
+        row_layout: eredu_nn::LinearRowLayout,
         stream: &Stream,
     ) -> Result<Self, Exception> {
         if format.block_rows != 128 || format.block_columns != 128 {
@@ -251,17 +255,19 @@ impl PackedGatedProductGroups {
             eredu_checkpoint::BlockFp8ScaleEncoding::Ue8m0 => Dtype::Uint8,
         };
         let ceil128 = |value: i32| (value + 127) / 128;
+        let scale_rows = row_layout
+            .scale_rows(2 * self.intermediate_dim as usize, 128)
+            .map_err(|error| Exception::custom(error.to_string()))?;
+        let scale_rows = i32::try_from(scale_rows)
+            .map_err(|_| Exception::custom("FP8 row scale count exceeds i32"))?;
+        self.gate_up_row_layout = row_layout;
         self.gate_up_proj = PhysicalParam::<Array>::unloaded(
             &[self.group_count, 2 * self.intermediate_dim, self.hidden_dim],
             Dtype::Uint8,
             stream,
         )?;
         self.gate_up_proj_scales = PhysicalParam::<Option<Array>>::unloaded_some(
-            &[
-                self.group_count,
-                ceil128(2 * self.intermediate_dim),
-                ceil128(self.hidden_dim),
-            ],
+            &[self.group_count, scale_rows, ceil128(self.hidden_dim)],
             scale_dtype,
             stream,
         )?;
@@ -288,13 +294,16 @@ impl PackedGatedProductGroups {
         hidden_states: &Array,
         top_k_index: &Array,
         top_k_weights: &Array,
+        token_offset: usize,
+        total_token_count: usize,
+        observer: &mut Option<&mut dyn NativeGroupedUnitObserver>,
         stream: &Stream,
     ) -> Result<Array, Exception> {
         let num_tokens = hidden_states.dim(0);
         let plan = topk_group_plan(top_k_index, stream)?;
         let hidden = gather_grouped_rows(hidden_states, &plan, stream)?;
         let gate_up = if self.native_fp8 {
-            crate::backend::nn::fp8::grouped_linear(
+            crate::backend::nn::fp8::grouped_linear_with_row_layout(
                 &hidden,
                 self.gate_up_proj.as_ref(),
                 self.gate_up_proj_scales
@@ -302,17 +311,20 @@ impl PackedGatedProductGroups {
                     .as_ref()
                     .expect("native FP8 gate/up scales"),
                 &plan.sorted_group_ids,
+                self.gate_up_row_layout,
                 stream,
             )?
         } else if let Some(iquant) = self.gate_up_iquant {
             let (ggml_type, endian) = iquant.gguf_iquant().expect("IQ group format");
-            let native = NativeQuantizedTensor::from_iq_array(
-                self.gate_up_proj.value.clone(),
+            native_grouped_linear_from_array(
+                &hidden,
+                self.gate_up_proj.as_ref(),
                 &[self.group_count, 2 * self.intermediate_dim, self.hidden_dim],
                 ggml_type,
                 endian,
-            )?;
-            native_grouped_linear(&hidden, &native, &plan.sorted_group_ids, stream)?
+                &plan.sorted_group_ids,
+                stream,
+            )?
         } else if let Some(quantization) = self.gate_up_affine {
             packed_grouped_linear(
                 &hidden,
@@ -372,7 +384,15 @@ impl PackedGatedProductGroups {
                 ))
             }
         };
-        let activated = gate.multiply(up, stream)?;
+        let activated = observe_units(
+            gate.multiply(up, stream)?,
+            &plan,
+            top_k_weights,
+            token_offset,
+            total_token_count,
+            self.group_count as usize,
+            observer,
+        )?;
         let output = if self.native_fp8 {
             crate::backend::nn::fp8::grouped_linear(
                 &activated,
@@ -386,13 +406,15 @@ impl PackedGatedProductGroups {
             )?
         } else if let Some(iquant) = self.down_iquant {
             let (ggml_type, endian) = iquant.gguf_iquant().expect("IQ group format");
-            let native = NativeQuantizedTensor::from_iq_array(
-                self.down_proj.value.clone(),
+            native_grouped_linear_from_array(
+                &activated,
+                self.down_proj.as_ref(),
                 &[self.group_count, self.hidden_dim, self.intermediate_dim],
                 ggml_type,
                 endian,
-            )?;
-            native_grouped_linear(&activated, &native, &plan.sorted_group_ids, stream)?
+                &plan.sorted_group_ids,
+                stream,
+            )?
         } else if let Some(quantization) = self.down_affine {
             packed_grouped_linear(
                 &activated,
@@ -437,9 +459,29 @@ impl PackedGatedProductGroups {
         top_k_weights: &Array,
         stream: &Stream,
     ) -> Result<Array, Exception> {
+        self.forward_with_unit_observer(hidden_states, top_k_index, top_k_weights, stream, None)
+    }
+
+    /// Executes with borrowed sparse unit evidence and in-place semantic intervention.
+    pub(crate) fn forward_with_unit_observer(
+        &mut self,
+        hidden_states: &Array,
+        top_k_index: &Array,
+        top_k_weights: &Array,
+        stream: &Stream,
+        mut observer: Option<&mut dyn NativeGroupedUnitObserver>,
+    ) -> Result<Array, Exception> {
         let num_tokens = hidden_states.dim(0);
         if num_tokens <= GROUPED_PROJECTION_CHUNK_THRESHOLD {
-            return self.forward_chunk(hidden_states, top_k_index, top_k_weights, stream);
+            return self.forward_chunk(
+                hidden_states,
+                top_k_index,
+                top_k_weights,
+                0,
+                num_tokens as usize,
+                &mut observer,
+                stream,
+            );
         }
         let mut outputs = Vec::new();
         let mut start = 0;
@@ -449,6 +491,9 @@ impl PackedGatedProductGroups {
                 &hidden_states.try_index_device((start..end, ..), stream)?,
                 &top_k_index.try_index_device((start..end, ..), stream)?,
                 &top_k_weights.try_index_device((start..end, ..), stream)?,
+                start as usize,
+                num_tokens as usize,
+                &mut observer,
                 stream,
             )?);
             start = end;
@@ -466,12 +511,38 @@ impl PackedGatedProductGroups {
         partitions: usize,
         stream: &Stream,
     ) -> Result<TensorParallelGroupedOutput<Array>, Exception> {
+        self.forward_tensor_parallel_with_unit_observer(
+            hidden_states,
+            top_k_index,
+            top_k_weights,
+            partitions,
+            stream,
+            None,
+        )
+    }
+
+    /// Keeps down-bias placement while modifying selected rank-local units.
+    pub(crate) fn forward_tensor_parallel_with_unit_observer(
+        &mut self,
+        hidden_states: &Array,
+        top_k_index: &Array,
+        top_k_weights: &Array,
+        partitions: usize,
+        stream: &Stream,
+        observer: Option<&mut dyn NativeGroupedUnitObserver>,
+    ) -> Result<TensorParallelGroupedOutput<Array>, Exception> {
         if partitions == 0 {
             return Err(Exception::custom(
                 "tensor-parallel partition count must be positive",
             ));
         }
-        let output = self.forward(hidden_states, top_k_index, top_k_weights, stream)?;
+        let output = self.forward_with_unit_observer(
+            hidden_states,
+            top_k_index,
+            top_k_weights,
+            stream,
+            observer,
+        )?;
         let Some(bias) = self.down_proj_bias.as_ref() else {
             return Ok(TensorParallelGroupedOutput::new(output, None));
         };

@@ -59,6 +59,20 @@ pub fn packed_grouped_linear_with_options(
     sorted_indices: bool,
     stream: &Stream,
 ) -> Result<Array, Exception> {
+    // Reversible overlays retain the declared packed format and companions but
+    // publish a floating copy of this affected parameter. Dispatch from the
+    // actual storage so each group remains input-dependent after publication.
+    if matches!(
+        weight.dtype(),
+        Dtype::Float32 | Dtype::Float16 | Dtype::Bfloat16
+    ) {
+        let weight = if transpose {
+            weight.swap_axes(-1, -2, stream)?
+        } else {
+            weight.clone()
+        };
+        return grouped_matmul(input, &weight, group_ids, sorted_indices, stream);
+    }
     let mode =
         crate::backend::runtime::checkpoint::quantization::mlx_quantization_mode(quantization)
             .map_err(|error| Exception::custom(error.to_string()))?;

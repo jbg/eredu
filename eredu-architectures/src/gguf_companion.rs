@@ -147,11 +147,12 @@ pub(crate) fn resolve_media_projector(
             (GgufMediaProjectorConfig::MuseGlimmer(args), checkpoint)
         }
         GgufModelConfig::Qwen(text) => {
-            let vision = crate::qwen::vl::vision_config_from_gguf_catalog(
+            let mut vision = crate::qwen::vl::vision_config_from_gguf_catalog(
                 &ExactCatalog(projector),
                 &projector_metadata,
             )
             .map_err(|error| error.to_string())?;
+            qwen_vision_checkpoint_formats(&mut vision, projector)?;
             let model =
                 crate::qwen::vl::model_args_from_gguf_parts(text.clone(), &model_metadata, vision)
                     .map_err(|error| error.to_string())?;
@@ -159,11 +160,12 @@ pub(crate) fn resolve_media_projector(
             (GgufMediaProjectorConfig::Qwen3VlPending(model), checkpoint)
         }
         GgufModelConfig::QwenHybrid(parsed) => {
-            let vision = crate::qwen::hybrid::vision_config_from_gguf_catalog(
+            let mut vision = crate::qwen::hybrid::vision_config_from_gguf_catalog(
                 &ExactCatalog(projector),
                 &projector_metadata,
             )
             .map_err(|error| error.to_string())?;
+            qwen_vision_checkpoint_formats(&mut vision, projector)?;
             let model = crate::qwen::hybrid::with_gguf_vision_projector(parsed.clone(), vision)
                 .map_err(|error| error.to_string())?;
             let checkpoint = crate::qwen::hybrid::conditional_projector_gguf_plan(&model)?;
@@ -218,13 +220,13 @@ fn canonical_projector_mapping(
         GgufMediaProjectorConfig::Qwen3Vl(model) => {
             let deepstack = model.vision.deepstack_layers();
             projector.translated_outputs(|name| {
-                crate::qwen::vision::translate_gguf_weight_name(name, &deepstack)
+                crate::qwen::vl::translate_vision_gguf_weight_name(name, &deepstack)
             })
         }
         GgufMediaProjectorConfig::Qwen3VlPending(model) => {
             let deepstack = model.vision.deepstack_layers();
             projector.translated_outputs(|name| {
-                crate::qwen::vision::translate_gguf_weight_name(name, &deepstack)
+                crate::qwen::vl::translate_vision_gguf_weight_name(name, &deepstack)
             })
         }
         GgufMediaProjectorConfig::Qwen35(model)
@@ -248,6 +250,20 @@ fn metadata(checkpoint: &Checkpoint) -> HashMap<String, MetadataValue> {
         .iter()
         .map(|(name, value)| (name.clone(), value.clone()))
         .collect()
+}
+
+fn qwen_vision_checkpoint_formats(
+    vision: &mut crate::qwen::vision::VisionConfig,
+    checkpoint: &Checkpoint,
+) -> Result<(), String> {
+    let deepstack = vision.deepstack_layers();
+    vision.linear_formats = weight_formats(checkpoint, |name| {
+        crate::qwen::vision::translate_gguf_weight_name(name, &deepstack)
+    })?
+    .into_iter()
+    .map(|(name, format)| (name, format.into()))
+    .collect();
+    Ok(())
 }
 
 fn weight_formats(
@@ -479,6 +495,105 @@ mod tests {
     }
 
     #[test]
+    fn qwen_vl_projector_mapping_preserves_both_temporal_recipe_sources() {
+        use eredu_checkpoint::{recipe::RecipeCatalog, store::TensorMetadata, StoredDtype};
+        let args = crate::qwen::vl::model_args_from_config_value(&serde_json::json!({
+            "model_type":"qwen3_vl", "image_token_id":61, "video_token_id":62,
+            "text_config": {"model_type":"qwen3_vl_text", "hidden_size":32,
+                "num_hidden_layers":1, "intermediate_size":64, "num_attention_heads":4,
+                "num_key_value_heads":2, "head_dim":8, "rms_norm_eps":0.000001,
+                "vocab_size":64, "max_position_embeddings":128, "tie_word_embeddings":true,
+                "rope_scaling":{"mrope_section":[2,1,1]}},
+            "vision_config":{"depth":1,"hidden_size":16,"intermediate_size":24,
+                "num_heads":4,"num_position_embeddings":16,"in_channels":3,"patch_size":2,
+                "spatial_merge_size":2,"temporal_patch_size":2,"out_hidden_size":32,
+                "deepstack_visual_indexes":[0]}
+        }))
+        .unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("temporal.gguf");
+        let first = vec![1_f32.to_le_bytes(); 16 * 3 * 2 * 2].concat();
+        let second = vec![2_f32.to_le_bytes(); 16 * 3 * 2 * 2].concat();
+        Writer::default()
+            .write(
+                File::create(&path).unwrap(),
+                &BTreeMap::new(),
+                &[
+                    TensorInput {
+                        name: "v.patch_embd.weight",
+                        dimensions: &[2, 2, 3, 16],
+                        ggml_type: GgmlType::F32,
+                        data: &first,
+                    },
+                    TensorInput {
+                        name: "v.patch_embd.weight.1",
+                        dimensions: &[2, 2, 3, 16],
+                        ggml_type: GgmlType::F32,
+                        data: &second,
+                    },
+                ],
+            )
+            .unwrap();
+        let checkpoint = Checkpoint::open(path).unwrap();
+        struct Catalog(BTreeMap<String, TensorMetadata>);
+        impl RecipeCatalog for Catalog {
+            fn tensor_metadata(
+                &self,
+                key: &str,
+            ) -> Result<TensorMetadata, eredu_checkpoint::store::StoreError> {
+                self.0.get(key).cloned().ok_or_else(|| {
+                    eredu_checkpoint::store::StoreError::UnknownTensor { key: key.into() }
+                })
+            }
+        }
+        for model in [
+            GgufMediaProjectorConfig::Qwen3VlPending(crate::qwen::vl::GgufModelArgs {
+                text: args.text.clone(),
+                vision: args.vision.clone(),
+                mrope_section: args.mrope_section,
+                model_type: args.model_type.clone(),
+            }),
+            GgufMediaProjectorConfig::Qwen3Vl(args),
+        ] {
+            let mapping = canonical_projector_mapping(&checkpoint, &model).unwrap();
+            let catalog = Catalog(
+                mapping
+                    .iter()
+                    .map(|mapped| {
+                        let shape = mapped
+                            .layout
+                            .shape
+                            .iter()
+                            .map(|&d| d as usize)
+                            .collect::<Vec<_>>();
+                        (
+                            mapped.layout.name.clone(),
+                            TensorMetadata {
+                                name: mapped.layout.name.clone(),
+                                logical_shape: shape.clone(),
+                                physical_shape: shape,
+                                stored_dtype: StoredDtype::F32,
+                                encoded_byte_len: first.len() as u64,
+                                backing_shard: None,
+                            },
+                        )
+                    })
+                    .collect(),
+            );
+            let recipes = crate::qwen::vl::static_recipes(&catalog);
+            let recipe = &recipes["model.visual.patch_embed.proj.weight"];
+            assert_eq!(
+                recipe.source_keys(),
+                [
+                    "model.visual.patch_embed.proj.weight.0",
+                    "model.visual.patch_embed.proj.weight.1",
+                ]
+            );
+            assert_eq!(recipe.infer(&catalog).unwrap().shape, [16, 3, 2, 2, 2]);
+        }
+    }
+
+    #[test]
     fn portable_weight_formats_cover_affine_mxfp4_and_native_ggml() {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("formats.gguf");
@@ -525,5 +640,66 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn qwen_projector_packed_formats_reach_full_and_deepstack_linear_bindings() {
+        let mut args = crate::qwen::vl::model_args_from_config_value(&serde_json::json!({
+            "model_type":"qwen3_vl", "image_token_id":61, "video_token_id":62,
+            "text_config": {"model_type":"qwen3_vl_text", "hidden_size":32,
+                "num_hidden_layers":1, "intermediate_size":64, "num_attention_heads":4,
+                "num_key_value_heads":2, "head_dim":8, "rms_norm_eps":0.000001,
+                "vocab_size":64, "max_position_embeddings":128, "tie_word_embeddings":true,
+                "rope_scaling":{"mrope_section":[2,1,1]}},
+            "vision_config":{"depth":1,"hidden_size":32,"intermediate_size":64,
+                "num_heads":4,"num_position_embeddings":16,"in_channels":3,"patch_size":2,
+                "spatial_merge_size":2,"temporal_patch_size":2,"out_hidden_size":32,
+                "deepstack_visual_indexes":[0]}
+        }))
+        .unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("packed-projector.gguf");
+        let qkv = vec![1u8; 96 * 34];
+        let merger = vec![1u8; 128 * 4 * 18];
+        Writer::default()
+            .write(
+                File::create(&path).unwrap(),
+                &BTreeMap::new(),
+                &[
+                    TensorInput {
+                        name: "v.blk.0.attn_qkv.weight",
+                        dimensions: &[32, 96],
+                        ggml_type: GgmlType::Q8_0,
+                        data: &qkv,
+                    },
+                    TensorInput {
+                        name: "v.deepstack.0.fc1.weight",
+                        dimensions: &[128, 128],
+                        ggml_type: GgmlType::IQ4NL,
+                        data: &merger,
+                    },
+                ],
+            )
+            .unwrap();
+        let checkpoint = Checkpoint::open(path).unwrap();
+        qwen_vision_checkpoint_formats(&mut args.vision, &checkpoint).unwrap();
+        for (path, ggml_type) in [
+            ("blocks.0.attn.qkv.weight", GgmlType::Q8_0),
+            ("deepstack_merger_list.0.linear_fc1.weight", GgmlType::IQ4NL),
+        ] {
+            let expected = eredu_checkpoint::LinearFormat::GgufIQuant {
+                ggml_type,
+                endian: eredu_gguf::Endian::Little,
+            };
+            assert_eq!(args.vision.linear_format(path), expected);
+            assert_eq!(
+                args.vision.linear_format(&format!("model.visual.{path}")),
+                expected
+            );
+        }
+        assert_eq!(
+            args.vision.linear_format("patch_embed.proj.weight"),
+            eredu_checkpoint::LinearFormat::Dense
+        );
     }
 }

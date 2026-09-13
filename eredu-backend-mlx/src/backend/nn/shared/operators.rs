@@ -1,5 +1,7 @@
 use super::parameters::*;
 use super::*;
+use safemlx::error::Exception;
+mod grouped_units;
 
 /// MLX dense-or-quantized affine projection.
 #[derive(Debug, Clone)]
@@ -12,6 +14,81 @@ pub struct MlxLinear {
 impl LinearOperator<MlxTensor> for MlxLinear {
     fn forward(&mut self, input: &MlxTensor, context: &Stream) -> Result<MlxTensor, ComputeError> {
         compute_tensor(self.module.forward(input.as_array(), context))
+    }
+    fn forward_with_input_observer(
+        &mut self,
+        input: &MlxTensor,
+        context: &Stream,
+        observer: Option<&mut dyn eredu_nn::ProjectionInputObserver<MlxTensor>>,
+    ) -> Result<MlxTensor, ComputeError> {
+        self.forward_observed_input(input, None, context, observer)
+    }
+}
+
+struct NativeInputObserver<'a> {
+    inner: &'a mut dyn eredu_nn::ProjectionInputObserver<MlxTensor>,
+    failure: Option<ComputeError>,
+}
+impl NativeInputObserver<'_> {
+    fn result(&mut self, result: Result<(), ComputeError>) -> Result<(), Exception> {
+        result.map_err(|error| {
+            let native = Exception::custom(error.to_string());
+            self.failure = Some(error);
+            native
+        })
+    }
+}
+impl common::linear::NativeProjectionInputObserver for NativeInputObserver<'_> {
+    fn observe(&mut self, input: &Array) -> Result<(), Exception> {
+        let result = self.inner.observe(MlxTensor::ref_cast(input));
+        self.result(result)
+    }
+    fn observe_generated(
+        &mut self,
+        prototype: &Array,
+        source: &eredu_nn::GeneratedTensorSource,
+        generate: &mut dyn FnMut() -> Result<Array, Exception>,
+    ) -> Result<(), Exception> {
+        let result =
+            self.inner
+                .observe_generated(MlxTensor::ref_cast(prototype), source, &mut || {
+                    generate()
+                        .map(MlxTensor::from_array)
+                        .map_err(ComputeError::backend_source)
+                });
+        self.result(result)
+    }
+}
+impl MlxLinear {
+    pub(super) fn forward_observed_input(
+        &mut self,
+        input: &MlxTensor,
+        parallel: Option<&Group>,
+        context: &Stream,
+        observer: Option<&mut dyn eredu_nn::ProjectionInputObserver<MlxTensor>>,
+    ) -> Result<MlxTensor, ComputeError> {
+        let mut adapter = observer.map(|inner| NativeInputObserver {
+            inner,
+            failure: None,
+        });
+        let observer = adapter
+            .as_mut()
+            .map(|adapter| adapter as &mut dyn common::linear::NativeProjectionInputObserver);
+        let result = match parallel {
+            Some(group) => self.module.forward_row_parallel_with_input_observer(
+                input.as_array(),
+                group,
+                context,
+                observer,
+            ),
+            None => self
+                .module
+                .forward_with_input_observer(input.as_array(), context, observer),
+        };
+        match adapter.and_then(|adapter| adapter.failure) {
+            Some(error) => Err(error),
+            None => compute_tensor(result),
+        }
     }
 }
 
@@ -177,7 +254,7 @@ impl NormalizationOperator<MlxTensor> for MlxRmsNorm {
             (Some(module), None) => compute_tensor(module.forward(input, context)),
             (Some(module), Some(offset)) => {
                 let scale = compute(module.weight.as_ref().add(Array::from_f32(offset), context))?;
-                compute_tensor(safemlx::fast::rms_norm(
+                compute_tensor(super::super::normalization::input_precision_rms(
                     input,
                     &scale,
                     self.epsilon,
@@ -369,6 +446,35 @@ impl HyperHeadOperator<MlxTensor> for MlxHyperHead {
     ) -> Result<MlxTensor, ComputeError> {
         compute_tensor(self.module.forward(residual.as_array(), context))
     }
+
+    fn forward_with_coefficients_observer(
+        &mut self,
+        residual: &MlxTensor,
+        context: &Stream,
+        observer: Option<&mut dyn eredu_nn::TensorValueObserver<MlxTensor>>,
+    ) -> Result<MlxTensor, ComputeError> {
+        let Some(observer) = observer else {
+            return self.forward(residual, context);
+        };
+        let mut failure = None;
+        let result = self.module.forward_with_coefficients_observer(
+            residual.as_array(),
+            context,
+            Some(&mut |coefficients| {
+                observer
+                    .observe(MlxTensor::ref_cast(coefficients))
+                    .map_err(|error| {
+                        let native = Exception::custom(error.to_string());
+                        failure = Some(error);
+                        native
+                    })
+            }),
+        );
+        match failure {
+            Some(error) => Err(error),
+            None => compute_tensor(result),
+        }
+    }
 }
 
 impl Parameterized<MlxTensor> for MlxHyperHead {
@@ -493,7 +599,30 @@ impl MlxGroupedGatedProduct {
         &mut self,
         bindings: BTreeMap<String, Array>,
     ) -> Result<(), ComputeError> {
-        self.module.bind_local_parameters(bindings)
+        self.module.bind_local_parameters(
+            bindings,
+            &[
+                (
+                    "gate_up_proj",
+                    [
+                        self.spec.group_count(),
+                        self.spec
+                            .intermediate_dimensions()
+                            .checked_mul(2)
+                            .ok_or_else(|| ComputeError::backend("grouped read width overflow"))?,
+                        self.spec.input_dimensions(),
+                    ],
+                ),
+                (
+                    "down_proj",
+                    [
+                        self.spec.group_count(),
+                        self.spec.output_dimensions(),
+                        self.spec.intermediate_dimensions(),
+                    ],
+                ),
+            ],
+        )
     }
 }
 
@@ -526,6 +655,11 @@ impl GroupedGatedProductOperator<MlxTensor> for MlxGroupedGatedProduct {
         selections: &GroupSelection<MlxTensor>,
         context: &Stream,
     ) -> Result<MlxTensor, ComputeError> {
+        #[cfg(test)]
+        crate::tests::support::provider_failure::check(
+            crate::tests::support::provider_failure::Operator::Gated,
+            context,
+        )?;
         let input = input.as_array();
         let flattened = compute(input.reshape(&[-1, input.dim(-1)], context))?;
         let output = compute(self.module.forward(
@@ -535,6 +669,16 @@ impl GroupedGatedProductOperator<MlxTensor> for MlxGroupedGatedProduct {
             context,
         ))?;
         compute_tensor(output.reshape(input.shape(), context))
+    }
+
+    fn forward_grouped_with_unit_observer(
+        &mut self,
+        input: &MlxTensor,
+        selections: &GroupSelection<MlxTensor>,
+        context: &Stream,
+        observer: Option<&mut dyn eredu_nn::GroupedUnitObserver<MlxTensor>>,
+    ) -> Result<MlxTensor, ComputeError> {
+        self.forward_units(input, selections, context, observer)
     }
 }
 
@@ -546,6 +690,11 @@ impl TensorParallelGroupedGatedProductOperator<MlxTensor> for MlxGroupedGatedPro
         partitions: usize,
         context: &Stream,
     ) -> Result<TensorParallelGroupedOutput<MlxTensor>, ComputeError> {
+        #[cfg(test)]
+        crate::tests::support::provider_failure::check(
+            crate::tests::support::provider_failure::Operator::Gated,
+            context,
+        )?;
         let input = input.as_array();
         let flattened = compute(input.reshape(&[-1, input.dim(-1)], context))?;
         let output = compute(self.module.forward_tensor_parallel(
@@ -562,6 +711,17 @@ impl TensorParallelGroupedGatedProductOperator<MlxTensor> for MlxGroupedGatedPro
                 .map(|bias| compute_tensor(bias.reshape(input.shape(), context)))
                 .transpose()?,
         ))
+    }
+
+    fn forward_grouped_tensor_parallel_with_unit_observer(
+        &mut self,
+        input: &MlxTensor,
+        selections: &GroupSelection<MlxTensor>,
+        partitions: usize,
+        context: &Stream,
+        observer: Option<&mut dyn eredu_nn::GroupedUnitObserver<MlxTensor>>,
+    ) -> Result<TensorParallelGroupedOutput<MlxTensor>, ComputeError> {
+        self.forward_units_tensor_parallel(input, selections, partitions, context, observer)
     }
 }
 
@@ -586,7 +746,27 @@ impl MlxGroupedRelu2 {
         &mut self,
         bindings: BTreeMap<String, Array>,
     ) -> Result<(), ComputeError> {
-        self.module.bind_local_parameters(bindings)
+        self.module.bind_local_parameters(
+            bindings,
+            &[
+                (
+                    "up_proj",
+                    [
+                        self.spec.group_count(),
+                        self.spec.intermediate_dimensions(),
+                        self.spec.hidden_dimensions(),
+                    ],
+                ),
+                (
+                    "down_proj",
+                    [
+                        self.spec.group_count(),
+                        self.spec.hidden_dimensions(),
+                        self.spec.intermediate_dimensions(),
+                    ],
+                ),
+            ],
+        )
     }
 }
 
@@ -621,6 +801,11 @@ impl GroupedRelu2Operator<MlxTensor> for MlxGroupedRelu2 {
         selections: &GroupSelection<MlxTensor>,
         context: &Stream,
     ) -> Result<MlxTensor, ComputeError> {
+        #[cfg(test)]
+        crate::tests::support::provider_failure::check(
+            crate::tests::support::provider_failure::Operator::Relu2,
+            context,
+        )?;
         let input = input.as_array();
         let shape = input.shape();
         let flattened = compute(input.reshape(&[-1, input.dim(-1)], context))?;
@@ -632,6 +817,16 @@ impl GroupedRelu2Operator<MlxTensor> for MlxGroupedRelu2 {
         ))?;
         compute_tensor(output.reshape(shape, context))
     }
+
+    fn forward_grouped_with_unit_observer(
+        &mut self,
+        input: &MlxTensor,
+        selections: &GroupSelection<MlxTensor>,
+        context: &Stream,
+        observer: Option<&mut dyn eredu_nn::GroupedUnitObserver<MlxTensor>>,
+    ) -> Result<MlxTensor, ComputeError> {
+        self.forward_units(input, selections, context, observer)
+    }
 }
 
 impl TensorParallelGroupedRelu2Operator<MlxTensor> for MlxGroupedRelu2 {
@@ -642,6 +837,11 @@ impl TensorParallelGroupedRelu2Operator<MlxTensor> for MlxGroupedRelu2 {
         partitions: usize,
         context: &Stream,
     ) -> Result<TensorParallelGroupedOutput<MlxTensor>, ComputeError> {
+        #[cfg(test)]
+        crate::tests::support::provider_failure::check(
+            crate::tests::support::provider_failure::Operator::Relu2,
+            context,
+        )?;
         let input = input.as_array();
         let shape = input.shape();
         let flattened = compute(input.reshape(&[-1, input.dim(-1)], context))?;
@@ -660,4 +860,19 @@ impl TensorParallelGroupedRelu2Operator<MlxTensor> for MlxGroupedRelu2 {
                 .transpose()?,
         ))
     }
+
+    fn forward_grouped_tensor_parallel_with_unit_observer(
+        &mut self,
+        input: &MlxTensor,
+        selections: &GroupSelection<MlxTensor>,
+        partitions: usize,
+        context: &Stream,
+        observer: Option<&mut dyn eredu_nn::GroupedUnitObserver<MlxTensor>>,
+    ) -> Result<TensorParallelGroupedOutput<MlxTensor>, ComputeError> {
+        self.forward_units_tensor_parallel(input, selections, partitions, context, observer)
+    }
 }
+
+#[cfg(test)]
+#[path = "operators/observation_errors.rs"]
+mod observation_errors;

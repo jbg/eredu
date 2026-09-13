@@ -1,5 +1,7 @@
 //! One neutral Muse-Glimmer multimodal model for resident and bounded runtimes.
 
+mod observation;
+
 use eredu_nn::{
     AttentionCache, EmbeddingLookupPolicy, Error, GroupedNeuralBackend, Parameterized, Tensor,
 };
@@ -30,6 +32,57 @@ use super::{
 pub const VISION_EXECUTION_GROUP: &str = "vision_encoder";
 /// Stable execution-group identity for Muse-Glimmer text decoding.
 pub const TEXT_EXECUTION_GROUP: &str = "text_decoder";
+
+/// Shared cold and loaded transport ownership for an optional Muse vision root.
+pub(crate) fn vision_group_transport(
+    args: &DecoderConfig,
+) -> eredu_runtime::ArchitectureGroupTransport {
+    eredu_runtime::ArchitectureGroupTransport {
+        placement: eredu_runtime::ArchitectureGroupPlacement::Pipeline,
+        kind: eredu_runtime::ArchitectureGroupKind::VisionEncoder,
+        first_owner_static_roles: args
+            .vision_config
+            .as_ref()
+            .map_or_else(Vec::new, |_| vec!["vision".into()]),
+        last_owner_static_roles: Vec::new(),
+        merge_destination: eredu_runtime::ArchitectureMergeDestination::FirstPipelineOwner,
+        parallel_subgroup: Some(eredu_runtime::ArchitectureParallelSubgroup::TensorSharded),
+        request_optional: true,
+    }
+}
+
+/// Exact flattened patch or projected-media wire geometry for a vision edge.
+pub(crate) fn vision_partition_boundary_schema(
+    args: &DecoderConfig,
+    continuation: bool,
+) -> Result<eredu_runtime::BoundaryWireSchema, Error> {
+    use eredu_runtime::{BoundaryTensorDimension as Dim, BoundaryTensorDtype as Dtype};
+    let vision = args
+        .vision_config
+        .as_ref()
+        .ok_or_else(|| Error::backend("Muse vision boundary has no vision configuration"))?;
+    eredu_runtime::BoundaryWireSchema::new(
+        if continuation {
+            "muse.vision_continuation"
+        } else {
+            "muse.vision_to_decoder"
+        },
+        eredu_runtime::BoundaryTensorSpec::new(
+            "hidden",
+            [
+                Dim::Sequence,
+                Dim::Fixed(if continuation {
+                    vision.hidden_size
+                } else {
+                    args.hidden_size
+                }),
+            ],
+            Dtype::Activation,
+        ),
+        [],
+    )
+    .map_err(Error::backend)
+}
 
 /// Proves one DFlash assistant against a target and returns exact ordered capture paths.
 pub fn external_assistant_capture_request(
@@ -206,6 +259,118 @@ where
                 .any(|part| matches!(part, MuseGlimmerInputPartPlan::Vision { .. }))
     }
 
+    fn prepared_group_boundary_sequence(
+        &self,
+        group: usize,
+        input: PreparedCompositeInput<'_, B::Tensor, Self::InputPartPlan>,
+    ) -> Result<i32, String> {
+        let positions = if group == 0 {
+            input
+                .admitted()
+                .parts()
+                .iter()
+                .filter_map(|part| match part {
+                    MuseGlimmerInputPartPlan::Vision { ingress, .. } => {
+                        Some(ingress.placeholder_count)
+                    }
+                    _ => None,
+                })
+                .try_fold(0_u64, |total, positions| total.checked_add(positions))
+                .ok_or_else(|| "Muse projected media positions overflowed".to_owned())?
+        } else {
+            input.admitted().decoder_positions()
+        };
+        i32::try_from(positions)
+            .map_err(|_| "Muse prepared boundary sequence exceeds i32".to_owned())
+    }
+
+    fn prepared_group_continuation_geometry(
+        &self,
+        group: usize,
+        input: PreparedCompositeInput<'_, B::Tensor, Self::InputPartPlan>,
+    ) -> Result<Option<(i32, i32)>, String> {
+        if group != 0 {
+            return Ok(None);
+        }
+        let patches = input
+            .admitted()
+            .parts()
+            .iter()
+            .filter_map(|part| match part {
+                MuseGlimmerInputPartPlan::Vision { ingress, .. } => Some(&ingress.patch_grid),
+                _ => None,
+            })
+            .flatten()
+            .try_fold(0_u64, |total, &(time, height, width)| {
+                [time, height, width]
+                    .into_iter()
+                    .try_fold(1_u64, |product, value| {
+                        u64::try_from(value)
+                            .ok()
+                            .and_then(|value| product.checked_mul(value))
+                    })
+                    .and_then(|patches| total.checked_add(patches))
+                    .ok_or_else(|| "Muse continuation patch geometry overflowed".to_owned())
+            })?;
+        if patches == 0 {
+            return Ok(None);
+        }
+        let patches = i32::try_from(patches)
+            .map_err(|_| "Muse continuation patch count exceeds i32".to_owned())?;
+        let width = self
+            .args
+            .vision_config
+            .as_ref()
+            .ok_or_else(|| "Muse continuation has no vision configuration".to_owned())?
+            .hidden_size;
+        Ok(Some((patches, width)))
+    }
+
+    fn prepared_group_continuation_batched(&self, group: usize) -> bool {
+        group != 0
+    }
+
+    fn partition_boundary_schema(
+        &self,
+        source_group: usize,
+        destination_group: usize,
+        _selected: &eredu_runtime::ResolvedBoundaryWireSchema,
+        batch: i32,
+        source_sequence: i32,
+        _group_sequences: &[i32],
+        continuation: Option<(i32, i32)>,
+    ) -> Result<Option<eredu_runtime::ResolvedBoundaryWireSchema>, Error> {
+        if source_group != 0 || !matches!(destination_group, 0 | 1) {
+            return Ok(None);
+        }
+        let sequence = continuation.map_or(source_sequence, |(sequence, _)| sequence);
+        vision_partition_boundary_schema(&self.args, source_group == destination_group)?
+            .resolve(batch, sequence)
+            .map(Some)
+            .map_err(Error::backend)
+    }
+
+    fn accept_partition_boundary(
+        &mut self,
+        source_group: usize,
+        destination_group: usize,
+        schema: &eredu_runtime::ResolvedBoundaryWireSchema,
+        values: Vec<B::Tensor>,
+        _forward: &mut Self::ForwardContext,
+    ) -> Result<Option<B::Tensor>, Error> {
+        if !matches!((source_group, destination_group), (0, 0) | (0, 1) | (1, 1)) {
+            return Ok(None);
+        }
+        if values.len() != 1 || !schema.auxiliary().is_empty() {
+            return Err(Error::backend(
+                "Muse boundary must contain exactly its primary activation",
+            ));
+        }
+        // A rank that already executed vision retains its admitted request
+        // context. Resume the incoming decoder value without reassembling it.
+        Ok(values.into_iter().next())
+    }
+
     fn prepared_group_collective_waves(
         &self,
         group: usize,
@@ -219,6 +384,29 @@ where
         // collective; the explicit empty waves keep that fact architecture-owned.
         Ok((group == 0 && tensor_partitions > 1 && pipeline_stages > 1)
             .then(|| vec![Vec::new(); pipeline_stages]))
+    }
+
+    fn prepared_primary_ingress_collectives(
+        &self,
+        input: PreparedCompositeInput<'_, B::Tensor, Self::InputPartPlan>,
+        tensor_partitions: usize,
+    ) -> Result<Option<Vec<crate::composite_execution::CompositeTensorCollective>>, String> {
+        crate::composite_execution::segmented_token_ingress_collectives(
+            input
+                .admitted()
+                .parts()
+                .iter()
+                .filter_map(|part| match part {
+                    MuseGlimmerInputPartPlan::TextTokens { positions } => Some(*positions),
+                    MuseGlimmerInputPartPlan::Vision { .. } => None,
+                }),
+            self.args.hidden_size,
+            tensor_partitions,
+        )
+    }
+
+    fn primary_ingress_collectives_pending(&self, forward: &Self::ForwardContext) -> bool {
+        forward.parts.iter().any(|part| matches!(part, PreparedPart::PendingText { .. }))
     }
 
     fn external_prediction_capture_paths(
@@ -336,6 +524,7 @@ pub enum TextPartitionInput<'a, T> {
 
 enum PreparedPart<T> {
     Text { tokens: T, embeddings: T },
+    PendingText { tokens: T },
     Media { tokens: T },
 }
 
@@ -372,6 +561,36 @@ where
     S: LayerRuntimeState<B>,
     S::LayerState: AttentionCache<B::Tensor>,
 {
+    fn routed_unit_observations(&self) -> bool {
+        true
+    }
+    fn routed_sparse_observations(&self) -> bool {
+        true
+    }
+
+    fn forward_unit_observed_with_provider<P, O>(
+        &mut self,
+        group: usize,
+        index: usize,
+        unit: &mut Self::Unit,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &mut Self::ForwardContext,
+        pass: ExpertPass,
+        provider: &mut P,
+        context: &<B::Tensor as Tensor>::Context,
+        observer: &mut O,
+    ) -> Result<B::Tensor, Error>
+    where
+        P: RoutedExpertProvider<B>,
+        P::Error: std::fmt::Display,
+        O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
+    {
+        self.forward_text_observed(
+            group, index, unit, hidden, state, forward, pass, provider, context, observer,
+        )
+    }
+
     fn forward_unit_with_provider<P>(
         &mut self,
         group: usize,
@@ -405,6 +624,37 @@ where
     S: LayerRuntimeState<B>,
     S::LayerState: AttentionCache<B::Tensor>,
 {
+    fn parallel_routed_unit_observations(&self) -> bool {
+        true
+    }
+    fn parallel_routed_sparse_observations(&self) -> bool {
+        true
+    }
+
+    fn forward_unit_parallel_observed_with_provider<P, O>(
+        &mut self,
+        group: usize,
+        index: usize,
+        unit: &mut Self::Unit,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &mut Self::ForwardContext,
+        pass: ExpertPass,
+        provider: &mut P,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+        observer: &mut O,
+    ) -> Result<B::Tensor, Error>
+    where
+        P: eredu_runtime::TensorParallelRoutedExpertProvider<B>,
+        P::Error: std::fmt::Display,
+        O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
+    {
+        self.forward_text_parallel_observed(
+            group, index, unit, hidden, state, forward, pass, provider, parallel, context, observer,
+        )
+    }
+
     fn forward_unit_parallel_with_provider<P>(
         &mut self,
         group: usize,
@@ -696,7 +946,20 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
                 )
             })
             .chain(vision_static.into_iter().map(|group| {
-                OwnedParameterGroupSpec::new(ParameterGroupOwner::static_role("vision"), group)
+                let consumers = super::parallel::vision_static_consumer_units(
+                    &self.args,
+                    group.members()[0].target(),
+                )
+                .expect("declared Muse vision static group has consumers");
+                OwnedParameterGroupSpec::new(
+                    ParameterGroupOwner::static_unit_consumers(
+                        "vision",
+                        consumers.map(|unit| {
+                            (layout.group_id(0).expect("Muse vision group").clone(), unit)
+                        }),
+                    ),
+                    group,
+                )
             }))
             .collect::<Vec<_>>();
         for (group_index, &count) in counts.iter().enumerate() {
@@ -1138,6 +1401,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
     fn prepare_parts_parallel(
         &mut self,
         parts: &[DecoderInputPart<'_, B::Tensor>],
+        defer_embeddings: bool,
         parallel: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Vec<PreparedPart<B::Tensor>>, Error> {
@@ -1147,6 +1411,11 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
         parts
             .iter()
             .map(|part| match part {
+                DecoderInputPart::Text(tokens) if defer_embeddings => {
+                    Ok(PreparedPart::PendingText {
+                        tokens: (*tokens).clone(),
+                    })
+                }
                 DecoderInputPart::Text(tokens) => {
                     let embeddings = B::vocabulary_parallel_lookup(
                         &mut self.static_modules.text.embeddings,
@@ -1187,7 +1456,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
             .iter()
             .filter_map(|part| match part {
                 PreparedPart::Media { tokens } => Some(tokens.dim(1)),
-                PreparedPart::Text { .. } => None,
+                PreparedPart::Text { .. } | PreparedPart::PendingText { .. } => None,
             })
             .sum::<i32>();
         match vision {
@@ -1209,6 +1478,11 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
         let mut offset = 0;
         for part in parts {
             match part {
+                PreparedPart::PendingText { .. } => {
+                    return Err(Error::backend(
+                        "Muse text embeddings must be completed in the decoder ingress wave",
+                    ));
+                }
                 PreparedPart::Text { embeddings, .. } => {
                     owned_embeddings.push(embeddings.clone());
                 }
@@ -1232,12 +1506,16 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
         let batch = parts
             .first()
             .map(|part| match part {
-                PreparedPart::Text { tokens, .. } | PreparedPart::Media { tokens } => tokens.dim(0),
+                PreparedPart::Text { tokens, .. }
+                | PreparedPart::PendingText { tokens }
+                | PreparedPart::Media { tokens } => tokens.dim(0),
             })
             .ok_or_else(|| Error::backend("Muse-Glimmer input has no ordered parts"))?;
         for (index, (part, embeddings)) in parts.iter().zip(&owned_embeddings).enumerate() {
             let tokens = match part {
-                PreparedPart::Text { tokens, .. } | PreparedPart::Media { tokens } => tokens,
+                PreparedPart::Text { tokens, .. }
+                | PreparedPart::PendingText { tokens }
+                | PreparedPart::Media { tokens } => tokens,
             };
             if tokens.shape().len() != 2
                 || embeddings.shape().len() != 3
@@ -1263,6 +1541,58 @@ where
     S: LayerRuntimeState<B>,
     S::LayerState: AttentionCache<B::Tensor>,
 {
+    fn observation_hooks(&self) -> eredu_runtime::inspection::ObservationHookSupport {
+        eredu_runtime::inspection::ObservationHookSupport::internal(true, true, true)
+            .with_routed_units(true)
+    }
+    fn observes_unit_boundaries(&self, group: usize, _index: usize) -> bool {
+        group == 1
+    }
+    fn forward_unit_observed<O>(
+        &mut self,
+        group: usize,
+        index: usize,
+        unit: &mut Self::Unit,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &mut Self::ForwardContext,
+        context: &<B::Tensor as Tensor>::Context,
+        observer: &mut O,
+    ) -> Result<B::Tensor, Error>
+    where
+        O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
+    {
+        let pass = <Self as RoutedLayeredArchitecture<B, S>>::expert_pass_for_unit(
+            self, group, index, hidden, forward,
+        );
+        self.forward_text_observed(
+            group,
+            index,
+            unit,
+            hidden,
+            state,
+            forward,
+            pass,
+            &mut eredu_runtime::ResidentExpertProvider,
+            context,
+            observer,
+        )
+    }
+
+    fn finish_forward_observed<O>(
+        &mut self,
+        hidden: &B::Tensor,
+        _state: &mut S,
+        _forward: &Self::ForwardContext,
+        context: &<B::Tensor as Tensor>::Context,
+        observer: &mut O,
+    ) -> Result<B::Tensor, Error>
+    where
+        O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
+    {
+        self.finish_text_observed(hidden, None, context, observer)
+    }
+
     type Input<'a> = ModelInput<'a, B::Tensor>;
     type StaticModules = StaticModules<B>;
     type Unit = Unit<B>;
@@ -1275,15 +1605,7 @@ where
 
     fn group_transport(&self, group: usize) -> eredu_runtime::ArchitectureGroupTransport {
         if group == 0 {
-            eredu_runtime::ArchitectureGroupTransport {
-                placement: eredu_runtime::ArchitectureGroupPlacement::Pipeline,
-                kind: eredu_runtime::ArchitectureGroupKind::VisionEncoder,
-                first_owner_static_roles: vec!["vision".into()],
-                last_owner_static_roles: Vec::new(),
-                merge_destination: eredu_runtime::ArchitectureMergeDestination::FirstPipelineOwner,
-                parallel_subgroup: Some(eredu_runtime::ArchitectureParallelSubgroup::TensorSharded),
-                request_optional: true,
-            }
+            vision_group_transport(&self.args)
         } else {
             crate::transport::decoder()
         }
@@ -1567,7 +1889,9 @@ where
                 PreparedPart::Text { tokens, embeddings } => {
                     values.extend([tokens, embeddings]);
                 }
-                PreparedPart::Media { tokens } => values.push(tokens),
+                PreparedPart::Media { tokens } | PreparedPart::PendingText { tokens } => {
+                    values.push(tokens)
+                }
             }
         }
         if let Some(vision) = &forward.vision {
@@ -1583,6 +1907,91 @@ where
     S: LayerRuntimeState<B>,
     S::LayerState: AttentionCache<B::Tensor>,
 {
+    fn parallel_observation_hooks(&self) -> eredu_runtime::inspection::ObservationHookSupport {
+        eredu_runtime::inspection::ObservationHookSupport::internal(true, true, true)
+            .with_routed_units(true)
+    }
+    fn forward_unit_parallel_observed<O>(
+        &mut self,
+        group: usize,
+        index: usize,
+        unit: &mut Self::Unit,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &mut Self::ForwardContext,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+        observer: &mut O,
+    ) -> Result<B::Tensor, Error>
+    where
+        O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
+    {
+        let pass = <Self as RoutedLayeredArchitecture<B, S>>::expert_pass_for_unit(
+            self, group, index, hidden, forward,
+        );
+        self.forward_text_parallel_observed(
+            group,
+            index,
+            unit,
+            hidden,
+            state,
+            forward,
+            pass,
+            &mut eredu_runtime::ResidentExpertProvider,
+            parallel,
+            context,
+            observer,
+        )
+    }
+
+    fn finish_forward_parallel_observed<O>(
+        &mut self,
+        hidden: &B::Tensor,
+        _state: &mut S,
+        _forward: &Self::ForwardContext,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+        observer: &mut O,
+    ) -> Result<B::Tensor, Error>
+    where
+        O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
+    {
+        self.finish_text_observed(hidden, Some(parallel), context, observer)
+    }
+
+    fn begin_execution_group_parallel(
+        &mut self,
+        group: usize,
+        initial: &B::Tensor,
+        dependencies: &[&B::Tensor],
+        state: &mut S,
+        forward: &mut Self::ForwardContext,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Self::Error> {
+        if group == 1 {
+            for part in &mut forward.parts {
+                if let PreparedPart::PendingText { tokens } = part {
+                    let embeddings = B::vocabulary_parallel_lookup(
+                        &mut self.static_modules.text.embeddings,
+                        tokens,
+                        EmbeddingLookupPolicy::Strict,
+                        parallel,
+                        context,
+                    )?;
+                    *part = PreparedPart::Text {
+                        tokens: tokens.clone(),
+                        embeddings: self
+                            .static_modules
+                            .text
+                            .normalize_embeddings(&embeddings, context)?,
+                    };
+                }
+            }
+        }
+        self.begin_execution_group(group, initial, dependencies, state, forward, context)
+    }
+
     fn begin_forward_parallel<'a>(
         &mut self,
         input: Self::Input<'a>,
@@ -1596,7 +2005,11 @@ where
             ));
         }
         self.validate_partition_state(state)?;
-        let parts = self.prepare_parts_parallel(input.parts, parallel, context)?;
+        // Text lookup reductions belong to the primary decoder wave, after the
+        // replicated vision equations. Other pipeline ranks can then enter the
+        // same exact segmented sums before the decoder's routed collectives.
+        let parts =
+            self.prepare_parts_parallel(input.parts, input.vision.is_some(), parallel, context)?;
         let (hidden, vision) = match input.vision {
             Some(vision) => {
                 let (hidden, state) = self
@@ -1663,17 +2076,12 @@ where
                 "Muse-Glimmer model was not built with rank-local geometry",
             ));
         }
-        let hidden = self.static_modules.text.final_hidden(hidden, context)?;
-        let logits = match &mut self.static_modules.text.head {
-            Some(head) => B::vocabulary_parallel_project(head, &hidden, parallel, context)?,
-            None => B::vocabulary_parallel_embedding_project(
-                &mut self.static_modules.text.embeddings,
-                &hidden,
-                parallel,
-                context,
-            )?,
-        };
-        self.static_modules.text.finish_logits(logits, context)
+        self.static_modules.text.logits_instrumented(
+            hidden,
+            Some(parallel),
+            context,
+            &mut crate::decoder::ComponentInstrumentation::disabled(),
+        )
     }
 }
 
@@ -1683,6 +2091,36 @@ where
     S: LayerRuntimeState<B>,
     S::LayerState: AttentionCache<B::Tensor>,
 {
+    fn partition_observation_hooks(
+        &self,
+        _tensor_parallel: bool,
+    ) -> eredu_runtime::inspection::ObservationHookSupport {
+        eredu_runtime::inspection::ObservationHookSupport::internal(true, true, true)
+            .with_routed_units(true)
+    }
+
+    fn finish_partition_observed<O>(
+        &mut self,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &Self::ForwardContext,
+        owns_output: bool,
+        parallel: Option<&B::ParallelContext>,
+        context: &<B::Tensor as Tensor>::Context,
+        observer: &mut O,
+    ) -> Result<LayeredPartitionOutput<B::Tensor>, Error>
+    where
+        O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
+    {
+        if !owns_output {
+            return self.finish_partition(hidden, state, forward, false, parallel, context);
+        }
+        Ok(LayeredPartitionOutput::Final {
+            output: self.finish_text_observed(hidden, parallel, context, observer)?,
+            retained: None,
+        })
+    }
+
     type Boundary = eredu_runtime::NoAuxiliaryBoundarySchema;
 
     fn boundary_schema(&self) -> Result<Self::Boundary, Self::Error> {

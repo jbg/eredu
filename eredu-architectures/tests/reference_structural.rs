@@ -4354,7 +4354,7 @@ impl RoutedExpertProvider<ReferenceBackend> for ProbeExpertProvider {
     fn forward_grouped(
         &mut self,
         _resident_bank: &mut ReferenceLinear,
-        request: RoutedExpertRequest<'_, ReferenceTensor>,
+        request: RoutedExpertRequest<'_, '_, ReferenceTensor>,
         _: &(),
     ) -> Result<ReferenceTensor, Self::Error> {
         self.calls.push((
@@ -4370,7 +4370,7 @@ impl RoutedExpertProvider<ReferenceBackend> for ProbeExpertProvider {
     fn forward_linear_routed(
         &mut self,
         _resident_bank: &mut ReferenceLinearGroups,
-        request: RoutedExpertRequest<'_, ReferenceTensor>,
+        request: RoutedExpertRequest<'_, '_, ReferenceTensor>,
         _: &(),
     ) -> Result<ReferenceTensor, Self::Error> {
         self.calls.push((
@@ -4385,7 +4385,7 @@ impl RoutedExpertProvider<ReferenceBackend> for ProbeExpertProvider {
     fn forward_relu2_routed(
         &mut self,
         _resident_bank: &mut ReferenceLinear,
-        request: RoutedExpertRequest<'_, ReferenceTensor>,
+        request: RoutedExpertRequest<'_, '_, ReferenceTensor>,
         _: &(),
     ) -> Result<ReferenceTensor, Self::Error> {
         self.calls.push((
@@ -4621,6 +4621,27 @@ fn partition_test_layout(
             .map(|units| partition_test_range(units, size, rank));
         for member in group.members() {
             let mut local_shape = member.global_shape().to_vec();
+            let chunk_range =
+                |extent: usize, chunk: usize| -> Result<std::ops::Range<usize>, Error> {
+                    let units = group.partition_units().ok_or_else(|| {
+                        Error::backend("test chunked member has no logical units")
+                    })?;
+                    let logical = logical_range.as_ref().unwrap();
+                    if chunk == 0 || extent.div_ceil(chunk) != units || logical.end > units {
+                        return Err(Error::backend(
+                            "test chunked member has incompatible geometry",
+                        ));
+                    }
+                    let boundary = |unit: usize| {
+                        if unit == units {
+                            Ok(extent)
+                        } else {
+                            unit.checked_mul(chunk)
+                                .ok_or_else(|| Error::backend("test chunk boundary overflows"))
+                        }
+                    };
+                    Ok(boundary(logical.start)?..boundary(logical.end)?)
+                };
             let (placement, member_logical_range) = match member.sharding() {
                 MemberSharding::Replicated => (TensorPlacement::Replicated, None),
                 MemberSharding::Equal { axis } => {
@@ -4670,6 +4691,37 @@ fn partition_test_layout(
                             end,
                         },
                         Some(range.clone()),
+                    )
+                }
+                MemberSharding::PartitionedChunks { axis, chunk_size } => {
+                    let range = chunk_range(member.global_shape()[*axis], *chunk_size)?;
+                    local_shape[*axis] = range.len();
+                    (
+                        TensorPlacement::Range {
+                            axis: *axis,
+                            start: range.start,
+                            end: range.end,
+                        },
+                        logical_range.clone(),
+                    )
+                }
+                MemberSharding::PartitionedChunkSegments {
+                    axis,
+                    segments,
+                    chunk_size,
+                } => {
+                    let mut indices = Vec::new();
+                    for segment in segments {
+                        let range = chunk_range(segment.len(), *chunk_size)?;
+                        indices.extend(segment.start + range.start..segment.start + range.end);
+                    }
+                    local_shape[*axis] = indices.len();
+                    (
+                        TensorPlacement::Indices {
+                            axis: *axis,
+                            indices,
+                        },
+                        logical_range.clone(),
                     )
                 }
                 MemberSharding::PartitionedSegments { axis, segments } => {
@@ -4723,7 +4775,14 @@ fn partition_test_layout(
                     group.partition_units(),
                     member_logical_range,
                     false,
-                ),
+                )
+                .with_partition_chunk_size(match member.sharding() {
+                    MemberSharding::PartitionedChunks { chunk_size, .. }
+                    | MemberSharding::PartitionedChunkSegments { chunk_size, .. } => {
+                        Some(*chunk_size)
+                    }
+                    _ => None,
+                }),
             );
         }
     }

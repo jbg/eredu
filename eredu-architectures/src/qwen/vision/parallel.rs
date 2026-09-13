@@ -142,7 +142,35 @@ pub fn static_parallel_parameter_groups<B: NeuralBackend + eredu_nn::Distributed
     config: &VisionConfig,
     root: &str,
 ) -> Result<Vec<ParameterGroupSpec>, ParallelPlanError> {
-    let mut groups = vec![
+    Ok(owned_static_parallel_parameter_groups(
+        modules,
+        config,
+        root,
+        eredu_runtime::ExecutionGroupId::new("vision")
+            .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?,
+        "vision",
+    )?
+    .into_iter()
+    .map(|owned| owned.group().clone())
+    .collect())
+}
+
+/// Declares pinned vision storage at its actual patch, final projection and
+/// per-layer DeepStack consumers. A shared consumer list allocates one copy per
+/// owning partition and never transfers these parameters into a block's payload.
+pub fn owned_static_parallel_parameter_groups<
+    B: NeuralBackend + eredu_nn::DistributedNeuralBackend,
+>(
+    modules: &VisionStatic<B>,
+    config: &VisionConfig,
+    root: &str,
+    execution_group: eredu_runtime::ExecutionGroupId,
+    role: &str,
+) -> Result<Vec<eredu_runtime::OwnedParameterGroupSpec>, ParallelPlanError> {
+    let last_unit = config.layer_count().checked_sub(1).ok_or_else(|| {
+        ParallelPlanError::InvalidGroup("vision projection has no consuming unit".into())
+    })?;
+    let ingress = vec![
         module_parameter_group::<B::Tensor, _>(
             format!("{root}.position"),
             ParameterRole::Replicated,
@@ -156,22 +184,48 @@ pub fn static_parallel_parameter_groups<B: NeuralBackend + eredu_nn::Distributed
             |_, _| Ok(MemberSharding::Replicated),
         )?,
     ];
+    let mut groups = ingress
+        .into_iter()
+        .map(|group| {
+            eredu_runtime::OwnedParameterGroupSpec::new(
+                eredu_runtime::ParameterGroupOwner::static_role(role),
+                group,
+            )
+        })
+        .collect::<Vec<_>>();
+    let consumer = |unit| {
+        eredu_runtime::ParameterGroupOwner::static_unit_consumers(
+            role,
+            [(execution_group.clone(), unit)],
+        )
+    };
     let width =
         usize::try_from(config.hidden_size * config.spatial_merge_size * config.spatial_merge_size)
             .map_err(|_| {
                 ParallelPlanError::InvalidGroup("vision merger width exceeds usize".into())
             })?;
-    groups.extend(merger_groups(
-        &modules.merger,
-        &rooted(root, "merger"),
-        width,
-    )?);
+    groups.extend(
+        merger_groups(&modules.merger, &rooted(root, "merger"), width)?
+            .into_iter()
+            .map(|group| {
+                eredu_runtime::OwnedParameterGroupSpec::new(
+                    consumer(last_unit),
+                    group,
+                )
+            }),
+    );
     for (index, merger) in modules.deepstack_mergers.iter().enumerate() {
-        groups.extend(merger_groups(
-            merger,
-            &rooted(root, &format!("deepstack_merger_list.{index}")),
-            width,
-        )?);
+        let unit = usize::try_from(config.deepstack_layers()[index])
+            .map_err(|_| ParallelPlanError::InvalidGroup("negative DeepStack consumer".into()))?;
+        groups.extend(
+            merger_groups(
+                merger,
+                &rooted(root, &format!("deepstack_merger_list.{index}")),
+                width,
+            )?
+            .into_iter()
+            .map(|group| eredu_runtime::OwnedParameterGroupSpec::new(consumer(unit), group)),
+        );
     }
     Ok(groups)
 }

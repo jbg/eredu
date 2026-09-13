@@ -15,6 +15,40 @@ fn setup() -> (CaptureSession, CaptureDiscovery) {
     )
 }
 
+#[test]
+fn aborted_forward_keeps_measurements_and_usage_without_claiming_a_committed_prediction() {
+    let (mut session, discovery) = setup();
+    let initial = session.checkpoint(&discovery).unwrap();
+    let epoch = DistributedCommitEpoch::FIRST;
+    session
+        .prepare_step_transaction(epoch, crate::ExpertPass::Prefill, 0)
+        .unwrap();
+    let mut backend = ProbeBackend {
+        copies: Cell::new(0),
+    };
+    session
+        .observe(&mut backend, "block.output", &vec![3, 4])
+        .unwrap();
+    assert_eq!(backend.copies.get(), 1);
+    assert!(session.take_step().is_none());
+    let charged = session.cumulative_usage();
+    session.finish_transaction(epoch, false);
+    let step = session.take_step().unwrap();
+    assert_eq!(step.outcome, CaptureStepOutcome::Aborted);
+    assert!(step.records[0].payload.is_some());
+    assert_eq!(step.cumulative_usage, charged);
+    assert!(session.checkpoint(&discovery).is_err());
+    assert!(session.take_step().is_none());
+    session.restore(&initial).unwrap();
+    assert_eq!(session.cumulative_usage(), charged);
+    assert_eq!(backend.copies.get(), 1);
+    // Legacy records do not gain fabricated transaction evidence when decoded.
+    let mut legacy = serde_json::to_value(&step).unwrap();
+    legacy.as_object_mut().unwrap().remove("outcome");
+    let legacy: CapturedStep = serde_json::from_value(legacy).unwrap();
+    assert_eq!(legacy.outcome, CaptureStepOutcome::Untracked);
+}
+
 fn run(session: &mut CaptureSession, prediction: u64) -> CapturedStep {
     session
         .begin_step(
@@ -188,4 +222,27 @@ fn failed_reservations_do_not_become_checkpoints_after_drain() {
     assert!(session.checkpoint(&discovery).is_err());
     session.restore(&checkpoint).unwrap();
     assert!(session.begin_step(CapturePhase::Prefill, 0).is_err());
+}
+
+#[test]
+fn pending_admission_failure_blocks_restore_even_without_records() {
+    let (mut session, discovery) = setup();
+    let saved = session.checkpoint(&discovery).unwrap();
+    session
+        .ledger
+        .reserve(session.plan().plan().limits.cumulative)
+        .unwrap();
+    let epoch = eredu_core::DistributedCommitEpoch::FIRST;
+    assert!(session
+        .prepare_step_transaction(epoch, crate::ExpertPass::Prefill, 0)
+        .is_err());
+    assert!(session.records.is_none());
+    assert!(session.take_step().is_none());
+    assert!(session.restore(&saved).is_err());
+    session.finish_transaction(epoch, false);
+    session.restore(&saved).unwrap();
+    assert!(session
+        .prepare_step_transaction(epoch, crate::ExpertPass::Prefill, 0)
+        .is_err());
+    assert!(session.cumulative_usage().host_bytes > 0);
 }

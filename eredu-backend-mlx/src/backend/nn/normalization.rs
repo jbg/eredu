@@ -1,6 +1,35 @@
 //! Native realization of reproducible weighted-normalization arithmetic.
 use safemlx::{error::Exception, Array, Stream};
 
+/// Learned RMS normalization with an input-precision boundary before the gain.
+/// Keep the same rounding order as the native low-precision operator, using
+/// the shared float32 reduction to make half-way cases reproducible on Metal.
+pub(crate) fn input_precision_rms(
+    input: &Array,
+    weight: &Array,
+    epsilon: f32,
+    stream: &Stream,
+) -> Result<Array, Exception> {
+    if input.dtype() == weight.dtype()
+        && matches!(
+            input.dtype(),
+            safemlx::Dtype::Bfloat16 | safemlx::Dtype::Float16
+        )
+        && input
+            .shape()
+            .last()
+            .is_some_and(|width| weight.shape() == [*width])
+    {
+        let wide = input.as_dtype(safemlx::Dtype::Float32, stream)?;
+        if let Some(normalized) = f32_weightless_rms(&wide, epsilon, stream)? {
+            return normalized
+                .as_dtype(input.dtype(), stream)?
+                .multiply(weight, stream);
+        }
+    }
+    safemlx::fast::rms_norm(input, weight, epsilon, stream)
+}
+
 pub(crate) fn f32_weightless_rms(
     input: &Array,
     epsilon: f32,

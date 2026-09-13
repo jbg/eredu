@@ -89,7 +89,7 @@ impl<T> DistributedCompletion<T> {
             Some(context) => context
                 .authority
                 .ensure_active()
-                .map_err(|error| Error::Parallel(error.to_string())),
+                .map_err(|error| Error::Other(Box::new(error))),
             None => Ok(()),
         }
     }
@@ -150,29 +150,27 @@ impl<T> DistributedCompletion<T> {
         recovery.retention().host_failed.set(event.is_err());
         recovery.progress();
         let event = Rc::new(event.map_err(|error| {
-            Error::Parallel(
+            Error::Other(Box::new(
                 authority
-                    .submission_error(
+                    .submission_failure(
                         error,
                         operation,
                         eredu_runtime::DistributedExecutionPhase::Execution,
                         None,
-                    )
-                    .to_string(),
-            )
+                    ),
+            ))
         })?);
         *recovery.retention().event.borrow_mut() = Some(Rc::clone(&event));
         check_native_status(&recovery).map_err(|error| {
-            Error::Parallel(
+            Error::Other(Box::new(
                 authority
-                    .submission_error(
+                    .submission_failure(
                         error,
                         operation,
                         eredu_runtime::DistributedExecutionPhase::Execution,
                         None,
-                    )
-                    .to_string(),
-            )
+                    ),
+            ))
         })?;
         #[cfg(test)]
         let force_pending = Rc::new(Cell::new(
@@ -195,12 +193,11 @@ impl<T> DistributedCompletion<T> {
 
     fn completion_error(&self, error: safemlx::error::Exception) -> Error {
         match &self.authority {
-            Some(context) => Error::Parallel(
+            Some(context) => Error::Other(Box::new(
                 context
                     .authority
-                    .completion_error(error, context.operation, context.phase, None)
-                    .to_string(),
-            ),
+                    .completion_failure(error, context.operation, context.phase, None),
+            )),
             None => Error::from(error),
         }
     }

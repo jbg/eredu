@@ -81,7 +81,7 @@ where
         input.with_borrowed(|input| {
             let tokens = input::text_token_ids(input, context)
                 .map(MlxTensor::from_array)
-                .map_err(|error| Exception::custom(error.to_string()))?;
+                .map_err(Exception::from_source)?;
             let prepared_tokens = tokens.clone();
             operation(
                 A::text_input(&prepared_tokens, None),
@@ -127,6 +127,29 @@ where
         state.deep_checkpoint()
     }
 
+    fn control_state_estimate(
+        state: &S,
+    ) -> Option<eredu_core::execution_control::SnapshotEstimate> {
+        state.isolated_snapshot_estimate()
+    }
+
+    fn control_state_snapshot(
+        state: &S,
+        stream: &Stream,
+    ) -> Result<Option<S>, eredu_core::speculative::SpeculativeControlError> {
+        if !state.supports_isolated_snapshot() {
+            return Ok(None);
+        }
+        let copy = (|| {
+            super::speculative::state_snapshot::settle(state.retained_arrays())?;
+            let copy = state.isolated_snapshot(stream)?;
+            super::speculative::state_snapshot::settle(copy.retained_arrays())?;
+            Ok::<_, Exception>(copy)
+        })()
+        .map_err(eredu_core::speculative::SpeculativeControlError::backend)?;
+        Ok(Some(copy))
+    }
+
     fn restore(state: &mut S, checkpoint: &S, context: &Stream) -> Result<(), Exception> {
         state.restore_checkpoint(checkpoint, context)
     }
@@ -161,6 +184,10 @@ where
         Exception::custom(error.to_string())
     }
 
+    fn session_failure(error: eredu_core::BackendFailure) -> Exception {
+        Exception::from_source(error)
+    }
+
     fn take_telemetry() -> Result<Self::Telemetry, Exception> {
         Ok(Self::Telemetry::default())
     }
@@ -172,6 +199,61 @@ impl SpeculativeTensorMechanisms for MlxEmbeddedPredictionMechanisms {
     type Context<'a> = SpeculativeExecutionStreams<'a>;
     type Completion = super::speculative::MlxSpeculativeCompletion;
     type Error = Exception;
+
+    fn observation_error(message: &'static str) -> Self::Error {
+        Exception::custom(message)
+    }
+
+    fn control_tensor_estimate(
+        value: &MlxTensor,
+    ) -> Option<eredu_core::execution_control::SnapshotEstimate> {
+        super::speculative::state_snapshot::estimate_array(value.as_array())
+    }
+
+    fn control_tensor_snapshot<'a>(
+        value: &MlxTensor,
+        context: Self::Context<'a>,
+    ) -> Result<Option<MlxTensor>, eredu_core::speculative::SpeculativeControlError> {
+        super::speculative::state_snapshot::copy_array(value.as_array(), context.target())
+            .map(|array| Some(MlxTensor::from_array(array)))
+            .map_err(eredu_core::speculative::SpeculativeControlError::backend)
+    }
+
+    fn coordinate_speculative_step<'a>(
+        local: Vec<eredu_core::SpeculativeScheduleState>,
+        context: Self::Context<'a>,
+    ) -> Result<Vec<eredu_core::SpeculativeScheduleState>, eredu_core::BackendFailure> {
+        context.coordinate_speculative_step(local)
+    }
+
+    fn agree_text_preparation<'a>(
+        stage: eredu_core::run_preparation::TextPreparationStage,
+        status: eredu_core::run_preparation::TextPreparationStatus,
+        context: Self::Context<'a>,
+    ) -> Result<eredu_core::run_preparation::TextPreparationOutcome, eredu_core::BackendFailure>
+    {
+        context.agree_text_preparation(stage, status)
+    }
+
+    fn activation_observer<'a>(
+        plan: &eredu_core::speculative::AdmittedSpeculativeActivations,
+        request: eredu_core::SpeculativeRequestId,
+        context: Self::Context<'a>,
+    ) -> Result<
+        Option<
+            Box<dyn eredu_runtime::inspection::SpeculativeActivationObserver<MlxTensor, Exception>>,
+        >,
+        eredu_core::speculative::SpeculativeControlError,
+    > {
+        match context.capture_binding() {
+            Some(binding) => binding.observer(plan, request, context.target()),
+            None => super::session::bounded_capture::speculative_capture(
+                plan,
+                request,
+                context.target(),
+            ),
+        }
+    }
 
     fn empty_prediction_input() -> Self::Error {
         Exception::custom("embedded prediction input must contain at least one token")
@@ -320,6 +402,27 @@ impl<'world> SpeculativeGenerationBackend for MlxBackend<'world> {
 
     fn speculative_capability(runtime: &ModelRuntime<Self>) -> SpeculativeCapability {
         runtime.session().speculative_capability()
+    }
+
+    fn speculative_activation_discovery(
+        runtime: &ModelRuntime<Self>,
+    ) -> Result<
+        eredu_core::speculative::SpeculativeActivationDiscovery,
+        eredu_core::capture::CaptureError,
+    > {
+        runtime.session().speculative_activation_discovery()
+    }
+
+    fn validate_speculative_activations(
+        runtime: &ModelRuntime<Self>,
+        plan: &eredu_core::speculative::AdmittedSpeculativeActivations,
+    ) -> Result<(), eredu_core::capture::CaptureError> {
+        plan.validate(&Self::speculative_activation_discovery(runtime)?)?;
+        eredu_runtime::intervention::preflight(
+            plan.captures(),
+            plan.interventions(),
+            &super::session::intervention::NativeInterventionEstimator,
+        )
     }
 
     fn validate_speculative_capture(
@@ -499,7 +602,7 @@ where
             self.streams,
             self.visitor,
         )
-        .map_err(|error| Error::Speculative(error.to_string()))
+        .map_err(|error| Error::Exception(Exception::from_source(error)))
     }
 }
 
@@ -518,48 +621,57 @@ where
     C: SpeculativeTokenFilterController + 'run,
     S: SpeculativeSampler<MlxSamplingBackend> + Clone + 'run,
 {
-    if caches.len() != lanes.len() {
-        return Err(Exception::custom(format!(
-            "speculative cache has {} lanes but the request has {} lanes",
-            caches.len(),
-            lanes.len()
-        )));
-    }
     let topology = streams.topology();
     let component_timings_collected = component_timing_enabled() && backend.supports_telemetry();
-    let mut prepared = Vec::with_capacity(lanes.len());
-    for (lane, cache) in lanes.into_iter().zip(caches.iter_mut()) {
-        let MlxSpeculativeLaneRuntime {
-            input,
-            config,
-            prng_key,
-            sampler,
-            semantic,
-            cancellation,
-            on_event,
-        } = lane;
-        let sampling = MlxSpeculativeSampling::new(wrap_sampler(sampler)?);
-        let randomness = <MlxSpeculativeSampling<S> as SpeculativeSampling>::initialize_randomness(
-            prng_key,
-            config.temperature,
-            streams,
-        )?;
-        let sequence =
-            GenerationSequence::new(config.max_tokens, config.eos_token_ids.iter().copied());
-        prepared.push(PreparedSpeculativeLane::new(
-            cache,
-            input,
-            config,
-            SpeculativeOutputRuntime::new(
-                sampling,
-                sequence,
-                SpeculativeSemanticConstraint::semantic(semantic),
-                SpeculativeCallbackPublisher::semantic(on_event),
+    let prepared = (|| {
+        if caches.len() != lanes.len() {
+            return Err(Exception::custom(format!(
+                "speculative cache has {} lanes but the request has {} lanes",
+                caches.len(),
+                lanes.len()
+            )));
+        }
+        let mut prepared = Vec::with_capacity(lanes.len());
+        for (lane, cache) in lanes.into_iter().zip(caches.iter_mut()) {
+            let MlxSpeculativeLaneRuntime {
+                input,
+                config,
+                prng_key,
+                sampler,
+                semantic,
                 cancellation,
-            ),
-            randomness,
-        ));
-    }
+                on_event,
+            } = lane;
+            let sampling = MlxSpeculativeSampling::new(wrap_sampler(sampler)?);
+            let randomness =
+                <MlxSpeculativeSampling<S> as SpeculativeSampling>::initialize_randomness(
+                    prng_key,
+                    config.temperature,
+                    streams,
+                )?;
+            let sequence =
+                GenerationSequence::new(config.max_tokens, config.eos_token_ids.iter().copied());
+            prepared.push(PreparedSpeculativeLane::new(
+                cache,
+                input,
+                config,
+                SpeculativeOutputRuntime::new(
+                    sampling,
+                    sequence,
+                    SpeculativeSemanticConstraint::semantic(semantic),
+                    SpeculativeCallbackPublisher::semantic(on_event),
+                    cancellation,
+                ),
+                randomness,
+            ));
+        }
+        Ok(prepared)
+    })();
+    let prepared = streams.finish_preparation(
+        eredu_core::run_preparation::TextPreparationStage::Delivery,
+        prepared,
+        Exception::from_source,
+    )?;
     visitor
         .run(
             backend,
@@ -569,7 +681,7 @@ where
             component_timings_collected,
             streams,
         )
-        .map_err(|error| Exception::custom(error.to_string()))
+        .map_err(Exception::from_source)
 }
 
 impl<'runtime, 'world> MlxSpeculativeSession<'runtime, 'world> {
@@ -586,7 +698,7 @@ impl<'runtime, 'world> MlxSpeculativeSession<'runtime, 'world> {
     {
         let resolved = generation.sampling();
         let sampler = MlxTextSampler::from_config(generation)
-            .map_err(|error| Error::Speculative(error.to_string()))?;
+            .map_err(|error| Error::Exception(Exception::from_source(error)))?;
         let prng_key = (resolved.temperature != 0.0)
             .then(|| safemlx::random::key(generation.seed()))
             .transpose()?;
@@ -698,7 +810,7 @@ impl<'runtime, 'world> MlxSpeculativeSession<'runtime, 'world> {
                         streams,
                         visitor,
                     )
-                    .map_err(|e| Error::Speculative(e.to_string()))
+                    .map_err(|error| Error::Exception(Exception::from_source(error)))
                 })
             });
         }
@@ -735,7 +847,9 @@ impl<'runtime, 'world> MlxSpeculativeSession<'runtime, 'world> {
     {
         self.runtime.session().ensure_no_submission_in_flight()?;
         let stream = self.runtime.backend().stream().clone();
-        let streams = SpeculativeExecutionStreams::single(&stream);
+        let capture = self.runtime.session().speculative_partition_binding();
+        let streams =
+            SpeculativeExecutionStreams::single(&stream).with_capture_binding(capture.as_ref());
         let mut continuation = MlxEmbeddedBatchContinuation {
             lanes,
             streams,
@@ -775,11 +889,21 @@ where
     ) -> Result<SpeculativeGenerationBatchOutput, Error> {
         let proposal_capacity = selected.requirements().strategy().proposal_capacity().get();
         let lanes = std::mem::take(&mut self.lanes);
-        let prepared_lanes =
-            MlxSpeculativeSession::prepare_speculative_batch_lanes(lanes, proposal_capacity)?;
-        let mut caches = (0..prepared_lanes.len())
+        // Cache construction may enter architecture-owned preparation
+        // collectives. Every rank must first accept its sampler/lane policy.
+        let prepared_lanes = self.streams.finish_preparation(
+            eredu_core::run_preparation::TextPreparationStage::Sampling,
+            MlxSpeculativeSession::prepare_speculative_batch_lanes(lanes, proposal_capacity),
+            |error| Error::Exception(Exception::from_source(error)),
+        )?;
+        let caches = (0..prepared_lanes.len())
             .map(|_| executor.new_cache())
-            .collect::<Result<Vec<_>, _>>()?;
+            .collect::<Result<Vec<_>, _>>();
+        let mut caches = self.streams.finish_preparation(
+            eredu_core::run_preparation::TextPreparationStage::Sampling,
+            caches,
+            Exception::from_source,
+        )?;
         run_speculative_batch(
             executor,
             prepared_lanes,
@@ -790,7 +914,7 @@ where
                 .take()
                 .expect("embedded executor continuation is invoked once"),
         )
-        .map_err(|error| Error::Speculative(error.to_string()))
+        .map_err(|error| Error::Exception(Exception::from_source(error)))
     }
 }
 

@@ -90,6 +90,53 @@ fn arithmetic_shape_and_indexing_match_native_operations() {
 }
 
 #[test]
+#[ignore = "requires local MLX CPU and Metal execution"]
+fn gather_bounds_settle_before_rejection_and_preserve_valid_indices() {
+    use crate::backend::nn::tensor::TokenValidationScope;
+    use safemlx::transforms::async_eval_with_event;
+
+    for device in [DeviceType::Cpu, DeviceType::Gpu] {
+        let execution = ExecutionContext::new(Device::new(device, 0));
+        let stream = execution.stream();
+        let table = MlxTensor::from_array(Array::from_slice(&[0_i32, 2, 1], &[3]));
+        let values = MlxTensor::from_array(Array::from_slice(&[0.25_f32, -2.0, 3.5], &[3]));
+        let valid = MlxTensor::from_array(Array::from_slice(&[-3_i32, -1, 1], &[3]));
+        let selected = table.take_axis(&valid, -1, stream).unwrap();
+        close(
+            values.take_axis(&selected, 0, stream).unwrap().as_array(),
+            &[0.25, -2.0, 3.5],
+        );
+        for invalid in [
+            Array::from_slice(&[-4_i32, 3, i32::MAX], &[3]),
+            Array::from_slice(&[3_u32, u32::MAX, 4], &[3]),
+            Array::from_slice(&[3_i64, i64::MAX, i64::MIN], &[3]),
+            Array::from_slice(&[3_u64, u64::MAX, 4], &[3]),
+        ] {
+            let invalid = MlxTensor::from_array(invalid);
+            assert!(table.take_axis(&invalid, 0, stream).is_err());
+            let scope = TokenValidationScope::begin().unwrap();
+            let selected = table.take_axis(&invalid, 0, stream).unwrap();
+            // A second gather must remain safe even before the first one's
+            // deferred rejection reaches the submission completion boundary.
+            let output = values.take_axis(&selected, 0, stream).unwrap();
+            let validations = scope.finish();
+            async_eval_with_event(std::iter::once(output.as_array()).chain(validations.arrays()))
+                .unwrap()
+                .synchronize()
+                .unwrap();
+            assert!(validations
+                .validate_completed()
+                .unwrap_err()
+                .to_string()
+                .contains("gather index is outside"));
+            close(output.as_array(), &[0.25; 3]);
+        }
+        assert!(table.take_axis(&valid, 1, stream).is_err());
+        assert!(table.take_axis(&valid, i32::MIN, stream).is_err());
+    }
+}
+
+#[test]
 #[ignore = "requires an MLX execution device; run with --ignored on an MLX-capable host"]
 fn convolution_matches_native_operation() {
     let context = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));

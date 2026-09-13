@@ -128,10 +128,10 @@ where
             .expect("validated layout covers every flat unit");
         let path = architecture
             .unit_path(address.group(), address.index())
-            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+            .map_err(|error| Error::Other(Box::new(error)))?;
         let unit = architecture
             .build_unit(address.group(), address.index(), stream)
-            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+            .map_err(|error| Error::Other(Box::new(error)))?;
         let bindings = unit_bindings(index, address, &path, unit, store.as_ref(), stream)?;
         let bytes = binding_bytes(&bindings)?;
         layer_parameter_bytes = layer_parameter_bytes
@@ -278,6 +278,46 @@ pub fn prepare_layerwise_policy_from_bindings<A, S, P, I>(
     store: SharedCheckpointSource,
     architecture: &mut A,
     populator: P,
+    state: std::marker::PhantomData<S>,
+    options: LayerWeightResidency,
+    stream: &Stream,
+    weights_stream: &Stream,
+    ignored: I,
+    layout: ExecutionUnitLayout,
+    static_bindings: Vec<WeightBinding>,
+    unit_bindings: Vec<Vec<WeightBinding>>,
+) -> Result<(MlxLayerwisePolicy<A::Unit, P>, LayerwiseModelMetadata), Error>
+where
+    A: LayeredArchitecture<MlxNeuralBackend, S>,
+    A::Unit: 'static,
+    S: RuntimeState<MlxNeuralBackend>,
+    A::Error: std::fmt::Display,
+    P: MlxUnitPopulator<A::Unit>,
+    I: Fn(&str) -> bool,
+{
+    prepare_layerwise_policy_with_supplementary_bindings(
+        store,
+        architecture,
+        populator,
+        state,
+        options,
+        stream,
+        weights_stream,
+        ignored,
+        layout,
+        static_bindings,
+        unit_bindings,
+        Vec::new(),
+    )
+}
+
+/// Builds one shared residency policy over ordinary and supplementary modules,
+/// retaining the exact prepared source associated with each supplementary owner.
+#[allow(clippy::too_many_arguments)]
+pub fn prepare_layerwise_policy_with_supplementary_bindings<A, S, P, I>(
+    store: SharedCheckpointSource,
+    architecture: &mut A,
+    populator: P,
     _state: std::marker::PhantomData<S>,
     options: LayerWeightResidency,
     stream: &Stream,
@@ -286,6 +326,7 @@ pub fn prepare_layerwise_policy_from_bindings<A, S, P, I>(
     layout: ExecutionUnitLayout,
     static_bindings: Vec<WeightBinding>,
     unit_bindings: Vec<Vec<WeightBinding>>,
+    supplementary: Vec<SupplementaryResidencyUnit>,
 ) -> Result<(MlxLayerwisePolicy<A::Unit, P>, LayerwiseModelMetadata), Error>
 where
     A: LayeredArchitecture<MlxNeuralBackend, S>,
@@ -382,6 +423,34 @@ where
         unit_ids.push(id);
         unit_bytes.push(bytes);
     }
+    let mut extra = eredu_runtime::AuxiliaryWeightRequirements::default();
+    let mut sources = std::collections::BTreeMap::new();
+    for unit in supplementary {
+        let bytes = binding_bytes(unit.definition.bindings())?;
+        let host = host_capacity_upper_bound_for_bindings(unit.definition.bindings())?;
+        extra = extra
+            .checked_add_module(bytes, host, unit.shared)
+            .ok_or_else(|| Error::Parallel("auxiliary residency bytes overflowed".into()))?;
+        let id = unit.definition.id().clone();
+        specs.push(OffloadUnitSpec::new(
+            id.clone(),
+            bytes,
+            if fully_resident {
+                ResidencyPolicy::Pinned
+            } else {
+                ResidencyPolicy::Cacheable
+            },
+            if fully_resident {
+                MemoryTier::Device
+            } else if dense.is_some() {
+                MemoryTier::Disk
+            } else {
+                MemoryTier::Host
+            },
+        )?);
+        sources.insert(id, unit.source);
+        definitions.push(unit.definition);
+    }
     consumed.extend(store.materialized_source_keys());
     validate_unused(store.as_ref(), &consumed, ignored)?;
     let device_window_bytes = (0..layout.group_count())
@@ -403,8 +472,28 @@ where
         None if fully_resident => 0,
         None => total_host_bytes,
     };
+    let auxiliary_host = extra
+        .host_bytes(options)
+        .ok_or_else(|| Error::Parallel("auxiliary host bytes overflowed".into()))?;
+    let host_required = if dense.is_some() {
+        host_required.max(auxiliary_host)
+    } else {
+        host_required
+            .checked_add(auxiliary_host)
+            .ok_or_else(|| Error::Parallel("combined host bytes overflowed".into()))?
+    };
+    let auxiliary_device = extra
+        .device_bytes(options)
+        .ok_or_else(|| Error::Parallel("auxiliary device bytes overflowed".into()))?;
+    let required_device = if fully_resident {
+        device_window_bytes
+            .checked_add(auxiliary_device)
+            .ok_or_else(|| Error::Parallel("combined device bytes overflowed".into()))?
+    } else {
+        device_window_bytes.max(auxiliary_device)
+    };
     validate_host_budget(offload, host_required)?;
-    validate_device_budget(offload, static_bytes, device_window_bytes, depth)?;
+    validate_device_budget(offload, static_bytes, required_device, depth)?;
 
     let plan = OffloadPlan::new(offload, specs)?;
     let residency_stream = if dense.is_some() {
@@ -412,8 +501,9 @@ where
     } else {
         stream.clone()
     };
-    let residency = ResidencyManager::new_shared(
+    let residency = ResidencyManager::new_shared_sources(
         Arc::clone(&store),
+        sources,
         plan,
         definitions,
         weights_stream.clone(),

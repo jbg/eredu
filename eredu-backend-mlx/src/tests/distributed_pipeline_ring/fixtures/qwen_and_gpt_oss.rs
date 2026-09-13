@@ -38,6 +38,61 @@ fn write_qwen_fixture(directory: &Path, model_type: &str) {
     write_qwen_fixture_with_tied_head(directory, model_type, false);
 }
 
+fn write_nanbeige_fixture(directory: &Path) {
+    // One physical dense block is invoked twice. Only the physical checkpoint
+    // parameters are written; the inter-loop gain aliases the shared final norm.
+    let config = serde_json::json!({
+        "model_type": "nanbeige", "hidden_size": 32, "num_hidden_layers": 1,
+        "num_loops": 2, "skip_loop_final_norm": false, "intermediate_size": 64,
+        "num_attention_heads": 4, "num_key_value_heads": 2, "head_dim": 8,
+        "rms_norm_eps": 0.000001, "vocab_size": 32, "max_position_embeddings": 128,
+        "rope_theta": 70000000.0, "tie_word_embeddings": false,
+        "attention_bias": false, "mlp_bias": false
+    });
+    std::fs::write(
+        directory.join("config.json"),
+        serde_json::to_vec_pretty(&config).unwrap(),
+    )
+    .unwrap();
+    let shapes = [
+        ("model.embed_tokens.weight", vec![32, 32]),
+        ("model.norm.weight", vec![32]),
+        ("lm_head.weight", vec![32, 32]),
+        ("model.layers.0.input_layernorm.weight", vec![32]),
+        ("model.layers.0.post_attention_layernorm.weight", vec![32]),
+        ("model.layers.0.self_attn.q_proj.weight", vec![32, 32]),
+        ("model.layers.0.self_attn.k_proj.weight", vec![16, 32]),
+        ("model.layers.0.self_attn.v_proj.weight", vec![16, 32]),
+        ("model.layers.0.self_attn.o_proj.weight", vec![32, 32]),
+        ("model.layers.0.mlp.gate_proj.weight", vec![64, 32]),
+        ("model.layers.0.mlp.up_proj.weight", vec![64, 32]),
+        ("model.layers.0.mlp.down_proj.weight", vec![32, 64]),
+    ];
+    let buffers = shapes
+        .iter()
+        .enumerate()
+        .map(|(ordinal, (_, shape))| {
+            (0..shape.iter().product::<usize>())
+                .flat_map(|index| {
+                    let value = if shape.len() == 1 {
+                        0.8 + index as f32 * 0.005
+                    } else {
+                        0.02 * (index as f32 * 0.013 + ordinal as f32).sin()
+                    };
+                    value.to_le_bytes()
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    let views = shapes.iter().zip(&buffers).map(|((name, shape), bytes)| {
+        (
+            *name,
+            TensorView::new(Dtype::F32, shape.clone(), bytes).unwrap(),
+        )
+    });
+    serialize_to_file(views, None, &directory.join("model.safetensors")).unwrap();
+}
+
 fn write_indexed_qwen_fixture(directory: &Path, model_type: &str) {
     write_qwen_fixture(directory, model_type);
     let source = directory.join("model.safetensors");
@@ -138,12 +193,20 @@ fn write_qwen_config_fixture(directory: &Path, config: serde_json::Value) {
     .unwrap();
 }
 
-fn write_qwen3_moe_gguf_fixture(path: &Path) {
-    write_qwen_gguf_fixture(path, "qwen3_moe");
+fn write_qwen3_moe_gguf_fixture(path: &Path, packed_component_fixture: bool) {
+    write_qwen_gguf_fixture_with_banks(path, "qwen3_moe", packed_component_fixture);
 }
 
 fn write_qwen_gguf_fixture(path: &Path, model_type: &str) {
-    let config = qwen_config(model_type);
+    write_qwen_gguf_fixture_with_banks(path, model_type, false);
+}
+
+fn write_qwen_gguf_fixture_with_banks(path: &Path, model_type: &str, packed_banks: bool) {
+    let mut config = qwen_config(model_type);
+    if packed_banks {
+        // Each TP2 down-projection input retains a complete native GGUF block.
+        config["moe_intermediate_size"] = serde_json::json!(64);
+    }
     std::fs::write(
         path.parent().unwrap().join("config.json"),
         serde_json::to_vec_pretty(&config).unwrap(),
@@ -272,12 +335,60 @@ fn write_qwen_gguf_fixture(path: &Path, model_type: &str) {
             GgufMetadataValue::Uint32(args.intermediate_size as u32),
         );
     }
+    let mut encodings = BTreeMap::new();
+    if packed_banks {
+        let mut reference_banks = BTreeMap::<String, (Vec<i32>, Vec<f32>)>::new();
+        for tensor in &mut specs {
+            if !tensor.name.ends_with("_exps.weight") { continue; }
+            let layer = tensor.name.split('.').nth(1).unwrap().parse::<usize>().unwrap();
+            let ty = if layer == 0 { GgmlType::Q8_0 } else { GgmlType::IQ4NL };
+            let [width, rows, groups] = tensor.dimensions.as_slice() else { panic!("expert bank geometry"); };
+            let (width, rows, groups) = (*width as usize, *rows as usize, *groups as usize);
+            assert_eq!(width % 32, 0);
+            let down = tensor.name.contains("ffn_down_exps");
+            let bank_rows = if down { rows } else { rows * 2 };
+            let row_start = if tensor.name.contains("ffn_up_exps") { rows } else { 0 };
+            let id = format!("model.layers.{layer}.mlp.experts.{}", if down { "down_proj" } else { "gate_up_proj" });
+            let (_, reference) = reference_banks.entry(id).or_insert_with(|| (
+                vec![groups as i32, bank_rows as i32, width as i32], vec![0.0; groups * bank_rows * width],
+            ));
+            let phase = tensor.name.bytes().map(usize::from).sum::<usize>();
+            let mut bytes = Vec::new();
+            let table = [-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113];
+            for group in 0..groups { for row in 0..rows { for block in 0..width / 32 {
+                let exponent = ((group + row + block) % 3) as i32 - if ty == GgmlType::Q8_0 { 8 } else { 11 };
+                let scale = 2.0f32.powi(exponent);
+                bytes.extend((((exponent + 15) as u16) << 10).to_le_bytes());
+                let code = |column: usize| group * 7 + row * 5 + block * 3 + column * 11 + phase;
+                if ty == GgmlType::Q8_0 {
+                    for column in 0..32 { bytes.push(((code(column) % 31) as i8 - 15) as u8); }
+                } else {
+                    for column in 0..16 { bytes.push((code(column) % 16) as u8 | ((code(column + 16) % 16) as u8) << 4); }
+                }
+                for column in 0..32 {
+                    let scalar = if ty == GgmlType::Q8_0 { (code(column) % 31) as i32 - 15 } else { table[code(column) % 16] };
+                    reference[(group * bank_rows + row_start + row) * width + block * 32 + column] = scalar as f32 * scale;
+                }
+            }}}
+            tensor.data = bytes;
+            encodings.insert(tensor.name.clone(), ty);
+        }
+        assert_eq!(reference_banks.len(), 4);
+        let reference_dir = path.parent().unwrap().join("independent-reference");
+        std::fs::create_dir(&reference_dir).unwrap();
+        std::fs::write(reference_dir.join("config.json"), serde_json::to_vec(&config).unwrap()).unwrap();
+        let reference_arrays: Vec<_> = arrays.iter().map(|(name, value)| {
+            (name.clone(), reference_banks.get(name).map_or_else(|| value.clone(), |(shape, values)| Array::from_slice(values, shape)))
+        }).collect();
+        Array::save_safetensors(reference_arrays.iter().map(|(name,value)| (name.as_str(),value)), None,
+            reference_dir.join("model.safetensors")).unwrap();
+    }
     let tensors = specs
         .iter()
         .map(|tensor| TensorInput {
             name: &tensor.name,
             dimensions: &tensor.dimensions,
-            ggml_type: GgmlType::F32,
+            ggml_type: encodings.get(&tensor.name).copied().unwrap_or(GgmlType::F32),
             data: &tensor.data,
         })
         .collect::<Vec<_>>();
@@ -287,6 +398,10 @@ fn write_qwen_gguf_fixture(path: &Path, model_type: &str) {
 }
 
 fn write_gpt_oss_fixture(directory: &Path) {
+    write_gpt_oss_fixture_with_patterns(directory, false);
+}
+
+fn write_gpt_oss_fixture_with_patterns(directory: &Path, component_patterns: bool) {
     let config = serde_json::json!({
         "model_type": "gpt_oss",
         "hidden_size": 64,
@@ -337,12 +452,19 @@ fn write_gpt_oss_fixture(directory: &Path) {
                         .bytes()
                         .fold(0u32, |sum, byte| sum + u32::from(byte))
                         % 17;
-                    Array::full::<f32>(
-                        &shape,
-                        Array::from_f32(0.002 + ordinal as f32 * 0.0003),
-                        stream,
-                    )
-                    .unwrap()
+                    if component_patterns {
+                        // Distinct signed reads, writes and token directions keep
+                        // causal trials observable through the final normalization.
+                        // Retain the published MXFP4 expert representation above.
+                        let count = tensor.shape.iter().product::<usize>();
+                        Array::from_slice(&patterned_values(count, 0.003, ordinal as usize), &shape)
+                    } else {
+                        Array::full::<f32>(
+                            &shape,
+                            Array::from_f32(0.002 + ordinal as f32 * 0.0003),
+                            stream,
+                        ).unwrap()
+                    }
                 }
             };
             (tensor.key.clone(), value)

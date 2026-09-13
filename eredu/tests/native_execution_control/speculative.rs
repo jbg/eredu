@@ -1,6 +1,15 @@
 use super::*;
 use eredu_core::{DraftPlacementPlan, DraftingPlan};
 
+#[path = "speculative/activations.rs"]
+mod activations;
+#[path = "speculative/parameters.rs"]
+mod parameters;
+#[path = "speculative/pooling.rs"]
+mod pooling;
+#[path = "speculative/v4_components.rs"]
+mod v4_components;
+
 fn artifacts() -> (Fixture, Fixture) {
     let target = fixture(false);
     let draft = fixture(false);

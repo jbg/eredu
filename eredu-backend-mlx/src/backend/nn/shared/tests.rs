@@ -31,3 +31,5 @@ include!("tests/communication.rs");
 include!("tests/backend_extension.rs");
 include!("tests/parameters.rs");
 include!("tests/operators.rs");
+
+mod grouped_units;

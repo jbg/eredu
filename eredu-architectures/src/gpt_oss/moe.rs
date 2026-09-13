@@ -61,6 +61,8 @@ pub struct RoutedMlp<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBacken
 impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend>
     crate::decoder::RoutedProjectionOperator<B> for RoutedMlp<B>
 {
+    const COMPONENT_OBSERVATIONS: bool = true;
+
     fn forward_with_provider<P>(
         &mut self,
         _layer: usize,
@@ -196,6 +198,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> RoutedMlp<B> 
             .forward_grouped(
                 &mut self.experts,
                 RoutedExpertRequest {
+                    unit_observer: None,
                     bank: eredu_runtime::RoutedBankId::new(0),
                     layer: self.layer,
                     input,
@@ -204,7 +207,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> RoutedMlp<B> 
                 },
                 context,
             )
-            .map_err(Error::backend)
+            .map_err(Error::backend_source)
     }
 
     /// Executes provider-backed rank-local TP work and performs one reduction.
@@ -225,6 +228,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> RoutedMlp<B> 
             .forward_grouped_tensor_parallel(
                 &mut self.experts,
                 RoutedExpertRequest {
+                    unit_observer: None,
                     bank: eredu_runtime::RoutedBankId::new(0),
                     layer: self.layer,
                     input,
@@ -234,7 +238,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> RoutedMlp<B> 
                 B::parallel_size(parallel),
                 context,
             )
-            .map_err(Error::backend)?;
+            .map_err(Error::backend_source)?;
         eredu_runtime::reduce_routed_expert_tensor_parallel::<B>(output, parallel, context)
     }
 }
@@ -447,6 +451,10 @@ mod tests {
 impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> DecoderProjectionOperator<B>
     for RoutedMlp<B>
 {
+    fn residual_observation(&self) -> &'static str {
+        "feed_forward.contribution"
+    }
+
     fn forward_feed_forward(
         &mut self,
         input: &B::Tensor,

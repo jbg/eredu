@@ -4,6 +4,7 @@ use eredu_core::{
     CompletionCancellationMode,
 };
 use safemlx::{Device, DeviceType};
+mod capture_hook;
 
 fn singleton_data_manifest() -> (
     eredu_runtime::CommunicationManifest,

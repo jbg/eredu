@@ -23,6 +23,7 @@ struct Support {
     direct: bool,
     transform: bool,
     paged: bool,
+    weight_paging: bool,
     rejected_dtype: Option<StateTensorDtype>,
     maximum_element_bytes: Option<u8>,
     storage_queries: RefCell<Vec<StateStorageDtype>>,
@@ -34,7 +35,15 @@ impl ReplicatedTextMechanismSupport for Support {
     fn facts(&self, _: &CacheResidencyPolicy) -> BackendMechanismFacts {
         BackendMechanismFacts::new(
             NeuralOperatorCapabilities::NONE,
-            [WeightResidencyMechanism::Resident],
+            if self.weight_paging {
+                vec![
+                    WeightResidencyMechanism::Resident,
+                    WeightResidencyMechanism::Windowed,
+                    WeightResidencyMechanism::DiskStreamed,
+                ]
+            } else {
+                vec![WeightResidencyMechanism::Resident]
+            },
             StateLifecycleCapabilities::new()
                 .with_transactions(true, true)
                 .with_reset(true),
@@ -637,5 +646,81 @@ fn half_precision_activations_preserve_fixed_float_and_integer_state_dtypes() {
             StateStorageDtype::F32,
             StateStorageDtype::I32
         ]
+    );
+}
+
+#[test]
+fn selected_auxiliary_groups_preserve_parallel_ownership_and_size_real_overlap() {
+    let auxiliary = [
+        ("shared_a", "fusion", true),
+        ("shared_b", "fusion", true),
+        ("first", "first", false),
+        ("second", "second", false),
+    ]
+    .into_iter()
+    .map(|(name, module, shared)| {
+        parameter(name, vec![64, 64], StoredDtype::F16)
+            .with_auxiliary_residency(crate::AuxiliaryModuleResidency::new(module, shared).unwrap())
+    })
+    .collect();
+    let requirements =
+        dense_requirements(vec![parameter("target", vec![64, 64], StoredDtype::F16)])
+            .with_auxiliary_parameters(auxiliary, BTreeMap::new(), BTreeMap::new())
+            .unwrap();
+    let support = Support {
+        direct: true,
+        ..Default::default()
+    };
+    let request = request();
+    let facts = synthesize_replicated_text_capabilities(&requirements, &request, &support);
+    let selected = select_replicated_text_realization(&requirements, &request, &facts).unwrap();
+    let mut tasks = selected.materialization_tasks().to_vec();
+    tasks.extend_from_slice(selected.auxiliary_materialization_tasks());
+    assert!(tasks.iter().all(|task| matches!(task.owner(), ReplicatedTextParameterOwner::ExecutionUnit { group, unit: 0 } if group == "units")));
+    let empty = std::collections::BTreeSet::new();
+    let resources = crate::selected_parameter_resources(&tasks, &empty, &empty).unwrap();
+    // Each fixture source declares one encoded byte. Two shared parameters
+    // overlap either one-byte sequential owner, not both at once.
+    assert_eq!(resources.parameter_bytes, 5);
+    assert_eq!(resources.pinned_bytes, 0);
+    assert_eq!(resources.largest_unit_bytes, 3);
+    assert_eq!(resources.largest_adjacent_units_bytes, 3);
+    let resident = crate::selected_text_bounded_requirement(&selected, &empty).unwrap();
+    assert_eq!(resident.required_bytes, 5);
+    assert_eq!(resident.static_bytes, 0);
+    let paging = Support {
+        direct: true,
+        weight_paging: true,
+        ..Default::default()
+    };
+    for residency in [
+        LayerWeightResidency::LayerwiseHost(Default::default()),
+        LayerWeightResidency::DenseDiskStream(
+            crate::DenseDiskStreamLoadOptions::new(1024, 0, 0, 0).unwrap(),
+        ),
+    ] {
+        let request = ReplicatedTextSelectionRequest::new(residency, CacheResidencyPolicy::Device);
+        let facts = synthesize_replicated_text_capabilities(&requirements, &request, &paging);
+        let selected = select_replicated_text_realization(&requirements, &request, &facts).unwrap();
+        let bounded = crate::selected_text_bounded_requirement(&selected, &empty).unwrap();
+        assert_eq!(
+            bounded.required_bytes, 3,
+            "shared fusion and one sequential owner overlap in {residency:?}"
+        );
+        assert_eq!(bounded.static_bytes, 0);
+    }
+    let first_shared = tasks
+        .iter()
+        .position(|task| task.name() == "shared_a")
+        .unwrap();
+    tasks[first_shared] = tasks[first_shared]
+        .clone()
+        .with_auxiliary_residency(crate::AuxiliaryModuleResidency::new("fusion", false).unwrap());
+    assert!(
+        matches!(
+            crate::selected_parameter_resources(&tasks, &empty, &empty),
+            Err(crate::BoundedResidencySizingError::InvalidLocalGeometry(_))
+        ),
+        "one physical group cannot declare inconsistent overlap roles"
     );
 }

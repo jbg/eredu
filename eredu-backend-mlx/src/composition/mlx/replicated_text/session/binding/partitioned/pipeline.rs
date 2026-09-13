@@ -18,7 +18,7 @@ pub(crate) fn bind_partitioned_routed_pipeline_with_provider<A, S, G, Provider, 
     additional_claimed_sources: std::collections::BTreeSet<String>,
     stream: &Stream,
     weights_stream: &Stream,
-    finalizer: F,
+    mut finalizer: F,
 ) -> Result<Box<dyn ErasedReplicatedTextExecutable>, Error>
 where
     S: MlxStateMechanisms + 'static,
@@ -44,6 +44,7 @@ where
         .into_iter()
         .collect::<Vec<_>>();
     let mut mechanisms = MlxReplicatedTextMechanisms::new(store, stream, weights_stream);
+    mechanisms.set_prediction_residency(finalizer.prediction_residency()?);
     mechanisms.set_ignored_checkpoint_sources(ignored_expert_sources);
     let mut distributed = Some(distributed);
     let mut partition_sampling_group = None;
@@ -58,12 +59,15 @@ where
         .prepare_session_runtime(
             prompt_cache_topology.clone(),
             stream,
-            |input, physical_layout, selected, execution, context| {
+            |input, source_architecture, physical_layout, selected, execution, context| {
+                let (source_architecture, source_layout) = source_architecture
+                    .map(|(architecture, layout)| (Some(architecture), Some(layout)))
+                    .unwrap_or((None, None));
                 let prepared = eredu_runtime::prepare_default_partitioned_runtime(
                     input,
-                    None,
+                    source_architecture,
                     physical_layout,
-                    None,
+                    source_layout,
                     selected,
                     &prompt_cache_topology,
                     eredu_runtime::PartitionedUnitScope::Owned,
@@ -71,7 +75,7 @@ where
                     &mut mechanisms,
                     context,
                 )
-                .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+                .map_err(Error::from)?;
                 let (architecture, partition, manifest, execution_policy, bounded_policy, state) =
                     prepared.into_parts();
                 let addresses = partition.units().collect::<Vec<_>>();
@@ -106,7 +110,7 @@ where
                     activation_dtype,
                     unit_strategy,
                 )
-                .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+                .map_err(|error| Error::Other(Box::new(error)))?;
                 let runtime = eredu_runtime::PartitionedTextRuntime::new(
                     execution_plan,
                     executor,
@@ -118,17 +122,17 @@ where
                     selected_residency.execution_residency(),
                     bounded_policy,
                 )
-                .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+                .map_err(|error| Error::Other(Box::new(error)))?;
                 Ok::<_, Error>((runtime, state))
             },
         )
-        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+        .map_err(Error::from)?;
     let session = eredu_runtime::construct_replicated_text_session_with_runtime(
         binding,
         mechanisms,
         eredu_runtime::PartitionedTextExecution::new(),
     )
-    .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+    .map_err(|error| Error::Other(Box::new(error)))?;
     let mut completed = CompletedReplicatedText::from_session(
         session,
         prompt_cache_identity,
@@ -141,7 +145,7 @@ where
         publication_authority.local_public_output(),
         stream,
     );
-    completed = completed.with_parameter_banks(parameter_bank);
+    completed = completed.with_parameter_banks(parameter_bank)?;
     finalizer.finish(completed)
 }
 
@@ -157,7 +161,7 @@ pub(crate) fn bind_partitioned_pipeline<A, G, F>(
     additional_claimed_sources: std::collections::BTreeSet<String>,
     stream: &Stream,
     weights_stream: &Stream,
-    finalizer: F,
+    mut finalizer: F,
 ) -> Result<Box<dyn ErasedReplicatedTextExecutable>, Error>
 where
     A: eredu_architectures::partitioned_execution::TextPartitionArchitecture<
@@ -177,6 +181,7 @@ where
     let (prompt_cache_identity, capability_estimate, effective_model_type, selected_residency) =
         text.into_parts();
     let mut mechanisms = MlxReplicatedTextMechanisms::new(store, stream, weights_stream);
+    mechanisms.set_prediction_residency(finalizer.prediction_residency()?);
     mechanisms.set_ignored_checkpoint_sources(additional_claimed_sources);
     let mut distributed = Some(distributed);
     let mut partition_sampling_group = None;
@@ -207,7 +212,7 @@ where
                     &mut mechanisms,
                     context,
                 )
-                .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+                .map_err(Error::from)?;
                 let (architecture, partition, manifest, execution_policy, bounded_policy, state) =
                     prepared.into_parts();
                 let addresses = partition.units().collect::<Vec<_>>();
@@ -227,7 +232,7 @@ where
                         MlxPartitionTensorAllocator,
                         activation_dtype,
                     )
-                    .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+                    .map_err(|error| Error::Other(Box::new(error)))?;
                 let runtime = eredu_runtime::PartitionedTextRuntime::new(
                     execution_plan,
                     executor,
@@ -239,17 +244,17 @@ where
                     selected_residency.execution_residency(),
                     bounded_policy,
                 )
-                .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+                .map_err(|error| Error::Other(Box::new(error)))?;
                 Ok::<_, Error>((runtime, state))
             },
         )
-        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+        .map_err(Error::from)?;
     let session = eredu_runtime::construct_replicated_text_session_with_runtime(
         binding,
         mechanisms,
         MlxPipelinePartitionStrategy::<A, MlxHybridState>::new(),
     )
-    .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+    .map_err(|error| Error::Other(Box::new(error)))?;
     finalizer.finish(CompletedReplicatedText::from_session(
         session,
         prompt_cache_identity,

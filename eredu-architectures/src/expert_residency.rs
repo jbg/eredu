@@ -17,6 +17,25 @@ use eredu_runtime::{
     VariableAllToAllBackend,
 };
 
+/// Retained owner assignment used by both native construction and cold projection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExpertOwnershipPolicy {
+    Balanced,
+}
+impl ExpertOwnershipPolicy {
+    fn range(
+        self,
+        count: usize,
+        size: usize,
+        rank: usize,
+    ) -> Result<std::ops::Range<usize>, ExpertRealizationPlanError> {
+        match self {
+            Self::Balanced => balanced_contiguous_range(count, size, rank, false)
+                .map_err(|error| ExpertRealizationPlanError::InvalidTopology(error.to_string())),
+        }
+    }
+}
+
 /// Complete architecture-derived ownership and rank-local bank construction plan.
 ///
 /// The plan is deliberately independent of a concrete collective runtime. It
@@ -24,6 +43,7 @@ use eredu_runtime::{
 /// rank-local construction specification for every routed execution unit.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ExpertRealizationPlan<S> {
+    ownership_policy: ExpertOwnershipPolicy,
     global_expert_count: usize,
     expert_parallel_size: usize,
     expert_parallel_rank: usize,
@@ -32,6 +52,7 @@ pub struct ExpertRealizationPlan<S> {
     collective_members: Vec<usize>,
     collective_local_rank: usize,
     unit_specs: BTreeMap<(ExecutionGroupId, usize), S>,
+    replicated_units: BTreeSet<(ExecutionGroupId, usize)>,
 }
 
 impl<S> ExpertRealizationPlan<S> {
@@ -47,28 +68,26 @@ impl<S> ExpertRealizationPlan<S> {
         if unit_specs.is_empty() {
             return Err(ExpertRealizationPlanError::EmptyUnitSchedule);
         }
+        let ownership_policy = ExpertOwnershipPolicy::Balanced;
         let mut owners = vec![0; global_expert_count];
         for owner in 0..topology.expert_parallel_size() {
-            let range = balanced_contiguous_range(
+            let range = ownership_policy.range(
                 global_expert_count,
                 topology.expert_parallel_size(),
                 owner,
-                false,
-            )
-            .map_err(|error| ExpertRealizationPlanError::InvalidTopology(error.to_string()))?;
+            )?;
             owners[range].fill(owner);
         }
-        let local = balanced_contiguous_range(
+        let local = ownership_policy.range(
             global_expert_count,
             topology.expert_parallel_size(),
             topology.expert_parallel_rank(),
-            false,
-        )
-        .map_err(|error| ExpertRealizationPlanError::InvalidTopology(error.to_string()))?;
+        )?;
         let collective = topology
             .subgroup(ParallelAxis::Expert)
             .map_err(|error| ExpertRealizationPlanError::InvalidTopology(error.to_string()))?;
         Ok(Self {
+            ownership_policy,
             global_expert_count,
             expert_parallel_size: topology.expert_parallel_size(),
             expert_parallel_rank: topology.expert_parallel_rank(),
@@ -77,7 +96,23 @@ impl<S> ExpertRealizationPlan<S> {
             collective_members: collective.global_ranks().to_vec(),
             collective_local_rank: collective.rank(),
             unit_specs,
+            replicated_units: BTreeSet::new(),
         })
+    }
+
+    /// Projects the retained assignment policy without inventing local bank
+    /// specifications. Physical unit columns are resolved separately from layout.
+    pub(crate) fn project_local_groups(
+        &self,
+        topology: ParallelRankTopology,
+    ) -> Result<Vec<usize>, ExpertRealizationPlanError> {
+        self.ownership_policy
+            .range(
+                self.global_expert_count,
+                topology.expert_parallel_size(),
+                topology.expert_parallel_rank(),
+            )
+            .map(Iterator::collect)
     }
 
     /// Returns the checkpoint-global routed expert count used by preflight.
@@ -125,6 +160,42 @@ impl<S> ExpertRealizationPlan<S> {
         &self.unit_specs
     }
 
+    /// Retains exact per-invocation distribution from the admitted source catalog.
+    /// Cache addresses are distinct from the enclosing logical decoder owner.
+    pub(crate) fn with_catalog_distribution(
+        mut self,
+        catalog: &ExpertResidencyCatalog,
+    ) -> Result<Self, String> {
+        self.replicated_units.clear();
+        for address in self.unit_specs.keys() {
+            let mut distribution = None;
+            for entry in catalog.units().iter().filter(|entry| {
+                entry.owner_group() == &address.0 && entry.identity().unit() == address.1
+            }) {
+                if distribution.is_some_and(|previous| previous != entry.distribution()) {
+                    return Err("provider invocation has inconsistent catalog distribution".into());
+                }
+                distribution = Some(entry.distribution());
+            }
+            match distribution
+                .ok_or("provider invocation is absent from the distribution catalog")?
+            {
+                ExpertResidencyDistribution::Replicated => {
+                    self.replicated_units.insert(address.clone());
+                }
+                ExpertResidencyDistribution::ExpertParallel => {}
+            }
+        }
+        Ok(self)
+    }
+
+    /// Provider requests are already scoped to one bank/owner group.
+    pub(crate) fn unit_is_replicated(&self, unit: usize) -> bool {
+        self.replicated_units
+            .iter()
+            .any(|(_, candidate)| *candidate == unit)
+    }
+
     pub(crate) fn try_map_unit_specs<T>(
         self,
         mut map: impl FnMut(S) -> Result<T, String>,
@@ -135,6 +206,7 @@ impl<S> ExpertRealizationPlan<S> {
             .map(|(address, spec)| map(spec).map(|mapped| (address, mapped)))
             .collect::<Result<BTreeMap<_, _>, _>>()?;
         Ok(ExpertRealizationPlan {
+            ownership_policy: self.ownership_policy,
             global_expert_count: self.global_expert_count,
             expert_parallel_size: self.expert_parallel_size,
             expert_parallel_rank: self.expert_parallel_rank,
@@ -143,6 +215,7 @@ impl<S> ExpertRealizationPlan<S> {
             collective_members: self.collective_members,
             collective_local_rank: self.collective_local_rank,
             unit_specs,
+            replicated_units: self.replicated_units,
         })
     }
 
@@ -161,15 +234,28 @@ impl<S> ExpertRealizationPlan<S> {
 }
 
 /// Failure while translating and executing one routed plan through generic mechanisms.
-#[derive(Debug, Clone, Eq, PartialEq, thiserror::Error)]
+#[derive(Debug, Clone, thiserror::Error)]
 #[non_exhaustive]
 pub enum RoutedMechanismExecutionError {
+    /// Another owner rejected route validation or bank execution before return exchange.
+    #[error("an expert owner rejected local provider work before reverse exchange")]
+    ProviderRejected,
     /// The architecture plan did not contain the requested local bank member or unit.
     #[error("invalid routed mechanism plan: {0}")]
     InvalidPlan(String),
     /// A mechanism-only bank or collective operation failed.
     #[error("routed mechanism execution failed: {0}")]
     Mechanism(String),
+    /// Original compute, storage, movement or completion failure.
+    #[error("routed mechanism execution failed: {0}")]
+    Source(#[source] eredu_nn::Error),
+}
+
+impl RoutedMechanismExecutionError {
+    /// Retains a mechanism failure without erasing its typed cause.
+    pub fn from_error(error: impl std::error::Error + Send + Sync + 'static) -> Self {
+        Self::Source(eredu_nn::Error::backend_source(error))
+    }
 }
 
 /// Architecture-owned peer counts for a forward expert dispatch and its return path.
@@ -470,13 +556,13 @@ where
         })
         .collect::<Result<Vec<_>, _>>()?;
     let local = B::Tensor::from_i32_slice(&values, &shape, context)
-        .map_err(|error| RoutedMechanismExecutionError::Mechanism(error.to_string()))?;
+        .map_err(RoutedMechanismExecutionError::from_error)?;
     let gathered = communication
         .all_gather_even(local, 0, group, executor)
-        .map_err(|error| RoutedMechanismExecutionError::Mechanism(error.to_string()))?;
+        .map_err(RoutedMechanismExecutionError::from_error)?;
     let matrix = gathered
         .to_i32_vec(context)
-        .map_err(|error| RoutedMechanismExecutionError::Mechanism(error.to_string()))?
+        .map_err(RoutedMechanismExecutionError::from_error)?
         .into_iter()
         .map(|count| {
             usize::try_from(count).map_err(|_| {
@@ -573,7 +659,7 @@ where
         })?;
     let output = communication
         .variable_all_to_all(value, peer_counts, 0, counts.group(), executor)
-        .map_err(|error| RoutedMechanismExecutionError::Mechanism(error.to_string()))?;
+        .map_err(RoutedMechanismExecutionError::from_error)?;
     let actual_rows = output
         .shape()
         .first()
@@ -592,6 +678,65 @@ where
     Ok(output)
 }
 
+/// Shared provider-work vote for exchanged and replicated invocations. Every
+/// participant enters TP, EP and optional pipeline-wave agreement in that order.
+pub(crate) fn agree_partition_provider_work<B, G, R, I>(
+    communication: &PartitionCommunication<B, G, R, I>,
+    executor: &B::Executor,
+    tensor_group: Option<CollectiveGroupId>,
+    expert_group: CollectiveGroupId,
+    wave_group: Option<CollectiveGroupId>,
+    local_success: bool,
+) -> Result<bool, RoutedMechanismExecutionError>
+where
+    B: eredu_runtime::FailureAgreementBackend,
+    G: std::borrow::Borrow<B::CommunicationGroup>,
+    R: std::borrow::Borrow<B::CommunicationRoute>,
+    I: CommunicationTensorMetadata<B>,
+{
+    let tensor = tensor_group.map_or(Ok(local_success), |group| {
+        eredu_runtime::PartitionCommitAgreement::agree_phase(
+            &mut eredu_runtime::OpaqueFailureAgreement,
+            communication,
+            group,
+            eredu_runtime::DistributedExecutionPhase::Execution,
+            local_success,
+            executor,
+        )
+        .map_err(RoutedMechanismExecutionError::from_error)
+    });
+    // A TP rejection must still reach the EP owners before any participant
+    // returns. Inactive pipeline waves use this same ordered pair of votes.
+    let expert = eredu_runtime::PartitionCommitAgreement::agree_phase(
+        &mut eredu_runtime::OpaqueFailureAgreement,
+        communication,
+        expert_group,
+        eredu_runtime::DistributedExecutionPhase::Execution,
+        matches!(tensor, Ok(true)),
+        executor,
+    )
+    .map_err(RoutedMechanismExecutionError::from_error);
+    let owners = match (tensor, expert) {
+        (Err(error), _) | (Ok(_), Err(error)) => Err(error),
+        (Ok(tensor), Ok(expert)) => Ok(tensor && expert),
+    };
+    let wave = wave_group.map_or(Ok(matches!(owners, Ok(true))), |group| {
+        eredu_runtime::PartitionCommitAgreement::agree_phase(
+            &mut eredu_runtime::OpaqueFailureAgreement,
+            communication,
+            group,
+            eredu_runtime::DistributedExecutionPhase::Execution,
+            matches!(owners, Ok(true)),
+            executor,
+        )
+        .map_err(RoutedMechanismExecutionError::from_error)
+    });
+    match (owners, wave) {
+        (Err(error), _) | (Ok(_), Err(error)) => Err(error),
+        (Ok(owners), Ok(wave)) => Ok(owners && wave),
+    }
+}
+
 /// Borrowed opaque communication adapter for one half of expert exchange.
 ///
 /// Integer metadata uses the same selected variable-count operation as tensor
@@ -603,6 +748,8 @@ where
 {
     counts: &'a ExpertRouteCountPlan,
     direction: ExpertRouteExchangeDirection,
+    provider_tensor_group: Option<CollectiveGroupId>,
+    provider_wave_group: Option<CollectiveGroupId>,
     communication: &'a PartitionCommunication<B, G, R, I>,
     executor: &'a B::Executor,
     context: &'a <B::Tensor as Tensor>::Context,
@@ -623,10 +770,25 @@ where
         Self {
             counts,
             direction,
+            provider_tensor_group: None,
+            provider_wave_group: None,
             communication,
             executor,
             context,
         }
+    }
+
+    /// Retains the selected tensor group for the local-work vote preceding EP
+    /// return exchange. Validation and idle owners participate in both votes.
+    pub const fn with_provider_tensor_group(mut self, group: Option<CollectiveGroupId>) -> Self {
+        self.provider_tensor_group = group;
+        self
+    }
+
+    /// Binds every active and inactive participant in a shared pipeline wave.
+    pub const fn with_provider_wave_group(mut self, group: Option<CollectiveGroupId>) -> Self {
+        self.provider_wave_group = group;
+        self
     }
 
     fn expected_counts(&self) -> &CommunicationPeerCounts {
@@ -639,12 +801,23 @@ where
 
 impl<B, G, R, I> ExpertRouteExchange<B::Tensor> for PartitionExpertRouteExchange<'_, B, G, R, I>
 where
-    B: VariableAllToAllBackend,
+    B: VariableAllToAllBackend + eredu_runtime::FailureAgreementBackend,
     G: std::borrow::Borrow<B::CommunicationGroup>,
     R: std::borrow::Borrow<B::CommunicationRoute>,
     I: CommunicationTensorMetadata<B>,
 {
     type Error = RoutedMechanismExecutionError;
+
+    fn agree_provider_success(&mut self, local_success: bool) -> Result<bool, Self::Error> {
+        agree_partition_provider_work(
+            self.communication,
+            self.executor,
+            self.provider_tensor_group,
+            self.counts.group(),
+            self.provider_wave_group,
+            local_success,
+        )
+    }
 
     fn exchange_tensor(
         &mut self,
@@ -691,7 +864,7 @@ where
             )
         })?;
         let tensor = B::Tensor::from_i32_slice(&values, &[rows, 1], self.context)
-            .map_err(|error| RoutedMechanismExecutionError::Mechanism(error.to_string()))?;
+            .map_err(RoutedMechanismExecutionError::from_error)?;
         let exchanged = exchange_expert_rows(
             self.counts,
             self.direction,
@@ -706,10 +879,10 @@ where
         // materializing this exchange.
         self.communication
             .complete_execution_dependencies(std::iter::once(&exchanged), self.executor)
-            .map_err(|error| RoutedMechanismExecutionError::Mechanism(error.to_string()))?;
+            .map_err(RoutedMechanismExecutionError::from_error)?;
         exchanged
             .to_i32_vec(self.context)
-            .map_err(|error| RoutedMechanismExecutionError::Mechanism(error.to_string()))?
+            .map_err(RoutedMechanismExecutionError::from_error)?
             .into_iter()
             .map(|value| {
                 usize::try_from(value).map_err(|_| {
@@ -846,13 +1019,13 @@ where
 
     let packed_input = movement
         .gather_rows(input, packing.packed_token_indices())
-        .map_err(|error| RoutedMechanismExecutionError::Mechanism(error.to_string()))?;
+        .map_err(RoutedMechanismExecutionError::from_error)?;
     let packed_scores = movement
         .gather_route_values(selected_scores, packing.packed_route_positions())
-        .map_err(|error| RoutedMechanismExecutionError::Mechanism(error.to_string()))?;
+        .map_err(RoutedMechanismExecutionError::from_error)?;
     let packed_coefficients = movement
         .gather_route_values(coefficients, packing.packed_route_positions())
-        .map_err(|error| RoutedMechanismExecutionError::Mechanism(error.to_string()))?;
+        .map_err(RoutedMechanismExecutionError::from_error)?;
     let packed_rows = packing.packed_route_positions().len();
     let hidden = movement.shape(input)[1];
     validate_packed_tensor_shape(movement, &packed_input, packed_rows, Some(hidden), "input")?;
@@ -867,125 +1040,147 @@ where
 
     let received_global_experts = forward
         .exchange_indices(counts.forward(), packing.packed_global_experts().to_vec())
-        .map_err(|error| RoutedMechanismExecutionError::Mechanism(error.to_string()))?;
+        .map_err(RoutedMechanismExecutionError::from_error)?;
     let received_local_experts = forward
         .exchange_indices(
             counts.forward(),
             packing.packed_owner_local_experts().to_vec(),
         )
-        .map_err(|error| RoutedMechanismExecutionError::Mechanism(error.to_string()))?;
+        .map_err(RoutedMechanismExecutionError::from_error)?;
     let received_route_tags = forward
         .exchange_indices(counts.forward(), packing.packed_route_positions().to_vec())
-        .map_err(|error| RoutedMechanismExecutionError::Mechanism(error.to_string()))?;
+        .map_err(RoutedMechanismExecutionError::from_error)?;
     let received_input = forward
         .exchange_tensor(counts.forward(), packed_input)
-        .map_err(|error| RoutedMechanismExecutionError::Mechanism(error.to_string()))?;
+        .map_err(RoutedMechanismExecutionError::from_error)?;
     let received_scores = forward
         .exchange_tensor(counts.forward(), packed_scores)
-        .map_err(|error| RoutedMechanismExecutionError::Mechanism(error.to_string()))?;
+        .map_err(RoutedMechanismExecutionError::from_error)?;
     let received_coefficients = forward
         .exchange_tensor(counts.forward(), packed_coefficients)
-        .map_err(|error| RoutedMechanismExecutionError::Mechanism(error.to_string()))?;
+        .map_err(RoutedMechanismExecutionError::from_error)?;
 
-    let received_rows = counts
-        .forward()
-        .receive()
-        .iter()
-        .try_fold(0usize, |total, count| total.checked_add(*count))
-        .ok_or_else(|| {
-            RoutedMechanismExecutionError::InvalidPlan(
-                "expert route receive row count overflowed usize".into(),
-            )
-        })?;
-    if received_global_experts.len() != received_rows
-        || received_local_experts.len() != received_rows
-        || received_route_tags.len() != received_rows
-    {
-        return Err(RoutedMechanismExecutionError::Mechanism(format!(
-            "expert route metadata returned ({}, {}, {}) rows, expected {received_rows}",
-            received_global_experts.len(),
-            received_local_experts.len(),
-            received_route_tags.len()
-        )));
-    }
-    validate_packed_tensor_shape(
-        movement,
-        &received_input,
-        received_rows,
-        Some(hidden),
-        "received input",
-    )?;
-    validate_packed_tensor_shape(
-        movement,
-        &received_scores,
-        received_rows,
-        Some(1),
-        "received scores",
-    )?;
-    validate_packed_tensor_shape(
-        movement,
-        &received_coefficients,
-        received_rows,
-        Some(1),
-        "received coefficients",
-    )?;
-    validate_received_expert_identities(
-        realization,
-        &received_global_experts,
-        &received_local_experts,
-    )?;
-
-    let output = provider
-        .execute_addressable_routes_tensor_parallel(AddressableExpertRouteRequest {
-            bank: invocation.bank,
-            unit: invocation.unit,
-            input: &received_input,
-            global_experts: &received_global_experts,
-            owner_local_experts: &received_local_experts,
-            selected_scores: &received_scores,
-            coefficients: &received_coefficients,
-            pass: invocation.pass,
-            access: invocation.pass.parameter_bank_access(),
-            combination: ExpertRouteCombination::CoefficientWeightedSum,
-        })
-        .map_err(|error| RoutedMechanismExecutionError::Mechanism(error.to_string()))?;
-    let (complete, reducible, post_reduce) = match output {
-        RoutedExpertTensorParallelOutput::Complete(output) => (true, output, None),
-        RoutedExpertTensorParallelOutput::Partial(output) => {
-            let (reducible, post_reduce) = output.into_parts();
-            (false, reducible, post_reduce)
+    let local = (|| {
+        let received_rows = counts
+            .forward()
+            .receive()
+            .iter()
+            .try_fold(0usize, |total, count| total.checked_add(*count))
+            .ok_or_else(|| {
+                RoutedMechanismExecutionError::InvalidPlan(
+                    "expert route receive row count overflowed usize".into(),
+                )
+            })?;
+        if received_global_experts.len() != received_rows
+            || received_local_experts.len() != received_rows
+            || received_route_tags.len() != received_rows
+        {
+            return Err(RoutedMechanismExecutionError::Mechanism(format!(
+                "expert route metadata returned ({}, {}, {}) rows, expected {received_rows}",
+                received_global_experts.len(),
+                received_local_experts.len(),
+                received_route_tags.len()
+            )));
         }
-    };
-    validate_packed_tensor_shape(
-        movement,
-        &reducible,
-        received_rows,
-        Some(invocation.output_dimensions),
-        "provider activation contribution",
-    )?;
-    if let Some(bias) = post_reduce.as_ref() {
         validate_packed_tensor_shape(
             movement,
-            bias,
+            &received_input,
+            received_rows,
+            Some(hidden),
+            "received input",
+        )?;
+        validate_packed_tensor_shape(
+            movement,
+            &received_scores,
+            received_rows,
+            Some(1),
+            "received scores",
+        )?;
+        validate_packed_tensor_shape(
+            movement,
+            &received_coefficients,
+            received_rows,
+            Some(1),
+            "received coefficients",
+        )?;
+        validate_received_expert_identities(
+            realization,
+            &received_global_experts,
+            &received_local_experts,
+        )?;
+
+        let output = provider
+            .execute_addressable_routes_tensor_parallel(AddressableExpertRouteRequest {
+                unit_origins: eredu_runtime::RoutedUnitOrigins::new(
+                    counts.forward().receive(),
+                    &received_route_tags,
+                    packing.routes_per_token(),
+                )
+                .map_err(RoutedMechanismExecutionError::from_error)?,
+                bank: invocation.bank,
+                unit: invocation.unit,
+                input: &received_input,
+                global_experts: &received_global_experts,
+                owner_local_experts: &received_local_experts,
+                selected_scores: &received_scores,
+                coefficients: &received_coefficients,
+                pass: invocation.pass,
+                access: invocation.pass.parameter_bank_access(),
+                combination: ExpertRouteCombination::CoefficientWeightedSum,
+            })
+            .map_err(RoutedMechanismExecutionError::from_error)?;
+        let (complete, reducible, post_reduce) = match output {
+            RoutedExpertTensorParallelOutput::Complete(output) => (true, output, None),
+            RoutedExpertTensorParallelOutput::Partial(output) => {
+                let (reducible, post_reduce) = output.into_parts();
+                (false, reducible, post_reduce)
+            }
+        };
+        validate_packed_tensor_shape(
+            movement,
+            &reducible,
             received_rows,
             Some(invocation.output_dimensions),
-            "provider post-reduction bias",
+            "provider activation contribution",
         )?;
-    }
+        if let Some(bias) = post_reduce.as_ref() {
+            validate_packed_tensor_shape(
+                movement,
+                bias,
+                received_rows,
+                Some(invocation.output_dimensions),
+                "provider post-reduction bias",
+            )?;
+        }
+
+        Ok((complete, reducible, post_reduce))
+    })();
+    // Every owner reaches the vote, even if its bank or local output validation
+    // failed. The originating rank keeps its exact cause; peers get a typed
+    // rejection before submitting reverse exchange.
+    let agreed = forward
+        .agree_provider_success(local.is_ok())
+        .map_err(RoutedMechanismExecutionError::from_error);
+    let (complete, reducible, post_reduce) = match (local, agreed) {
+        (Err(error), _) => return Err(error),
+        (Ok(_), Err(error)) => return Err(error),
+        (Ok(_), Ok(false)) => return Err(RoutedMechanismExecutionError::ProviderRejected),
+        (Ok(output), Ok(true)) => output,
+    };
 
     let returned = reverse
         .exchange_tensor(counts.reverse(), reducible)
-        .map_err(|error| RoutedMechanismExecutionError::Mechanism(error.to_string()))?;
+        .map_err(RoutedMechanismExecutionError::from_error)?;
     let returned_bias = post_reduce
         .map(|bias| {
             reverse
                 .exchange_tensor(counts.reverse(), bias)
-                .map_err(|error| RoutedMechanismExecutionError::Mechanism(error.to_string()))
+                .map_err(RoutedMechanismExecutionError::from_error)
         })
         .transpose()?;
     let returned_route_tags = reverse
         .exchange_indices(counts.reverse(), received_route_tags)
-        .map_err(|error| RoutedMechanismExecutionError::Mechanism(error.to_string()))?;
+        .map_err(RoutedMechanismExecutionError::from_error)?;
     validate_packed_tensor_shape(
         movement,
         &returned,
@@ -1015,11 +1210,11 @@ where
             order.sort_by_key(|row| packing.packed_global_experts()[*row]);
             let returned = movement
                 .gather_rows(&returned, &order)
-                .map_err(|error| RoutedMechanismExecutionError::Mechanism(error.to_string()))?;
+                .map_err(RoutedMechanismExecutionError::from_error)?;
             let returned_bias = returned_bias
                 .map(|bias| movement.gather_rows(&bias, &order))
                 .transpose()
-                .map_err(|error| RoutedMechanismExecutionError::Mechanism(error.to_string()))?;
+                .map_err(RoutedMechanismExecutionError::from_error)?;
             let destinations = order
                 .iter()
                 .map(|row| packing.packed_token_indices()[*row])
@@ -1039,7 +1234,7 @@ where
             packing.source_tokens(),
             invocation.reduction,
         )
-        .map_err(|error| RoutedMechanismExecutionError::Mechanism(error.to_string()))?;
+        .map_err(RoutedMechanismExecutionError::from_error)?;
     let post_reduce = returned_bias
         .map(|bias| {
             movement
@@ -1049,7 +1244,7 @@ where
                     packing.source_tokens(),
                     invocation.reduction,
                 )
-                .map_err(|error| RoutedMechanismExecutionError::Mechanism(error.to_string()))
+                .map_err(RoutedMechanismExecutionError::from_error)
         })
         .transpose()?;
     Ok(if complete {
@@ -1264,13 +1459,12 @@ where
     let key = ParameterBankKey::new(bank_id.value() as usize, owner_unit, global_member);
     let groups = bank
         .acquire(key, spec, context)
-        .map_err(|error| RoutedMechanismExecutionError::Mechanism(error.to_string()))?;
+        .map_err(RoutedMechanismExecutionError::from_error)?;
     let output =
         eredu_nn::GroupedGatedProductOperator::forward_grouped(groups, input, routes, context)
-            .map_err(|error| RoutedMechanismExecutionError::Mechanism(error.to_string()))?;
+            .map_err(RoutedMechanismExecutionError::from_error)?;
     if collective.members().len() > 1 {
-        B::all_to_all(output, group, executor)
-            .map_err(|error| RoutedMechanismExecutionError::Mechanism(error.to_string()))
+        B::all_to_all(output, group, executor).map_err(RoutedMechanismExecutionError::from_error)
     } else {
         Ok(output)
     }
@@ -1839,6 +2033,27 @@ mod tests {
     use eredu_core::ParallelTopology;
     use eredu_runtime::ExpertPass;
 
+    #[derive(Debug, thiserror::Error)]
+    #[error("{0}")]
+    struct FixtureError(&'static str);
+    impl From<&'static str> for FixtureError {
+        fn from(message: &'static str) -> Self {
+            Self(message)
+        }
+    }
+
+    fn assert_fixture_cause(error: &(dyn std::error::Error + 'static), expected: &str) {
+        let mut cause = Some(error);
+        while let Some(current) = cause {
+            if let Some(original) = current.downcast_ref::<FixtureError>() {
+                assert_eq!(original.0, expected);
+                return;
+            }
+            cause = current.source();
+        }
+        panic!("original mechanism error was lost: {error}");
+    }
+
     #[derive(Debug, Clone, PartialEq)]
     struct NumericTensor {
         rows: usize,
@@ -1866,7 +2081,7 @@ mod tests {
     }
 
     impl ExpertRouteTensorMovement<NumericTensor> for NumericMovement {
-        type Error = &'static str;
+        type Error = FixtureError;
 
         fn shape(&self, value: &NumericTensor) -> Vec<usize> {
             vec![value.rows, value.columns]
@@ -1881,7 +2096,7 @@ mod tests {
             let mut values = Vec::with_capacity(rows.len() * value.columns);
             for row in rows {
                 if *row >= value.rows {
-                    return Err("row outside tensor");
+                    return Err(FixtureError("row outside tensor"));
                 }
                 values.extend_from_slice(
                     &value.values[*row * value.columns..(*row + 1) * value.columns],
@@ -1919,12 +2134,12 @@ mod tests {
             self.scatter_rows += 1;
             self.scattered_destinations = destination_rows.to_vec();
             if value.rows != destination_rows.len() {
-                return Err("scatter row cardinality mismatch");
+                return Err(FixtureError("scatter row cardinality mismatch"));
             }
             let mut output = vec![0.0; output_rows * value.columns];
             for (source, destination) in destination_rows.iter().copied().enumerate() {
                 if destination >= output_rows {
-                    return Err("scatter destination outside tensor");
+                    return Err(FixtureError("scatter destination outside tensor"));
                 }
                 for column in 0..value.columns {
                     output[destination * value.columns + column] +=
@@ -1938,6 +2153,9 @@ mod tests {
     #[derive(Default)]
     struct IdentityExchange {
         calls: usize,
+        votes: Vec<bool>,
+        reject_provider: bool,
+        fail_agreement: bool,
         fail_on: Option<usize>,
         reorder_indices: bool,
         corrupt_index_call: Option<usize>,
@@ -1948,22 +2166,31 @@ mod tests {
             &mut self,
             counts: &CommunicationPeerCounts,
             rows: usize,
-        ) -> Result<(), &'static str> {
+        ) -> Result<(), FixtureError> {
             self.calls += 1;
             if self.fail_on == Some(self.calls) {
-                return Err("exchange failed");
+                return Err(FixtureError("exchange failed"));
             }
             let send = counts.send().iter().sum::<usize>();
             let receive = counts.receive().iter().sum::<usize>();
             if rows != send || send != receive {
-                return Err("identity exchange requires balanced row totals");
+                return Err(FixtureError(
+                    "identity exchange requires balanced row totals",
+                ));
             }
             Ok(())
         }
     }
 
     impl ExpertRouteExchange<NumericTensor> for IdentityExchange {
-        type Error = &'static str;
+        type Error = FixtureError;
+        fn agree_provider_success(&mut self, local_success: bool) -> Result<bool, Self::Error> {
+            self.votes.push(local_success);
+            if self.fail_agreement {
+                return Err(FixtureError("provider agreement failed"));
+            }
+            Ok(local_success && !self.reject_provider)
+        }
 
         fn exchange_tensor(
             &mut self,
@@ -2001,7 +2228,7 @@ mod tests {
     }
 
     impl AddressableExpertRouteProvider<NumericTensor> for NumericProvider {
-        type Error = &'static str;
+        type Error = FixtureError;
 
         fn execute_addressable_routes(
             &mut self,
@@ -2009,7 +2236,7 @@ mod tests {
         ) -> Result<NumericTensor, Self::Error> {
             self.calls += 1;
             if self.fail {
-                return Err("provider failed");
+                return Err(FixtureError("provider failed"));
             }
             if request.input.rows != request.global_experts.len()
                 || request.input.rows != request.owner_local_experts.len()
@@ -2017,7 +2244,7 @@ mod tests {
                 || request.selected_scores.rows != request.input.rows
                 || request.combination != ExpertRouteCombination::CoefficientWeightedSum
             {
-                return Err("provider request mismatch");
+                return Err(FixtureError("provider request mismatch"));
             }
             self.observed = Some((request.unit, request.pass, request.access));
             self.consumed_global_experts = request.global_experts.to_vec();
@@ -2047,13 +2274,15 @@ mod tests {
     }
 
     impl AddressableExpertRouteProvider<NumericTensor> for TensorParallelNumericProvider {
-        type Error = &'static str;
+        type Error = FixtureError;
 
         fn execute_addressable_routes(
             &mut self,
             _request: AddressableExpertRouteRequest<'_, NumericTensor>,
         ) -> Result<NumericTensor, Self::Error> {
-            Err("TP provider requires the structured output path")
+            Err(FixtureError(
+                "TP provider requires the structured output path",
+            ))
         }
 
         fn execute_addressable_routes_tensor_parallel(
@@ -2065,7 +2294,7 @@ mod tests {
                 || request.input.rows != request.owner_local_experts.len()
                 || request.coefficients.rows != request.input.rows
             {
-                return Err("TP provider request mismatch");
+                return Err(FixtureError("TP provider request mismatch"));
             }
             let contribution_scale = (self.tensor_rank + 1) as f32;
             let mut reducible = request.input.clone();
@@ -2228,11 +2457,9 @@ mod tests {
         )
         .unwrap_err();
 
-        assert_eq!(
-            error,
-            RoutedMechanismExecutionError::InvalidPlan(
-                "expert route count consensus changed the local send row".into()
-            )
+        assert!(
+            matches!(error, RoutedMechanismExecutionError::InvalidPlan(message)
+            if message == "expert route count consensus changed the local send row")
         );
     }
 
@@ -2318,7 +2545,7 @@ mod tests {
     fn expert_exchange_preserves_bank_identity_and_distinct_output_width() {
         struct ProjectionProvider;
         impl AddressableExpertRouteProvider<NumericTensor> for ProjectionProvider {
-            type Error = &'static str;
+            type Error = FixtureError;
             fn execute_addressable_routes(
                 &mut self,
                 request: AddressableExpertRouteRequest<'_, NumericTensor>,
@@ -2385,7 +2612,7 @@ mod tests {
     fn exchange_sequential_reduction_uses_global_expert_order_after_reverse_transport() {
         struct Cancellation;
         impl AddressableExpertRouteProvider<NumericTensor> for Cancellation {
-            type Error = &'static str;
+            type Error = FixtureError;
             fn execute_addressable_routes(
                 &mut self,
                 request: AddressableExpertRouteRequest<'_, NumericTensor>,
@@ -2591,6 +2818,7 @@ mod tests {
         .unwrap_err();
 
         assert!(error.to_string().contains("maps global expert"));
+        assert_eq!(forward.votes, [false]);
         assert_eq!((forward.calls, reverse.calls, provider.calls), (6, 0, 0));
         assert_eq!(movement.scatter_rows, 0);
     }
@@ -2717,9 +2945,65 @@ mod tests {
         )
         .unwrap_err();
 
-        assert!(error.to_string().contains("provider failed"));
+        assert_fixture_cause(&error, "provider failed");
+        assert_eq!(forward.votes, [false]);
         assert_eq!((forward.calls, provider.calls, reverse.calls), (6, 1, 0));
         assert_eq!(movement.scatter_rows, 0);
+    }
+
+    #[test]
+    fn provider_vote_rejects_peers_and_preserves_the_first_local_cause() {
+        for local_failure in [false, true] {
+            for peer_failure in [false, true] {
+                for agreement_failure in [false, true] {
+                    let (realization, packing, counts, input, scores, coefficients) =
+                        numeric_exchange_fixture();
+                    let mut movement = NumericMovement::default();
+                    let mut forward = IdentityExchange {
+                        reject_provider: peer_failure,
+                        fail_agreement: agreement_failure,
+                        ..Default::default()
+                    };
+                    let mut reverse = IdentityExchange::default();
+                    let mut provider = NumericProvider {
+                        fail: local_failure,
+                        ..Default::default()
+                    };
+                    let result = run_numeric_exchange(
+                        &realization,
+                        &packing,
+                        &counts,
+                        &input,
+                        &scores,
+                        &coefficients,
+                        &mut movement,
+                        &mut forward,
+                        &mut reverse,
+                        &mut provider,
+                    );
+                    assert_eq!(forward.votes, [!local_failure]);
+                    assert_eq!((forward.calls, provider.calls), (6, 1));
+                    if local_failure || peer_failure || agreement_failure {
+                        let error = result.unwrap_err();
+                        assert_eq!((reverse.calls, movement.scatter_rows), (0, 0));
+                        if local_failure {
+                            assert_fixture_cause(&error, "provider failed");
+                        } else if agreement_failure {
+                            assert_fixture_cause(&error, "provider agreement failed");
+                        } else {
+                            assert!(matches!(
+                                error,
+                                RoutedMechanismExecutionError::ProviderRejected
+                            ));
+                        }
+                    } else {
+                        assert!(result.is_ok());
+                        assert!(reverse.calls > 0);
+                        assert!(movement.scatter_rows > 0);
+                    }
+                }
+            }
+        }
     }
 
     #[test]
@@ -2748,7 +3032,7 @@ mod tests {
         )
         .unwrap_err();
 
-        assert!(error.to_string().contains("exchange failed"));
+        assert_fixture_cause(&error, "exchange failed");
         assert_eq!((forward.calls, provider.calls, reverse.calls), (3, 0, 0));
         assert_eq!(movement.scatter_rows, 0);
     }

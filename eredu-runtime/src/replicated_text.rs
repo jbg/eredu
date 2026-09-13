@@ -447,6 +447,15 @@ pub enum ParameterTransformConstraint {
         /// Axis whose extent is grouped or blocked by executable packing.
         packed_axis: usize,
     },
+    /// Transform a linear parameter only when its input extent satisfies both
+    /// this alignment and the requested format's grouping. Otherwise retain
+    /// the exact source-native executable format.
+    LinearIfAligned {
+        /// Axis whose extent is grouped or blocked by executable packing.
+        packed_axis: usize,
+        /// Additional architecture alignment; must be nonzero.
+        alignment: usize,
+    },
 }
 
 /// Architecture-owned semantic role of one logical parameter.
@@ -473,6 +482,14 @@ pub enum ReplicatedTextParameterRole {
 pub enum ReplicatedTextParameterOwner {
     /// Pinned module selected by a stable architecture role.
     StaticRole(String),
+    /// Pinned storage required by exact logical unit consumers, selected before
+    /// materialization. Multiple local consumers share one pinned copy.
+    StaticUnitConsumers {
+        /// Canonical static binding role.
+        role: String,
+        /// Canonical execution groups and their global unit indices.
+        consumers: Vec<(String, usize)>,
+    },
     /// One architecture-global execution unit.
     ExecutionUnit {
         /// Stable execution-group identity.
@@ -480,6 +497,15 @@ pub enum ReplicatedTextParameterOwner {
         /// Group-local architecture-global unit index.
         unit: usize,
     },
+}
+
+impl ReplicatedTextParameterOwner {
+    /// Resolves the portable parameter-topology owner without allocating tensors.
+    pub fn parameter_group_owner(
+        &self,
+    ) -> Result<ParameterGroupOwner, ReplicatedTextContractError> {
+        parameter_group_owner(self)
+    }
 }
 
 /// Exact admitted presence or derivation of one logical parameter.
@@ -604,6 +630,7 @@ pub struct ReplicatedTextParameterRequirement {
     role: ReplicatedTextParameterRole,
     /// Architecture-owned static/group/unit location.
     owner: ReplicatedTextParameterOwner,
+    auxiliary_residency: Option<crate::AuxiliaryModuleResidency>,
     /// Exact artifact presence, tie, or derivation.
     presence: ReplicatedTextParameterPresence,
     /// Architecture-selected native executable format.
@@ -611,6 +638,8 @@ pub struct ReplicatedTextParameterRequirement {
     /// Exact architecture-owned transform eligibility and packing axis.
     transform: ParameterTransformConstraint,
     /// Exact encoded-linear primary relationship for a physical companion.
+    // Exact schema-admitted redundant sources superseded by this logical value.
+    admitted_redundant_sources: BTreeSet<String>,
     linear_companion: Option<(eredu_nn::LinearCompanionRole, String)>,
     /// Exact architecture output names used when this weight is transformed.
     transform_companions: Option<(String, String)>,
@@ -708,12 +737,22 @@ impl ReplicatedTextParameterRequirement {
                 "logical parameter {name:?} has an invalid shape {logical_shape:?}"
             )));
         }
-        if let ParameterTransformConstraint::Linear { packed_axis } = transform {
+        if let ParameterTransformConstraint::Linear { packed_axis }
+        | ParameterTransformConstraint::LinearIfAligned { packed_axis, .. } = transform
+        {
             if packed_axis >= logical_shape.len() {
                 return Err(ReplicatedTextContractError::invalid(format!(
                     "logical parameter {name:?} has packing axis {packed_axis} outside shape {logical_shape:?}"
                 )));
             }
+        }
+        if matches!(
+            transform,
+            ParameterTransformConstraint::LinearIfAligned { alignment: 0, .. }
+        ) {
+            return Err(ReplicatedTextContractError::invalid(
+                "transform alignment must be nonzero",
+            ));
         }
         let requirement = Self {
             name,
@@ -725,14 +764,28 @@ impl ReplicatedTextParameterRequirement {
             logical_shape,
             role,
             owner,
+            auxiliary_residency: None,
             presence,
             native_executable,
             transform,
+            admitted_redundant_sources: BTreeSet::new(),
             linear_companion: None,
             transform_companions: None,
             permitted_native_source_dtypes: Vec::new(),
         };
         Ok(requirement)
+    }
+
+    /// Retains physical auxiliary execution ownership without changing parallel
+    /// parameter placement or checkpoint naming.
+    pub fn with_auxiliary_residency(mut self, owner: crate::AuxiliaryModuleResidency) -> Self {
+        self.auxiliary_residency = Some(owner);
+        self
+    }
+
+    /// Returns independently declared auxiliary residency ownership.
+    pub fn auxiliary_residency(&self) -> Option<&crate::AuxiliaryModuleResidency> {
+        self.auxiliary_residency.as_ref()
     }
 
     /// Explicitly permits exact source dtypes for this architecture parameter.
@@ -778,8 +831,11 @@ impl ReplicatedTextParameterRequirement {
     ) -> Result<Self, ReplicatedTextContractError> {
         let scale = scale.into();
         let affine_bias = affine_bias.into();
-        if !matches!(self.transform, ParameterTransformConstraint::Linear { .. })
-            || scale.trim().is_empty()
+        if !matches!(
+            self.transform,
+            ParameterTransformConstraint::Linear { .. }
+                | ParameterTransformConstraint::LinearIfAligned { .. }
+        ) || scale.trim().is_empty()
             || affine_bias.trim().is_empty()
             || scale == affine_bias
             || scale == self.name
@@ -791,6 +847,33 @@ impl ReplicatedTextParameterRequirement {
             )));
         }
         self.transform_companions = Some((scale, affine_bias));
+        Ok(self)
+    }
+
+    /// Preserves source-native execution for a linear parameter when a valid
+    /// requested transform does not meet architecture or format alignment.
+    pub fn with_optional_transform_alignment(
+        mut self,
+        alignment: usize,
+    ) -> Result<Self, ReplicatedTextContractError> {
+        let packed_axis = match self.transform {
+            ParameterTransformConstraint::Linear { packed_axis }
+            | ParameterTransformConstraint::LinearIfAligned { packed_axis, .. } => packed_axis,
+            ParameterTransformConstraint::None => {
+                return Err(ReplicatedTextContractError::invalid(
+                    "optional transform alignment requires a linear parameter",
+                ))
+            }
+        };
+        if alignment == 0 {
+            return Err(ReplicatedTextContractError::invalid(
+                "transform alignment must be nonzero",
+            ));
+        }
+        self.transform = ParameterTransformConstraint::LinearIfAligned {
+            packed_axis,
+            alignment,
+        };
         Ok(self)
     }
 
@@ -837,6 +920,29 @@ impl ReplicatedTextParameterRequirement {
     /// Returns the architecture-owned static/group/unit location.
     pub const fn owner(&self) -> &ReplicatedTextParameterOwner {
         &self.owner
+    }
+
+    /// Retains exact validated source keys made redundant by architecture policy.
+    /// These are never materialized for this parameter; backends consume this
+    /// declaration during strict source-use validation without inferring names.
+    pub fn with_admitted_redundant_sources(
+        mut self,
+        sources: BTreeSet<String>,
+    ) -> Result<Self, ReplicatedTextContractError> {
+        if !matches!(self.presence, ReplicatedTextParameterPresence::Tied { .. })
+            || sources.iter().any(|source| source.trim().is_empty())
+        {
+            return Err(ReplicatedTextContractError::invalid(
+                "redundant sources require a tied parameter and exact nonempty source keys",
+            ));
+        }
+        self.admitted_redundant_sources = sources;
+        Ok(self)
+    }
+
+    /// Exact schema-admitted sources intentionally superseded by this value.
+    pub fn admitted_redundant_sources(&self) -> &BTreeSet<String> {
+        &self.admitted_redundant_sources
     }
 
     /// Returns exact artifact presence, tie, or derivation.
@@ -888,9 +994,14 @@ impl ReplicatedTextParameterRequirement {
     ) -> Result<Option<ParameterTransformTarget>, ReplicatedTextContractError> {
         let packed_axis = match self.transform {
             ParameterTransformConstraint::None => return Ok(None),
-            ParameterTransformConstraint::Linear { packed_axis } => packed_axis,
+            ParameterTransformConstraint::Linear { packed_axis }
+            | ParameterTransformConstraint::LinearIfAligned { packed_axis, .. } => packed_axis,
         };
         let extent = self.logical_shape[packed_axis];
+        let optional_alignment = match self.transform {
+            ParameterTransformConstraint::LinearIfAligned { alignment, .. } => Some(alignment),
+            _ => None,
+        };
         let executable = match request {
             QuantizationRequest::Affine { group_size, bits } => {
                 let group_size = i32::try_from(group_size).map_err(|_| {
@@ -902,6 +1013,9 @@ impl ReplicatedTextParameterRequirement {
                     ReplicatedTextContractError::invalid("affine group size is negative")
                 })?;
                 if group_size > extent || !extent.is_multiple_of(group_size) {
+                    if optional_alignment.is_some() {
+                        return Ok(None);
+                    }
                     return Err(ReplicatedTextContractError::invalid(format!(
                         "affine group size {group_size} does not divide packed extent {extent}"
                     )));
@@ -911,6 +1025,9 @@ impl ReplicatedTextParameterRequirement {
             QuantizationRequest::MxFp4 => {
                 const MXFP4_BLOCK_SIZE: usize = 32;
                 if !extent.is_multiple_of(MXFP4_BLOCK_SIZE) {
+                    if optional_alignment.is_some() {
+                        return Ok(None);
+                    }
                     return Err(ReplicatedTextContractError::invalid(format!(
                         "MXFP4 packed extent {extent} is not divisible by block size {MXFP4_BLOCK_SIZE}"
                     )));
@@ -923,6 +1040,9 @@ impl ReplicatedTextParameterRequirement {
                 ))
             }
         };
+        if optional_alignment.is_some_and(|alignment| !extent.is_multiple_of(alignment)) {
+            return Ok(None);
+        }
         let descriptor = self.lowering_descriptor(executable)?;
         Ok(Some(ParameterTransformTarget::new(
             request, executable, descriptor,
@@ -936,7 +1056,10 @@ impl ReplicatedTextParameterRequirement {
     ) -> Result<WeightLoweringDescriptor, ReplicatedTextContractError> {
         let packed_axis = match self.transform {
             ParameterTransformConstraint::None => None,
-            ParameterTransformConstraint::Linear { packed_axis } => Some(packed_axis),
+            ParameterTransformConstraint::Linear { packed_axis }
+            | ParameterTransformConstraint::LinearIfAligned { packed_axis, .. } => {
+                Some(packed_axis)
+            }
         };
         let packed_axis = packed_axis
             .or_else(|| {
@@ -1058,6 +1181,7 @@ pub struct ReplicatedTextRequirements {
     parameters: Vec<ReplicatedTextParameterRequirement>,
     /// Exact additive prediction/auxiliary parameters selected with this target.
     auxiliary_parameters: Vec<ReplicatedTextParameterRequirement>,
+    replicated_static_roles: Vec<String>,
     derived_recipes: BTreeMap<String, eredu_checkpoint::recipe::DerivedWeightRecipe>,
     derived_recipe_outputs: BTreeMap<String, eredu_checkpoint::recipe::RecipeMetadata>,
     shared_source_keys: BTreeSet<String>,
@@ -1065,6 +1189,27 @@ pub struct ReplicatedTextRequirements {
 }
 
 impl ReplicatedTextRequirements {
+    /// Replaces architecture-authored state geometry before mechanism selection.
+    ///
+    /// Partitioned architectures use this for explicitly declared receiver
+    /// replicas. The layer address space and traversal access remain fixed;
+    /// capability synthesis, placement, and accounting select every new component.
+    pub fn with_state_layout(
+        mut self,
+        layout: StateLayout,
+    ) -> Result<Self, ReplicatedTextContractError> {
+        if layout.len() != self.state_layout.len()
+            || layout.segments() != self.state_layout.segments()
+        {
+            return Err(ReplicatedTextContractError::invalid(
+                "state geometry changed its layer address space",
+            ));
+        }
+        validate_state_access_profile(&layout, self.state_access)?;
+        self.state_layout = layout;
+        Ok(self)
+    }
+
     /// Creates exact requirements from architecture and admitted-artifact facts only.
     #[allow(
         clippy::too_many_arguments,
@@ -1109,6 +1254,19 @@ impl ReplicatedTextRequirements {
             ));
         }
         validate_state_access_profile(&state_layout, state_access)?;
+        for parameter in &parameters {
+            if matches!(
+                parameter.owner(),
+                ReplicatedTextParameterOwner::StaticUnitConsumers { .. }
+            ) {
+                parameter
+                    .owner()
+                    .parameter_group_owner()?
+                    .validate(&execution_graph, &execution_units)
+                    .map_err(|error| ReplicatedTextContractError::invalid(error.to_string()))?;
+            }
+        }
+
         let mut names = BTreeSet::new();
         if parameters
             .iter()
@@ -1129,11 +1287,36 @@ impl ReplicatedTextRequirements {
             state_access,
             parameters,
             auxiliary_parameters: Vec::new(),
+            replicated_static_roles: Vec::new(),
             derived_recipes: BTreeMap::new(),
             derived_recipe_outputs: BTreeMap::new(),
             shared_source_keys: BTreeSet::new(),
             grouped_operations: Vec::new(),
         })
+    }
+
+    /// Declares target static parameters also consumed by resident auxiliary
+    /// invocations on every pipeline rank. Tensor placement remains unchanged.
+    pub fn with_replicated_static_roles(
+        mut self,
+        roles: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Result<Self, ReplicatedTextContractError> {
+        let roles = roles.into_iter().map(Into::into).collect::<Vec<_>>();
+        let unique = roles.iter().collect::<BTreeSet<_>>();
+        if unique.len() != roles.len() || roles.iter().any(|role| {
+            role.trim().is_empty() || !self.parameters.iter().any(|parameter| {
+                matches!(parameter.owner(), ReplicatedTextParameterOwner::StaticRole(owner) | ReplicatedTextParameterOwner::StaticUnitConsumers { role: owner, .. } if owner == role)
+            })
+        }) {
+            return Err(ReplicatedTextContractError::invalid("auxiliary static dependency is unknown or duplicated"));
+        }
+        self.replicated_static_roles = roles;
+        Ok(self)
+    }
+
+    /// Static storage dependencies of auxiliary invocations on every rank.
+    pub fn replicated_static_roles(&self) -> &[String] {
+        &self.replicated_static_roles
     }
 
     /// Records the dtype of the architecture-declared activation source before native selection.
@@ -1772,6 +1955,7 @@ pub struct ReplicatedTextMaterializationTask {
     logical_shape: Vec<usize>,
     role: ReplicatedTextParameterRole,
     owner: ReplicatedTextParameterOwner,
+    auxiliary_residency: Option<crate::AuxiliaryModuleResidency>,
     presence: ReplicatedTextParameterPresence,
     executable: LinearFormat,
     lowering: WeightLoweringKind,
@@ -2004,6 +2188,18 @@ impl ReplicatedTextOutputCompanion {
 }
 
 impl ReplicatedTextMaterializationTask {
+    /// Assigns physical auxiliary residency while preserving parallel placement.
+    pub fn with_auxiliary_residency(mut self, owner: crate::AuxiliaryModuleResidency) -> Self {
+        self.auxiliary_residency = Some(owner);
+        self
+    }
+
+    /// Returns the retained physical owner for a separately invoked auxiliary
+    /// phase. This is independent of tensor/pipeline storage ownership.
+    pub fn auxiliary_residency(&self) -> Option<&crate::AuxiliaryModuleResidency> {
+        self.auxiliary_residency.as_ref()
+    }
+
     /// Creates one exact, source-backed materialization task selected outside
     /// the ordinary replicated-text session lifecycle.
     ///
@@ -2048,6 +2244,7 @@ impl ReplicatedTextMaterializationTask {
             logical_shape,
             role,
             owner,
+            auxiliary_residency: None,
             presence: ReplicatedTextParameterPresence::Required,
             executable,
             lowering,
@@ -2272,7 +2469,10 @@ pub fn plan_replicated_text_materialization_tasks(
     let mut unit_tasks = vec![Vec::new(); layout.len()];
     for (task_index, task) in tasks.iter().enumerate() {
         match task.owner() {
-            ReplicatedTextParameterOwner::StaticRole(_) => static_tasks.push(task_index),
+            ReplicatedTextParameterOwner::StaticRole(_)
+            | ReplicatedTextParameterOwner::StaticUnitConsumers { .. } => {
+                static_tasks.push(task_index)
+            }
             ReplicatedTextParameterOwner::ExecutionUnit { group, unit } => {
                 let group_index = (0..layout.group_count())
                     .find(|index| {
@@ -2341,7 +2541,10 @@ pub fn plan_local_replicated_text_materialization_tasks(
     let mut unit_tasks = vec![Vec::new(); addresses.len()];
     for (task_index, task) in tasks.iter().enumerate() {
         match task.owner() {
-            ReplicatedTextParameterOwner::StaticRole(_) => static_tasks.push(task_index),
+            ReplicatedTextParameterOwner::StaticRole(_)
+            | ReplicatedTextParameterOwner::StaticUnitConsumers { .. } => {
+                static_tasks.push(task_index)
+            }
             ReplicatedTextParameterOwner::ExecutionUnit { group, unit } => {
                 let local = addresses
                     .iter()
@@ -2595,6 +2798,7 @@ fn build_materialization_tasks(
                 logical_shape: requirement.logical_shape().to_vec(),
                 role: requirement.role(),
                 owner: requirement.owner().clone(),
+                auxiliary_residency: requirement.auxiliary_residency().cloned(),
                 presence: requirement.presence().clone(),
                 executable: realization.executable(),
                 lowering: realization.lowering(),
@@ -2715,6 +2919,17 @@ fn parameter_group_owner(
     match owner {
         ReplicatedTextParameterOwner::StaticRole(role) => {
             Ok(ParameterGroupOwner::static_role(role.clone()))
+        }
+        ReplicatedTextParameterOwner::StaticUnitConsumers { role, consumers } => {
+            let consumers = consumers
+                .iter()
+                .map(|(group, unit)| {
+                    ExecutionGroupId::new(group.clone())
+                        .map(|group| (group, *unit))
+                        .map_err(|error| ReplicatedTextContractError::invalid(error.to_string()))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(ParameterGroupOwner::static_unit_consumers(role, consumers))
         }
         ReplicatedTextParameterOwner::ExecutionUnit { group, unit } => {
             let group = ExecutionGroupId::new(group.clone())
@@ -2845,14 +3060,7 @@ pub fn partition_selected_replicated_text_materialization_tasks<G, A>(
                 declared.name() != selected.name()
                     || declared.role() != selected.role()
                     || declared.logical_shape() != selected.logical_shape()
-                    || !(declared.owner() == selected.owner()
-                        || matches!(
-                            (declared.owner(), selected.owner()),
-                            (
-                                ParameterGroupOwner::StaticAnyOf(declared_roles),
-                                ParameterGroupOwner::StaticRole(selected_role)
-                            ) if declared_roles.iter().any(|role| role == selected_role)
-                        ))
+                    || !declared.owner().refines_storage_owner(selected.owner())
             })
         {
             return Err(ReplicatedTextContractError::invalid(format!(
@@ -3209,10 +3417,17 @@ pub struct SelectedReplicatedTextRealization {
     prompt_cache: bool,
     /// Exact completion ownership selected for this lifecycle.
     exact_completion: bool,
+    /// Exact completion is available for later bounded transactional observers.
+    exact_completion_available: bool,
     grouped_operations: Vec<GroupedOperationRequirement>,
 }
 
 impl SelectedReplicatedTextRealization {
+    /// Retained backend fact used before admitting an observer that requires
+    /// completion even when ordinary execution did not request it.
+    pub const fn exact_completion_available(&self) -> bool {
+        self.exact_completion_available
+    }
     /// Returns the source reader-cache limit retained through selection.
     pub const fn max_cached_shards(&self) -> usize {
         self.max_cached_shards
@@ -3543,6 +3758,7 @@ pub fn select_replicated_text_realization(
         session: request.session,
         prompt_cache: request.prompt_cache,
         exact_completion: request.exact_completion,
+        exact_completion_available: capabilities.exact_completion,
         grouped_operations: requirements.grouped_operations.clone(),
     };
     selected.materialization_tasks = build_replicated_text_materialization_tasks(&selected)
@@ -3832,6 +4048,92 @@ mod tests {
             absent_bias.transform_constraint(),
             ParameterTransformConstraint::None
         );
+    }
+
+    #[test]
+    fn optional_linear_transform_preserves_unaligned_weights_without_hiding_invalid_requests() {
+        for extent in [12, 16, 32, 64] {
+            let required = ReplicatedTextParameterRequirement::new(
+                "projection.weight",
+                vec!["projection.weight".into()],
+                vec![physical_source("projection.weight")],
+                Vec::new(),
+                Some(SourceTensorEncoding::Safetensors(StoredDtype::F16)),
+                Some(vec![64, extent]),
+                vec![64, extent],
+                LinearFormat::Dense,
+                ReplicatedTextParameterRole::LinearWeight,
+                ReplicatedTextParameterOwner::StaticRole("media".into()),
+                ReplicatedTextParameterPresence::Required,
+                ParameterTransformConstraint::Linear { packed_axis: 1 },
+            )
+            .unwrap()
+            .with_transform_companions("projection.scales", "projection.biases")
+            .unwrap();
+            assert!(required
+                .clone()
+                .with_optional_transform_alignment(0)
+                .is_err());
+            let optional = required
+                .clone()
+                .with_optional_transform_alignment(32)
+                .unwrap();
+            assert_eq!(
+                optional
+                    .lowering_descriptor(LinearFormat::Dense)
+                    .unwrap()
+                    .logical_shape(),
+                &[64, extent]
+            );
+            for request in [
+                QuantizationRequest::Affine {
+                    group_size: 16,
+                    bits: 4,
+                },
+                QuantizationRequest::Affine {
+                    group_size: 32,
+                    bits: 4,
+                },
+                QuantizationRequest::Affine {
+                    group_size: 64,
+                    bits: 4,
+                },
+                QuantizationRequest::MxFp4,
+            ] {
+                let group = match request {
+                    QuantizationRequest::Affine { group_size, .. } => group_size as usize,
+                    _ => 32,
+                };
+                let selected = optional.transform_target(request).unwrap();
+                assert_eq!(
+                    selected.is_some(),
+                    extent.is_multiple_of(32) && extent.is_multiple_of(group)
+                );
+                if let Some(selected) = selected {
+                    assert_eq!(
+                        selected,
+                        required.transform_target(request).unwrap().unwrap()
+                    );
+                }
+            }
+            assert!(optional
+                .transform_target(QuantizationRequest::Affine {
+                    group_size: 0,
+                    bits: 4
+                })
+                .is_err());
+            assert!(optional
+                .transform_target(QuantizationRequest::Affine {
+                    group_size: 32,
+                    bits: 7
+                })
+                .is_err());
+            if extent < 32 {
+                assert!(required
+                    .transform_target(QuantizationRequest::MxFp4)
+                    .is_err());
+            }
+        }
     }
 
     #[test]
@@ -4370,6 +4672,32 @@ mod tests {
                 .unwrap(),
             );
         }
+        // A second bank invocation may belong to the same decoder unit.
+        // Its recipes still must prove that exact task ownership.
+        let shared_invocation = crate::AddressableBankMember::new(
+            crate::ParameterBankKey::new(0, 64, 0),
+            members[0].placement().clone(),
+            members[0].parameters().iter().cloned(),
+        )
+        .unwrap();
+        assert_eq!(shared_invocation.placement().owner_unit(), 0);
+        for (group, unit) in [("decoder", 1), ("different_decoder", 0)] {
+            let foreign = crate::AddressableBankMemberPlacement::new(
+                crate::ExecutionGroupId::new(group).unwrap(),
+                unit,
+                "model.layers.0",
+                crate::AddressableBankDistribution::Replicated,
+            )
+            .unwrap();
+            assert!(matches!(
+                crate::AddressableBankMember::new(
+                    shared_invocation.key(),
+                    foreign,
+                    shared_invocation.parameters().iter().cloned(),
+                ),
+                Err(crate::AddressableBankMemberError::InvalidParameter { .. }),
+            ));
+        }
         struct Source {
             physical: ReplicatedTextPhysicalSource,
             metadata_reads: std::sync::atomic::AtomicUsize,
@@ -4784,6 +5112,65 @@ mod tests {
     }
 
     #[test]
+    fn state_geometry_enters_selection_before_allocation() {
+        let layout = StateLayout::new(
+            LayerSchedule::new(
+                1,
+                vec![LayerCachePolicy::key_value(AttentionPolicy::Full, 2, 8).unwrap()],
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let requirements = requirements().with_state_layout(layout.clone()).unwrap();
+        let mut mechanisms = capabilities();
+        // Exact facts for the old one-head layout cannot authorize the new
+        // two-head allocation. The backend must report the replacement geometry.
+        assert!(select_replicated_text_realization(
+            &requirements,
+            &request(LayerWeightResidency::FullyResident),
+            &mechanisms,
+        )
+        .is_err());
+        mechanisms.state.components = layout
+            .components(0)
+            .unwrap()
+            .iter()
+            .cloned()
+            .map(|component| {
+                StateComponentMechanism::new(
+                    0,
+                    component,
+                    Some(StateComponentPlacement::Device),
+                    Some(StateComponentPlacement::Paged),
+                )
+            })
+            .collect();
+        let selected = select_replicated_text_realization(
+            &requirements,
+            &request(LayerWeightResidency::FullyResident),
+            &mechanisms,
+        )
+        .unwrap();
+        assert_eq!(selected.state().layout(), &layout);
+        assert_eq!(selected.state().components().len(), 2);
+        for component in selected.state().components() {
+            assert!(layout
+                .components(component.layer())
+                .unwrap()
+                .contains(component.component()));
+        }
+        let other_address_space = StateLayout::new(
+            LayerSchedule::new(
+                2,
+                vec![LayerCachePolicy::key_value(AttentionPolicy::Full, 1, 8).unwrap(); 2],
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(requirements.with_state_layout(other_address_space).is_err());
+    }
+
+    #[test]
     fn requirements_reject_state_layout_and_access_profile_mismatch() {
         let fixed = StateTensorPolicy::new(
             StateTensorRole::Recurrent,
@@ -4810,6 +5197,7 @@ mod tests {
         )
         .unwrap();
         let base = requirements();
+        assert!(base.clone().with_state_layout(layout.clone()).is_err());
         let error = ReplicatedTextRequirements::new(
             base.architecture_identity,
             base.operators,

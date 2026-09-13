@@ -15,6 +15,10 @@ use eredu_checkpoint::LinearFormat;
 pub use eredu_nn_macros::Parameterized;
 
 mod grouped_linear;
+mod grouped_units;
+mod linear_rows;
+pub use grouped_units::{GroupedUnitBatch, GroupedUnitError, GroupedUnitObserver};
+pub use linear_rows::LinearRowLayout;
 /// Reusable patch projection and multi-axis position operations.
 pub mod multimodal;
 /// Checked tensor-independent normalization and mask geometry.
@@ -26,10 +30,22 @@ pub use grouped_linear::{GroupedLinearActivation, GroupedLinearOperator, Grouped
 pub mod sequence_layout;
 
 /// Backend operation failure.
-#[derive(Debug, Clone, thiserror::Error)]
-#[error("{message}")]
+#[derive(Debug, Clone)]
 pub struct Error {
     message: String,
+    source: Option<std::sync::Arc<dyn std::error::Error + Send + Sync>>,
+}
+
+impl std::fmt::Display for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.source.as_deref().map(|error| error as _)
+    }
 }
 
 impl Error {
@@ -38,6 +54,15 @@ impl Error {
     pub fn backend(error: impl std::fmt::Display) -> Self {
         Self {
             message: error.to_string(),
+            source: None,
+        }
+    }
+
+    /// Retains the original failure behind the backend-neutral error boundary.
+    pub fn backend_source(error: impl std::error::Error + Send + Sync + 'static) -> Self {
+        Self {
+            message: error.to_string(),
+            source: Some(std::sync::Arc::new(error)),
         }
     }
 }
@@ -546,6 +571,8 @@ impl<T: Tensor> RelativeAttentionInput<'_, T> {
             || key.len() != 4
             || value.len() != 4
             || profiles.len() != 4
+            || query.iter().any(|dimension| *dimension <= 0)
+            || key.iter().any(|dimension| *dimension <= 0)
             || query[0] != key[0]
             || key != value
             || query[2] != profiles[2]
@@ -554,6 +581,10 @@ impl<T: Tensor> RelativeAttentionInput<'_, T> {
             || query[3] != key[3]
             || query[1] % key[1] != 0
             || profiles[3] <= 0
+            || self.query_offset < 0
+            || self.key_offset < 0
+            || self.query_offset.checked_add(query[2]).is_none()
+            || self.key_offset.checked_add(key[2]).is_none()
             || self.window.is_some_and(|window| window <= 0)
             || self.log_scaling_floor.is_some_and(|floor| floor <= 0)
             || !self.log_scaling_alpha.is_finite()
@@ -661,6 +692,8 @@ pub struct ParameterSpec {
     pub linear_companion: Option<LinearCompanionRole>,
     /// Primary linear weight owned by this physical companion.
     pub linear_companion_of: Option<ParameterId>,
+    /// Exact independent row-block origins of this primary linear weight.
+    pub linear_row_layout: LinearRowLayout,
 }
 
 impl ParameterSpec {
@@ -673,6 +706,7 @@ impl ParameterSpec {
             group: None,
             linear_companion: None,
             linear_companion_of: None,
+            linear_row_layout: LinearRowLayout::Contiguous,
         })
     }
 }
@@ -701,6 +735,8 @@ pub struct ParameterMetadata {
     pub linear_companion: Option<LinearCompanionRole>,
     /// Primary linear weight owned by this physical companion.
     pub linear_companion_of: Option<ParameterId>,
+    /// Exact independent row-block origins retained from construction.
+    pub linear_row_layout: LinearRowLayout,
 }
 
 impl ParameterMetadata {
@@ -713,6 +749,7 @@ impl ParameterMetadata {
             group: spec.group.clone(),
             linear_companion: spec.linear_companion,
             linear_companion_of: spec.linear_companion_of.clone(),
+            linear_row_layout: spec.linear_row_layout,
         }
     }
 }
@@ -754,6 +791,14 @@ pub trait ParameterVisitor<'a, T: 'a> {
 pub trait ParameterVisitorMut<'a, T: 'a> {
     /// Visits one authoritative mutable parameter slot.
     fn visit_mut(&mut self, metadata: ParameterMetadata, value: &'a mut T);
+}
+
+/// Object-safe traversal of loaded parameter slots at a quiescent boundary.
+/// Visitors must preserve slot topology and must not mutate shared tensor storage.
+/// A transaction prepares replacements separately, then publishes infallible moves.
+pub trait ParameterSlotVisitor<T> {
+    /// Visits one slot without allowing a borrowed tensor to escape traversal.
+    fn visit_slot(&mut self, metadata: ParameterMetadata, value: &mut T);
 }
 
 /// Backend-neutral parameter topology for a module or operator.
@@ -856,6 +901,7 @@ pub struct LinearFormatSpec {
     format: LinearFormat,
     scale: Option<ParameterSpec>,
     affine_bias: Option<ParameterSpec>,
+    row_layout: LinearRowLayout,
 }
 
 impl LinearFormatSpec {
@@ -865,6 +911,7 @@ impl LinearFormatSpec {
             format,
             scale: None,
             affine_bias: None,
+            row_layout: LinearRowLayout::Contiguous,
         };
         spec.validate()?;
         Ok(spec)
@@ -879,6 +926,7 @@ impl LinearFormatSpec {
             format,
             scale: Some(scale),
             affine_bias: None,
+            row_layout: LinearRowLayout::Contiguous,
         };
         spec.validate()?;
         Ok(spec)
@@ -900,6 +948,7 @@ impl LinearFormatSpec {
             format,
             scale: Some(scale),
             affine_bias: Some(affine_bias),
+            row_layout: LinearRowLayout::Contiguous,
         };
         spec.validate()?;
         Ok(spec)
@@ -908,6 +957,18 @@ impl LinearFormatSpec {
     /// Physical tensor encoding.
     pub const fn encoding(&self) -> LinearFormat {
         self.format
+    }
+
+    /// Declares independent row-block origins without changing scalar geometry.
+    pub fn with_row_layout(mut self, layout: LinearRowLayout) -> Result<Self, Error> {
+        self.row_layout = layout;
+        self.validate()?;
+        Ok(self)
+    }
+
+    /// Physical row-block origins consumed by native operators and parameter access.
+    pub const fn row_layout(&self) -> LinearRowLayout {
+        self.row_layout
     }
 
     /// Exact scale companion, when stored separately.
@@ -923,6 +984,13 @@ impl LinearFormatSpec {
     /// Validates that companion cardinality matches the physical encoding.
     pub fn validate(&self) -> Result<(), Error> {
         self.format.validate().map_err(Error::backend)?;
+        if self.row_layout != LinearRowLayout::Contiguous
+            && !matches!(self.format, LinearFormat::E4M3BlockFp8(_))
+        {
+            return Err(Error::backend(
+                "independent row blocks require a block-FP8 encoding",
+            ));
+        }
         let expected = match self.format {
             LinearFormat::Dense | LinearFormat::GgufIQuant { .. } => (false, false),
             LinearFormat::MxFp4 | LinearFormat::E4M3BlockFp8(_) => (true, false),
@@ -1395,10 +1463,86 @@ pub struct RotarySpec {
     pub algorithm: RotaryAlgorithm,
 }
 
+/// Physical scalar type of a neural tensor, independent of checkpoint encoding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TensorElementType {
+    /// Boolean.
+    Bool,
+    /// IEEE half precision.
+    F16,
+    /// Brain floating point.
+    Bf16,
+    /// IEEE single precision.
+    F32,
+    /// IEEE double precision.
+    F64,
+    /// Signed 8-bit integer.
+    I8,
+    /// Signed 16-bit integer.
+    I16,
+    /// Signed 32-bit integer.
+    I32,
+    /// Signed 64-bit integer.
+    I64,
+    /// Unsigned 8-bit integer.
+    U8,
+    /// Unsigned 16-bit integer.
+    U16,
+    /// Unsigned 32-bit integer.
+    U32,
+    /// Unsigned 64-bit integer.
+    U64,
+    /// Complex pair of IEEE single-precision values.
+    Complex64,
+}
+
+/// Cold facts about a deferred neural observation. The prototype supplies shape;
+/// these facts describe the generated value and its additional creation cost.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GeneratedTensorSource {
+    /// Conservative native storage bound for the source graph and temporaries.
+    pub creation_bytes: u64,
+    /// Actual scalar type promised by the mechanism, or unknown to that mechanism.
+    pub element_type: Option<TensorElementType>,
+}
+
+/// Read-only evidence from a neural mechanism. Creating diagnostic values is deferred until
+/// the observing owner has reserved their storage and transform costs.
+pub trait TensorValueObserver<T: Tensor> {
+    /// Borrows a value already needed by inference.
+    fn observe(&mut self, input: &T) -> Result<(), Error>;
+    /// Offers an additional diagnostic of exactly the prototype's geometry.
+    /// `source` conservatively covers its native graph and temporaries.
+    /// The factory may be omitted when the observation is not selected.
+    fn observe_generated(
+        &mut self,
+        prototype: &T,
+        source: &GeneratedTensorSource,
+        generate: &mut dyn FnMut() -> Result<T, Error>,
+    ) -> Result<(), Error>;
+}
+
+/// Actual projection-input evidence, including selected input quantization.
+/// This name preserves the existing projection observation contract.
+pub use TensorValueObserver as ProjectionInputObserver;
+
 /// Backend-native affine projection used by shared architectures.
 pub trait LinearOperator<T: Tensor>: Clone + Debug + Parameterized<T> {
     /// Applies the projection without host materialization.
     fn forward(&mut self, input: &T, context: &T::Context) -> Result<T, Error>;
+    /// Projects while optionally exposing the actual multiplication input.
+    /// Mechanisms that transform inputs must override this default identity path.
+    fn forward_with_input_observer(
+        &mut self,
+        input: &T,
+        context: &T::Context,
+        observer: Option<&mut dyn ProjectionInputObserver<T>>,
+    ) -> Result<T, Error> {
+        if let Some(observer) = observer {
+            observer.observe(input)?;
+        }
+        self.forward(input, context)
+    }
 }
 
 /// Backend-native token embedding used by shared architectures.
@@ -1422,6 +1566,19 @@ pub trait EmbeddingOperator<T: Tensor>: Clone + Debug + Parameterized<T> {
     }
     /// Projects hidden states through the transposed embedding table.
     fn as_linear(&mut self, input: &T, context: &T::Context) -> Result<T, Error>;
+    /// Exposes the multiplication input of a tied readout. Input-transforming
+    /// mechanisms override this default identity path.
+    fn as_linear_with_input_observer(
+        &mut self,
+        input: &T,
+        context: &T::Context,
+        observer: Option<&mut dyn ProjectionInputObserver<T>>,
+    ) -> Result<T, Error> {
+        if let Some(observer) = observer {
+            observer.observe(input)?;
+        }
+        self.as_linear(input, context)
+    }
 }
 
 /// Backend-native normalization operator.
@@ -1507,11 +1664,26 @@ impl<B: NeuralBackend> LowRankProjection<B> {
         input: &B::Tensor,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
+        self.forward_with_normalized_rank(input, context, |rank, _| Ok(rank))
+    }
+
+    /// Runs the same projection while allowing its owner to observe or replace
+    /// the normalized rank value consumed by the second matrix. Ordinary forward
+    /// uses an identity callback and creates no additional tensors.
+    pub fn forward_with_normalized_rank<F>(
+        &mut self,
+        input: &B::Tensor,
+        context: &<B::Tensor as Tensor>::Context,
+        normalized_rank: F,
+    ) -> Result<B::Tensor, Error>
+    where
+        F: FnOnce(B::Tensor, &<B::Tensor as Tensor>::Context) -> Result<B::Tensor, Error>,
+    {
         let rank = match &mut self.first {
             Some(first) => first.forward(input, context)?,
             None => input.clone(),
         };
-        let rank = self.normalization.forward(&rank, context)?;
+        let rank = normalized_rank(self.normalization.forward(&rank, context)?, context)?;
         self.second.forward(&rank, context)
     }
 }
@@ -1519,6 +1691,8 @@ impl<B: NeuralBackend> LowRankProjection<B> {
 /// Backend-native rotary-position operator.
 pub trait RotaryOperator<T: Tensor>: Clone + Debug + Parameterized<T> {
     /// Applies the architecture-selected rotary position source.
+    /// Sequence positions occupy the penultimate axis and features the final
+    /// axis; preceding axes identify independent batches or attention heads.
     fn forward(
         &mut self,
         input: &T,
@@ -2406,10 +2580,11 @@ pub struct GroupedProjectionSpec {
 impl GroupedProjectionSpec {
     /// Creates one validated grouped projection description.
     pub fn new(
-        weight: ParameterSpec,
+        mut weight: ParameterSpec,
         bias: Option<ParameterSpec>,
         format: LinearFormatSpec,
     ) -> Result<Self, Error> {
+        weight.linear_row_layout = format.row_layout();
         let spec = Self {
             weight,
             bias,
@@ -2594,7 +2769,16 @@ impl GroupedGatedProductSpec {
             }
         }
         let projections = match &self.layout {
-            GatedProductGroupLayout::Packed { gate_up, down } => vec![gate_up, down],
+            GatedProductGroupLayout::Packed { gate_up, down } => {
+                gate_up
+                    .format()
+                    .row_layout()
+                    .rows_per_partition(self.intermediate_dimensions as usize * 2)?;
+                down.format()
+                    .row_layout()
+                    .rows_per_partition(self.output_dimensions as usize)?;
+                vec![gate_up, down]
+            }
             GatedProductGroupLayout::Independent(groups) => groups
                 .iter()
                 .flat_map(|group| [&group.gate, &group.up, &group.down])
@@ -2663,6 +2847,21 @@ pub trait GroupedGatedProductOperator<T: Tensor>: Clone + Debug + Parameterized<
         selections: &GroupSelection<T>,
         context: &T::Context,
     ) -> Result<T, Error>;
+
+    /// Runs with a sparse hook at the actual activated units before down projection.
+    /// A missing hook takes the ordinary path with no additional tensor work.
+    fn forward_grouped_with_unit_observer(
+        &mut self,
+        input: &T,
+        selections: &GroupSelection<T>,
+        context: &T::Context,
+        observer: Option<&mut dyn GroupedUnitObserver<T>>,
+    ) -> Result<T, Error> {
+        if observer.is_some() {
+            return Err(Error::backend_source(GroupedUnitError::Unavailable));
+        }
+        self.forward_grouped(input, selections, context)
+    }
 }
 
 /// Additive mechanism for tensor-parallel grouped gated-product partials.
@@ -2678,6 +2877,22 @@ pub trait TensorParallelGroupedGatedProductOperator<T: Tensor>:
         partitions: usize,
         context: &T::Context,
     ) -> Result<TensorParallelGroupedOutput<T>, Error>;
+
+    /// Exposes the rank-local units while retaining the ordinary reduction and
+    /// post-reduction bias equation. Coordinates remain local to this bank.
+    fn forward_grouped_tensor_parallel_with_unit_observer(
+        &mut self,
+        input: &T,
+        selections: &GroupSelection<T>,
+        partitions: usize,
+        context: &T::Context,
+        observer: Option<&mut dyn GroupedUnitObserver<T>>,
+    ) -> Result<TensorParallelGroupedOutput<T>, Error> {
+        if observer.is_some() {
+            return Err(Error::backend_source(GroupedUnitError::Unavailable));
+        }
+        self.forward_grouped_tensor_parallel(input, selections, partitions, context)
+    }
 }
 
 /// Complete construction specification for packed grouped ReLU-squared groups.
@@ -2775,6 +2990,21 @@ pub trait GroupedRelu2Operator<T: Tensor>: Clone + Debug + Parameterized<T> {
         selections: &GroupSelection<T>,
         context: &T::Context,
     ) -> Result<T, Error>;
+
+    /// Runs with a sparse hook at the actual activated units before down projection.
+    /// A missing hook takes the ordinary path with no additional tensor work.
+    fn forward_grouped_with_unit_observer(
+        &mut self,
+        input: &T,
+        selections: &GroupSelection<T>,
+        context: &T::Context,
+        observer: Option<&mut dyn GroupedUnitObserver<T>>,
+    ) -> Result<T, Error> {
+        if observer.is_some() {
+            return Err(Error::backend_source(GroupedUnitError::Unavailable));
+        }
+        self.forward_grouped(input, selections, context)
+    }
 }
 
 /// Additive mechanism for tensor-parallel grouped ReLU-squared partials.
@@ -2788,6 +3018,22 @@ pub trait TensorParallelGroupedRelu2Operator<T: Tensor>: GroupedRelu2Operator<T>
         partitions: usize,
         context: &T::Context,
     ) -> Result<TensorParallelGroupedOutput<T>, Error>;
+
+    /// Exposes the rank-local units while retaining the ordinary reduction and
+    /// post-reduction bias equation. Coordinates remain local to this bank.
+    fn forward_grouped_tensor_parallel_with_unit_observer(
+        &mut self,
+        input: &T,
+        selections: &GroupSelection<T>,
+        partitions: usize,
+        context: &T::Context,
+        observer: Option<&mut dyn GroupedUnitObserver<T>>,
+    ) -> Result<TensorParallelGroupedOutput<T>, Error> {
+        if observer.is_some() {
+            return Err(Error::backend_source(GroupedUnitError::Unavailable));
+        }
+        self.forward_grouped_tensor_parallel(input, selections, partitions, context)
+    }
 }
 
 /// Neural backend extension for grouped computation.
@@ -2817,6 +3063,34 @@ pub trait GroupedNeuralBackend: NeuralBackend {
         output_per_group: i32,
         context: &<Self::Tensor as Tensor>::Context,
     ) -> Result<Self::Tensor, Error>;
+
+    /// Applies the grouped projection while exposing its actual multiplication
+    /// input. Mechanisms that change input precision must override this identity
+    /// path, just as for `LinearOperator::forward_with_input_observer`.
+    /// The observer retains the input's `[batch, groups, tokens, input]` geometry.
+    fn grouped_linear_with_input_observer(
+        linear: &mut Self::Linear,
+        input: &Self::Tensor,
+        groups: i32,
+        output_per_group: i32,
+        context: &<Self::Tensor as Tensor>::Context,
+        observer: Option<&mut dyn ProjectionInputObserver<Self::Tensor>>,
+    ) -> Result<Self::Tensor, Error> {
+        if groups <= 0
+            || output_per_group <= 0
+            || input.shape().len() != 4
+            || input.dim(1) != groups
+            || groups.checked_mul(output_per_group).is_none()
+        {
+            return Err(Error::backend(
+                "invalid observed grouped projection geometry",
+            ));
+        }
+        if let Some(observer) = observer {
+            observer.observe(input)?;
+        }
+        Self::grouped_linear(linear, input, groups, output_per_group, context)
+    }
 
     /// Builds a selector with architecture-selected top-k semantics.
     fn top_k_group_selector(
@@ -2863,6 +3137,35 @@ pub trait TensorParallelGroupedNeuralBackend: GroupedNeuralBackend {
         partitions: usize,
         context: &<Self::Tensor as Tensor>::Context,
     ) -> Result<TensorParallelGroupedOutput<Self::Tensor>, Error>;
+    /// Executes rank-local grouped units with an optional sparse observer.
+    fn gated_product_groups_tensor_parallel_with_unit_observer(
+        groups: &mut Self::GatedProductGroups,
+        input: &Self::Tensor,
+        selections: &GroupSelection<Self::Tensor>,
+        partitions: usize,
+        context: &<Self::Tensor as Tensor>::Context,
+        observer: Option<&mut dyn GroupedUnitObserver<Self::Tensor>>,
+    ) -> Result<TensorParallelGroupedOutput<Self::Tensor>, Error> {
+        if observer.is_some() {
+            return Err(Error::backend_source(GroupedUnitError::Unavailable));
+        }
+        Self::gated_product_groups_tensor_parallel(groups, input, selections, partitions, context)
+    }
+
+    /// Executes rank-local grouped units with an optional sparse observer.
+    fn relu2_groups_tensor_parallel_with_unit_observer(
+        groups: &mut Self::Relu2Groups,
+        input: &Self::Tensor,
+        selections: &GroupSelection<Self::Tensor>,
+        partitions: usize,
+        context: &<Self::Tensor as Tensor>::Context,
+        observer: Option<&mut dyn GroupedUnitObserver<Self::Tensor>>,
+    ) -> Result<TensorParallelGroupedOutput<Self::Tensor>, Error> {
+        if observer.is_some() {
+            return Err(Error::backend_source(GroupedUnitError::Unavailable));
+        }
+        Self::relu2_groups_tensor_parallel(groups, input, selections, partitions, context)
+    }
 }
 
 impl<B> TensorParallelGroupedNeuralBackend for B
@@ -2889,6 +3192,33 @@ where
         context: &<Self::Tensor as Tensor>::Context,
     ) -> Result<TensorParallelGroupedOutput<Self::Tensor>, Error> {
         groups.forward_grouped_tensor_parallel(input, selections, partitions, context)
+    }
+    /// Executes rank-local grouped units with an optional sparse observer.
+    fn gated_product_groups_tensor_parallel_with_unit_observer(
+        groups: &mut Self::GatedProductGroups,
+        input: &Self::Tensor,
+        selections: &GroupSelection<Self::Tensor>,
+        partitions: usize,
+        context: &<Self::Tensor as Tensor>::Context,
+        observer: Option<&mut dyn GroupedUnitObserver<Self::Tensor>>,
+    ) -> Result<TensorParallelGroupedOutput<Self::Tensor>, Error> {
+        groups.forward_grouped_tensor_parallel_with_unit_observer(
+            input, selections, partitions, context, observer,
+        )
+    }
+
+    /// Executes rank-local grouped units with an optional sparse observer.
+    fn relu2_groups_tensor_parallel_with_unit_observer(
+        groups: &mut Self::Relu2Groups,
+        input: &Self::Tensor,
+        selections: &GroupSelection<Self::Tensor>,
+        partitions: usize,
+        context: &<Self::Tensor as Tensor>::Context,
+        observer: Option<&mut dyn GroupedUnitObserver<Self::Tensor>>,
+    ) -> Result<TensorParallelGroupedOutput<Self::Tensor>, Error> {
+        groups.forward_grouped_tensor_parallel_with_unit_observer(
+            input, selections, partitions, context, observer,
+        )
     }
 }
 
@@ -3011,6 +3341,15 @@ pub trait HyperConnectionOperator<T: Tensor>: Clone + Debug + Parameterized<T> {
 pub trait HyperHeadOperator<T: Tensor>: Clone + Debug + Parameterized<T> {
     /// Collapses `[batch, tokens, streams, hidden]` into one hidden state.
     fn forward(&mut self, residual: &T, context: &T::Context) -> Result<T, Error>;
+
+    /// Reports the actual `[batch, tokens, streams]` coefficients consumed by
+    /// the final stream sum. An absent observer must preserve ordinary work.
+    fn forward_with_coefficients_observer(
+        &mut self,
+        residual: &T,
+        context: &T::Context,
+        observer: Option<&mut dyn TensorValueObserver<T>>,
+    ) -> Result<T, Error>;
 }
 
 /// Neural backend extension for hyper-connected residual architectures.
@@ -3108,6 +3447,17 @@ impl<B: HyperNeuralBackend> HyperHead<B> {
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
         self.operator.forward(residual, context)
+    }
+
+    /// Observes the actual coefficients used by the same stream collapse.
+    pub fn forward_with_coefficients_observer(
+        &mut self,
+        residual: &B::Tensor,
+        context: &<B::Tensor as Tensor>::Context,
+        observer: Option<&mut dyn TensorValueObserver<B::Tensor>>,
+    ) -> Result<B::Tensor, Error> {
+        self.operator
+            .forward_with_coefficients_observer(residual, context, observer)
     }
 }
 
@@ -3213,6 +3563,19 @@ pub trait AttentionCache<T: Tensor> {
         request: AttentionRequest<'_, T>,
         context: &T::Context,
     ) -> Result<T, Error>;
+    /// Applies learned relative profiles to the complete visible cache history.
+    /// Resident caches use the supplied tensors; blockwise caches must override
+    /// this method and scan their retained history, not only the latest append.
+    fn relative_attention<B: NeuralBackend<Tensor = T>>(
+        &mut self,
+        request: RelativeAttentionInput<'_, T>,
+        context: &T::Context,
+    ) -> Result<T, Error> {
+        if self.uses_blockwise_attention() {
+            return Err(Error::backend("cache lacks blockwise relative attention"));
+        }
+        B::relative_attention(request, context)
+    }
 }
 
 /// Attention cache with a fixed set of bounded causal-convolution histories.
@@ -3445,8 +3808,9 @@ pub trait PoolingAttentionCache<T: Tensor>: Debug {
         offset: i32,
         context: &T::Context,
     ) -> Result<Option<T>, Error>;
-    /// Captures a cheap speculative checkpoint.
-    fn checkpoint(&self) -> Self::Checkpoint;
+    /// Captures a cheap speculative checkpoint, retaining every history member
+    /// needed by a later rollback. Retention admission may fail before work.
+    fn checkpoint(&self) -> Result<Self::Checkpoint, Error>;
     /// Restores a previous checkpoint.
     fn restore(&mut self, checkpoint: &Self::Checkpoint, context: &T::Context)
         -> Result<(), Error>;
@@ -4108,6 +4472,20 @@ pub trait NeuralBackend: Sized + 'static {
         parallel: &Self::ParallelContext,
         context: &<Self::Tensor as Tensor>::Context,
     ) -> Result<Self::Tensor, Error>;
+    /// Same reduction and bias ordering with optional rank-local input evidence.
+    /// Input-transforming mechanisms override this default identity path.
+    fn row_parallel_linear_with_input_observer(
+        linear: &mut Self::Linear,
+        input: &Self::Tensor,
+        parallel: &Self::ParallelContext,
+        context: &<Self::Tensor as Tensor>::Context,
+        observer: Option<&mut dyn ProjectionInputObserver<Self::Tensor>>,
+    ) -> Result<Self::Tensor, Error> {
+        if let Some(observer) = observer {
+            observer.observe(input)?;
+        }
+        Self::row_parallel_linear(linear, input, parallel, context)
+    }
     /// Number of participants in a tensor-parallel collective context.
     fn parallel_size(_parallel: &Self::ParallelContext) -> usize {
         1
@@ -4147,6 +4525,21 @@ pub trait DistributedNeuralBackend: NeuralBackend {
         parallel: &Self::ParallelContext,
         context: &<Self::Tensor as Tensor>::Context,
     ) -> Result<Self::Tensor, Error>;
+    /// Projects and gathers while exposing the actual local multiplication input.
+    /// Input-transforming backends override this default identity path. An absent
+    /// observer adds no tensor work or communication.
+    fn vocabulary_parallel_project_with_input_observer(
+        linear: &mut Self::Linear,
+        input: &Self::Tensor,
+        parallel: &Self::ParallelContext,
+        context: &<Self::Tensor as Tensor>::Context,
+        observer: Option<&mut dyn ProjectionInputObserver<Self::Tensor>>,
+    ) -> Result<Self::Tensor, Error> {
+        if let Some(observer) = observer {
+            observer.observe(input)?;
+        }
+        Self::vocabulary_parallel_project(linear, input, parallel, context)
+    }
     /// Projects through a rank-local vocabulary embedding and gathers complete logits.
     fn vocabulary_parallel_embedding_project(
         embedding: &mut Self::Embedding,
@@ -4154,6 +4547,19 @@ pub trait DistributedNeuralBackend: NeuralBackend {
         parallel: &Self::ParallelContext,
         context: &<Self::Tensor as Tensor>::Context,
     ) -> Result<Self::Tensor, Error>;
+    /// Tied vocabulary projection with the same actual-input evidence contract.
+    fn vocabulary_parallel_embedding_project_with_input_observer(
+        embedding: &mut Self::Embedding,
+        input: &Self::Tensor,
+        parallel: &Self::ParallelContext,
+        context: &<Self::Tensor as Tensor>::Context,
+        observer: Option<&mut dyn ProjectionInputObserver<Self::Tensor>>,
+    ) -> Result<Self::Tensor, Error> {
+        if let Some(observer) = observer {
+            observer.observe(input)?;
+        }
+        Self::vocabulary_parallel_embedding_project(embedding, input, parallel, context)
+    }
     /// Sums a rank-local tensor contribution across the tensor-parallel group.
     fn sum_parallel(
         value: Self::Tensor,
@@ -4635,6 +5041,8 @@ pub trait Tensor: Clone + Debug + Sized + 'static {
     /// Creates a tensor view using backend-neutral axis indexes.
     fn index(&self, indexes: &[Index], context: &Self::Context) -> Result<Self, Error>;
     /// Takes rows along one axis using a backend index tensor.
+    /// Indices outside the supported axis domain must fail; deferred validation must prevent the
+    /// native gather from reading outside its source while work is pending.
     fn take_axis(&self, indexes: &Self, axis: i32, context: &Self::Context) -> Result<Self, Error>;
     /// Creates a zero tensor with the same shape and physical dtype.
     fn zeros_like(&self, context: &Self::Context) -> Result<Self, Error> {
@@ -5639,6 +6047,7 @@ mod parameter_topology_tests {
                 group: None,
                 linear_companion: None,
                 linear_companion_of: None,
+                linear_row_layout: LinearRowLayout::Contiguous,
             },
             1,
         );

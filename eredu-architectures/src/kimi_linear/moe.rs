@@ -69,13 +69,22 @@ impl<B: NeuralBackend> DenseSwiGlu<B> {
         B::gated_product(gate, up, eredu_nn::GatedProductPolicy::default(), context)
     }
 
-    pub(crate) fn forward(
+    pub(crate) fn forward_instrumented(
         &mut self,
         input: &B::Tensor,
+        parallel: Option<&B::ParallelContext>,
         context: &<B::Tensor as Tensor>::Context,
+        instrumentation: &mut crate::decoder::ComponentInstrumentation<'_, B::Tensor>,
     ) -> Result<B::Tensor, Error> {
         let hidden = self.hidden(input, context)?;
-        self.down.forward(&hidden, context)
+        let units = instrumentation.apply("feed_forward.units", hidden)?;
+        instrumentation.project::<B>(
+            "feed_forward.write_input",
+            &mut self.down,
+            &units,
+            parallel,
+            context,
+        )
     }
 }
 
@@ -85,6 +94,8 @@ impl<B: NeuralBackend> DenseSwiGlu<B> {
 pub struct SparseMoe<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> {
     #[parameter(skip)]
     layer: usize,
+    #[parameter(skip)]
+    observation: eredu_runtime::RoutedObservationPoints,
     /// Grouped sigmoid router with selection correction bias.
     pub router: B::Selector,
     /// Packed routed gated-product experts.
@@ -141,6 +152,9 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> SparseMoe<B> 
         let experts = B::grouped_gated_product(spec, context)?;
         Ok(Self {
             layer,
+            observation: args
+                .routed_observation_points(&format!("model.layers.{layer}"), layer)
+                .ok_or_else(|| Error::backend("Kimi sparse unit has no routing declaration"))?,
             router,
             experts,
             shared: DenseSwiGlu::new(
@@ -353,82 +367,136 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> FeedForward<B
     }
 
     /// Executes dense or provider-backed sparse computation.
-    pub fn forward_with_provider<P>(
+    pub fn forward_instrumented_with_provider<P>(
         &mut self,
         input: &B::Tensor,
         pass: eredu_runtime::ExpertPass,
         context: &<B::Tensor as Tensor>::Context,
         provider: &mut P,
+        instrumentation: &mut crate::decoder::ComponentInstrumentation<'_, B::Tensor>,
+        points: Option<eredu_runtime::RoutedObservationPoints>,
     ) -> Result<B::Tensor, Error>
     where
         P: RoutedExpertProvider<B>,
         P::Error: std::fmt::Display,
     {
-        match self {
-            Self::Dense(dense) => dense.forward(input, context),
-            Self::Sparse(sparse) => {
-                let routes = sparse.router.select(input, context)?;
-                let routed = provider
-                    .forward_grouped(
-                        &mut sparse.experts,
-                        RoutedExpertRequest {
-                            bank: eredu_runtime::RoutedBankId::new(0),
-                            layer: sparse.layer,
-                            input,
-                            routes: &routes,
-                            pass,
-                        },
-                        context,
-                    )
-                    .map_err(|error| Error::backend(error.to_string()))?;
-                routed.add(&sparse.shared.forward(input, context)?, context)
-            }
-        }
+        self.forward_instrumented_with_executor(
+            input,
+            pass,
+            None,
+            context,
+            instrumentation,
+            points,
+            |bank, request, context| {
+                provider
+                    .forward_grouped(bank, request, context)
+                    .map_err(Error::backend_source)
+            },
+        )
     }
 
-    /// Executes sparse routed/shared work with one complete semantic observation.
-    pub fn forward_observed_with_provider<P, O>(
+    /// Keeps local shared units and exchanged routed units in their declared scopes.
+    pub fn forward_parallel_instrumented_with_provider<P>(
         &mut self,
-        point: eredu_runtime::RoutedObservationPoints,
         input: &B::Tensor,
         pass: eredu_runtime::ExpertPass,
+        parallel: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
         provider: &mut P,
-        observer: &mut O,
+        instrumentation: &mut crate::decoder::ComponentInstrumentation<'_, B::Tensor>,
+        points: Option<eredu_runtime::RoutedObservationPoints>,
     ) -> Result<B::Tensor, Error>
     where
-        P: RoutedExpertProvider<B>,
+        P: TensorParallelRoutedExpertProvider<B>,
         P::Error: std::fmt::Display,
-        O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
     {
-        let point = point
-            .bank(eredu_runtime::RoutedBankId::new(0))
-            .ok_or_else(|| Error::backend("missing feed-forward routing observation"))?;
-        match self {
-            Self::Dense(dense) => dense.forward(input, context),
-            Self::Sparse(sparse) => {
-                let routes = eredu_runtime::select_routes_with_observer(
-                    &mut sparse.router,
-                    input,
-                    context,
-                    point.path(),
-                    observer,
-                )?;
-                let routed = provider
-                    .forward_grouped(
-                        &mut sparse.experts,
-                        RoutedExpertRequest {
-                            bank: eredu_runtime::RoutedBankId::new(0),
-                            layer: sparse.layer,
-                            input,
-                            routes: &routes,
-                            pass,
-                        },
+        self.forward_instrumented_with_executor(
+            input,
+            pass,
+            Some(parallel),
+            context,
+            instrumentation,
+            points,
+            |bank, request, context| {
+                let output = provider
+                    .forward_grouped_tensor_parallel(
+                        bank,
+                        request,
+                        B::parallel_size(parallel),
                         context,
                     )
-                    .map_err(|error| Error::backend(error.to_string()))?;
-                let shared = sparse.shared.forward(input, context)?;
-                let combined = routed.add(&shared, context)?;
+                    .map_err(Error::backend_source)?;
+                eredu_runtime::reduce_routed_expert_tensor_parallel::<B>(output, parallel, context)
+            },
+        )
+    }
+
+    fn forward_instrumented_with_executor<F>(
+        &mut self,
+        input: &B::Tensor,
+        pass: eredu_runtime::ExpertPass,
+        parallel: Option<&B::ParallelContext>,
+        context: &<B::Tensor as Tensor>::Context,
+        instrumentation: &mut crate::decoder::ComponentInstrumentation<'_, B::Tensor>,
+        points: Option<eredu_runtime::RoutedObservationPoints>,
+        execute: F,
+    ) -> Result<B::Tensor, Error>
+    where
+        F: FnOnce(
+            &mut B::GatedProductGroups,
+            RoutedExpertRequest<'_, '_, B::Tensor>,
+            &<B::Tensor as Tensor>::Context,
+        ) -> Result<B::Tensor, Error>,
+    {
+        let Self::Sparse(sparse) = self else {
+            let Self::Dense(dense) = self else {
+                unreachable!()
+            };
+            return dense.forward_instrumented(input, parallel, context, instrumentation);
+        };
+        let point = points
+            .as_ref()
+            .or_else(|| instrumentation.enabled().then_some(&sparse.observation))
+            .and_then(|points| points.bank(eredu_runtime::RoutedBankId::new(0)));
+        let routes = match (point, instrumentation.observer()) {
+            (Some(point), Some(observer)) => eredu_runtime::select_routes_with_observer(
+                &mut sparse.router,
+                input,
+                context,
+                point.path(),
+                observer,
+            )?,
+            _ => sparse.router.select(input, context)?,
+        };
+        let request = RoutedExpertRequest {
+            unit_observer: None,
+            bank: eredu_runtime::RoutedBankId::new(0),
+            layer: sparse.layer,
+            input,
+            routes: &routes,
+            pass,
+        };
+        let routed = match (point, instrumentation.observer()) {
+            (Some(point), Some(observer)) => eredu_runtime::with_routed_unit_observer(
+                observer,
+                point.path(),
+                request,
+                |request| execute(&mut sparse.experts, request, context),
+            )
+            .map_err(eredu_runtime::ObservedExpertProviderError::into_neural_error)?,
+            _ => execute(&mut sparse.experts, request, context)?,
+        };
+        let shared = instrumentation.with_scope("mlp.shared_experts", |instrumentation| {
+            let shared =
+                sparse
+                    .shared
+                    .forward_instrumented(input, parallel, context, instrumentation)?;
+            let shared = instrumentation.apply("feed_forward.write", shared)?;
+            instrumentation.apply("feed_forward.output", shared)
+        })?;
+        let combined = routed.add(&shared, context)?;
+        match (point, instrumentation.observer()) {
+            (Some(point), Some(observer)) => {
                 observer.observe_routing(eredu_runtime::RoutingObservation {
                     path: point.path(),
                     selected_experts: routes.group_indices(),
@@ -447,7 +515,61 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> FeedForward<B
                     &combined,
                 )
             }
+            _ => Ok(combined),
         }
+    }
+
+    /// Executes dense or provider-backed sparse computation.
+    pub fn forward_with_provider<P>(
+        &mut self,
+        input: &B::Tensor,
+        pass: eredu_runtime::ExpertPass,
+        context: &<B::Tensor as Tensor>::Context,
+        provider: &mut P,
+    ) -> Result<B::Tensor, Error>
+    where
+        P: RoutedExpertProvider<B>,
+        P::Error: std::fmt::Display,
+    {
+        self.forward_instrumented_with_provider(
+            input,
+            pass,
+            context,
+            provider,
+            &mut crate::decoder::ComponentInstrumentation::disabled(),
+            None,
+        )
+    }
+
+    /// Executes sparse routed/shared work with one complete semantic observation.
+    pub fn forward_observed_with_provider<P, O>(
+        &mut self,
+        point: eredu_runtime::RoutedObservationPoints,
+        input: &B::Tensor,
+        pass: eredu_runtime::ExpertPass,
+        context: &<B::Tensor as Tensor>::Context,
+        provider: &mut P,
+        observer: &mut O,
+    ) -> Result<B::Tensor, Error>
+    where
+        P: RoutedExpertProvider<B>,
+        P::Error: std::fmt::Display,
+        O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
+    {
+        let path = point
+            .bank(eredu_runtime::RoutedBankId::new(0))
+            .and_then(|point| point.path().strip_suffix(".mlp"))
+            .ok_or_else(|| Error::backend("Kimi routing point does not name its MLP invocation"))?
+            .to_owned();
+        let mut borrowed = eredu_runtime::BorrowedActivationObserver(observer);
+        self.forward_instrumented_with_provider(
+            input,
+            pass,
+            context,
+            provider,
+            &mut crate::decoder::ComponentInstrumentation::new(&path, &mut borrowed),
+            Some(point),
+        )
     }
 
     /// Executes tensor-partitioned dense/shared projections with provider-backed experts.
@@ -463,46 +585,49 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> FeedForward<B
         P: TensorParallelRoutedExpertProvider<B>,
         P::Error: std::fmt::Display,
     {
-        match self {
-            Self::Dense(dense) => {
-                let hidden = dense.hidden(input, context)?;
-                B::row_parallel_linear(&mut dense.down, &hidden, parallel, context)
-            }
-            Self::Sparse(sparse) => {
-                let routes = sparse.router.select(input, context)?;
-                let routed = provider
-                    .forward_grouped_tensor_parallel(
-                        &mut sparse.experts,
-                        RoutedExpertRequest {
-                            bank: eredu_runtime::RoutedBankId::new(0),
-                            layer: sparse.layer,
-                            input,
-                            routes: &routes,
-                            pass,
-                        },
-                        B::parallel_size(parallel),
-                        context,
-                    )
-                    .map_err(|error| Error::backend(error.to_string()))?;
-                let routed = eredu_runtime::reduce_routed_expert_tensor_parallel::<B>(
-                    routed, parallel, context,
-                )?;
-                let shared_hidden = sparse.shared.hidden(input, context)?;
-                let shared = B::row_parallel_linear(
-                    &mut sparse.shared.down,
-                    &shared_hidden,
-                    parallel,
-                    context,
-                )?;
-                routed.add(&shared, context)
-            }
-        }
+        self.forward_parallel_instrumented_with_provider(
+            input,
+            pass,
+            parallel,
+            context,
+            provider,
+            &mut crate::decoder::ComponentInstrumentation::disabled(),
+            None,
+        )
     }
 }
 
 impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> DecoderProjectionOperator<B>
     for FeedForward<B>
 {
+    fn residual_observation(&self) -> &'static str {
+        if matches!(self, Self::Sparse(_)) {
+            "feed_forward.contribution"
+        } else {
+            "feed_forward.output"
+        }
+    }
+
+    fn forward_feed_forward_observed(
+        &mut self,
+        input: &B::Tensor,
+        context: &<B::Tensor as Tensor>::Context,
+        instrumentation: &mut crate::decoder::ComponentInstrumentation<'_, B::Tensor>,
+    ) -> Result<B::Tensor, Error> {
+        self.forward_instrumented_with_provider(
+            input,
+            if input.dim(1) > 1 {
+                eredu_runtime::ExpertPass::Prefill
+            } else {
+                eredu_runtime::ExpertPass::Decode
+            },
+            context,
+            &mut ResidentExpertProvider,
+            instrumentation,
+            None,
+        )
+    }
+
     fn forward_feed_forward(
         &mut self,
         input: &B::Tensor,
@@ -525,38 +650,39 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> DecoderProjec
 impl<B: eredu_nn::TensorParallelGroupedNeuralBackend + eredu_nn::DistributedNeuralBackend>
     TensorParallelProjectionOperator<B> for FeedForward<B>
 {
+    fn forward_feed_forward_parallel_observed(
+        &mut self,
+        input: &B::Tensor,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+        instrumentation: &mut crate::decoder::ComponentInstrumentation<'_, B::Tensor>,
+    ) -> Result<B::Tensor, Error> {
+        self.forward_parallel_instrumented_with_provider(
+            input,
+            if input.dim(1) > 1 {
+                eredu_runtime::ExpertPass::Prefill
+            } else {
+                eredu_runtime::ExpertPass::Decode
+            },
+            parallel,
+            context,
+            &mut ResidentExpertProvider,
+            instrumentation,
+            None,
+        )
+    }
+
     fn forward_feed_forward_parallel(
         &mut self,
         input: &B::Tensor,
         parallel: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
-        match self {
-            Self::Dense(dense) => {
-                let hidden = dense.hidden(input, context)?;
-                B::row_parallel_linear(&mut dense.down, &hidden, parallel, context)
-            }
-            Self::Sparse(sparse) => {
-                let routes = sparse.router.select(input, context)?;
-                let routed = B::gated_product_groups_tensor_parallel(
-                    &mut sparse.experts,
-                    input,
-                    &routes,
-                    B::parallel_size(parallel),
-                    context,
-                )?;
-                let routed = eredu_runtime::reduce_tensor_parallel_expert_output::<B>(
-                    routed, parallel, context,
-                )?;
-                let shared_hidden = sparse.shared.hidden(input, context)?;
-                let shared = B::row_parallel_linear(
-                    &mut sparse.shared.down,
-                    &shared_hidden,
-                    parallel,
-                    context,
-                )?;
-                routed.add(&shared, context)
-            }
-        }
+        self.forward_feed_forward_parallel_observed(
+            input,
+            parallel,
+            context,
+            &mut crate::decoder::ComponentInstrumentation::disabled(),
+        )
     }
 }

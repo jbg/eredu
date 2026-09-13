@@ -48,6 +48,7 @@ pub mod mechanism_synthesis;
 pub mod parallel;
 /// Neutral checkpoint materialization and stable parameter binding.
 pub mod parameter;
+pub mod parameter_operations;
 /// Backend-neutral rank-local architecture ownership.
 pub mod partition;
 /// Rank-local graph execution over opaque communication resources.
@@ -80,6 +81,8 @@ pub mod replicated_session;
 pub mod replicated_text;
 /// Backend-neutral immutable-weight residency declarations and orchestration.
 pub mod residency;
+/// Bounded all-rank readiness and lifetime accounting before text execution.
+pub mod run_preparation;
 /// Backend-neutral speculative request lifecycle and fair scheduling.
 pub mod speculative;
 /// Family-blind speculative requirements, selection, and construction gating.
@@ -119,16 +122,17 @@ pub use cache::{
 };
 pub use communication::validate_communication_manifest_consensus;
 pub use communication::{
-    prepare_communication_realization, project_all_communication_manifests,
-    project_communication_manifest, validate_compatible_communication_manifests,
+    establish_communication_session, prepare_communication_realization,
+    project_all_communication_manifests, project_communication_manifest,
+    validate_compatible_communication_manifests, AgreedCommunicationSession,
     BoundaryDimensionContract, BoundaryFramingProtocol, BoundaryRoleContract,
     CommunicationCapabilities, CommunicationCapabilityError, CommunicationCompletionCapabilities,
     CommunicationCompletionPolicy, CommunicationGroupDescriptor, CommunicationGroupRequirements,
     CommunicationManifest, CommunicationManifestConsensusError, CommunicationManifestError,
     CommunicationOperation, CommunicationOperationRequirement, CommunicationPeerCounts,
     CommunicationRealizationError, CommunicationRouteDescriptor, CommunicationRouteId,
-    CommunicationTensorLimits, CommunicationTopologyCapabilities, PreparedCommunicationRealization,
-    RoleExactBoundaryContract, TopologyCommunicationPlan,
+    CommunicationSessionIdentity, CommunicationTensorLimits, CommunicationTopologyCapabilities,
+    PreparedCommunicationRealization, RoleExactBoundaryContract, TopologyCommunicationPlan,
 };
 pub use component::{
     ComponentDomain, ComponentGraph, ComponentGraphError, ComponentKind, ComponentResidencyClass,
@@ -163,17 +167,23 @@ pub use expert::{
     combine_routed_expert_tensor_parallel, combine_tensor_parallel_expert_outputs,
     plan_addressable_bank_bindings, reduce_routed_expert_tensor_parallel,
     reduce_tensor_parallel_expert_output, selected_addressable_parameter_bytes,
-    AddressableBankBindingPlan, AddressableBankDistribution, AddressableBankMember,
-    AddressableBankMemberError, AddressableBankMemberPlacement, AddressableBankParameter,
-    AddressableBankTask, AddressableBindingTransform, AddressableExpertRouteProvider,
-    AddressableExpertRouteRequest, AddressableGatedProductBank, AddressableGroupedBank,
-    ExpertRouteCombination, ExpertRouteExchange, ExpertRouteInvocation, ExpertRouteTensorMovement,
-    IndexedMovement, ObservedExpertProvider, ObservedExpertProviderError, ParameterBankAcquisition,
+    with_provider_unit_observer, with_resident_unit_coordinates, with_routed_unit_invocation,
+    with_routed_unit_observer, AddressableBankBindingPlan, AddressableBankDistribution,
+    AddressableBankMember, AddressableBankMemberError, AddressableBankMemberPlacement,
+    AddressableBankParameter, AddressableBankTask, AddressableBindingTransform,
+    AddressableExpertRouteProvider, AddressableExpertRouteRequest, AddressableGatedProductBank,
+    AddressableGroupedBank, ExpertRouteCombination, ExpertRouteExchange, ExpertRouteInvocation,
+    ExpertRouteTensorMovement, IndexedMovement, ObservedExpertProvider,
+    ObservedExpertProviderError, ParameterBankAcquisition, ProviderUnitObserver,
     ResidentExpertProvider, RoutedBankId, RoutedBankProviderError, RoutedBankProviders,
     RoutedExpertProvider, RoutedExpertRequest, RoutedExpertTensorParallelOutput,
-    RoutedObservationPoints, TensorParallelRoutedExpertProvider,
+    RoutedObservationPoints, RoutedUnitBatch, RoutedUnitInvocation, RoutedUnitObserver,
+    TensorParallelRoutedExpertProvider,
 };
-pub use expert::{select_routes_with_observer, select_routes_with_provider};
+pub use expert::{
+    select_routes_with_observer, select_routes_with_provider, with_exchanged_unit_observer,
+    with_partition_unit_observer, RoutedUnitOrigin, RoutedUnitOrigins,
+};
 pub use generation::{
     CausalModel, ConstrainedSampler, DefaultSampler, GenerationSampler, MirostatV2Sampler,
     PenaltyConfig, Sampler, SamplingBackend, SamplingConfigurationError, SpeculativeSampler,
@@ -184,8 +194,9 @@ pub use input::{
     PreparedInputPart, PreparedInputPayload, PreparedModelInput,
 };
 pub use inspection::{
-    observe_and_intervene, observe_model_logits, ActivationObserver, NoopObserver, RoutingDecision,
-    RoutingObservation, TargetStateCapture, TargetStateCaptureError, TargetStateTap,
+    observe_and_intervene, observe_model_logits, ActivationObserver, BorrowedActivationObserver,
+    NoopObserver, RoutingDecision, RoutingObservation, TargetStateCapture, TargetStateCaptureError,
+    TargetStateTap,
 };
 pub use layered::{
     ArchitectureGroupKind, ArchitectureGroupPlacement, ArchitectureGroupTransport,
@@ -207,11 +218,13 @@ pub use mechanism_synthesis::{
     StateLifecycleCapabilities,
 };
 pub use parallel::{
-    aligned_partition_units, expand_linear_format_parameter_groups, module_parameter_group,
-    partitioned_module_parameter_group, partitioned_projection_group, projection_parameter_group,
-    segmented_projection_group, LocalModelLayout, LocalTensorLayout, MemberSharding,
-    ParallelModelInfo, ParallelPlanError, ParameterGroupSpec, ParameterMemberSpec, ParameterRole,
-    ProjectionSharding, ShardingPolicy, TensorPlacement,
+    aligned_partition_units, aligned_partition_units_with_tail, derive_transform_source_layout,
+    expand_linear_format_parameter_groups, module_parameter_group, partition_chunk_range,
+    partition_parameter_group_chunks, partitioned_module_parameter_group,
+    partitioned_projection_group, projection_parameter_group, segmented_projection_group,
+    LocalModelLayout, LocalTensorLayout, MemberSharding, ParallelModelInfo, ParallelPlanError,
+    ParameterGroupSpec, ParameterMemberSpec, ParameterRole, ProjectionSharding, ShardingPolicy,
+    TensorPlacement,
 };
 pub use parameter::{
     bind_materialized_unit, bind_materialized_unit_excluding, bindings_from_recipe_set,
@@ -371,9 +384,9 @@ pub use state::{
     StateSegmentSpec, DEFAULT_STATE_SEGMENT_ID,
 };
 pub use weight_residency::{
-    DenseDiskStreamLoadOptions, DenseTransferSchedule, DenseTransferScheduleError,
-    ExecutionResidency, ExpertPass, LayerWeightResidency, LayerwiseLoadOptions,
-    LayerwiseModelMetadata, OrdinaryWeightResidency, ParameterBankAccess, ParameterBankKey,
-    ParameterBankLoadOptions, ParameterBankResidency, StaticUnitBindings, WeightResidency,
-    WeightResidencyPolicyError, DENSE_TRANSFER_WINDOW,
+    AuxiliaryModuleResidency, AuxiliaryWeightRequirements, DenseDiskStreamLoadOptions,
+    DenseTransferSchedule, DenseTransferScheduleError, ExecutionResidency, ExpertPass,
+    LayerWeightResidency, LayerwiseLoadOptions, LayerwiseModelMetadata, OrdinaryWeightResidency,
+    ParameterBankAccess, ParameterBankKey, ParameterBankLoadOptions, ParameterBankResidency,
+    StaticUnitBindings, WeightResidency, WeightResidencyPolicyError, DENSE_TRANSFER_WINDOW,
 };

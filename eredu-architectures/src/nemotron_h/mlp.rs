@@ -2,8 +2,8 @@
 
 use eredu_nn::{
     Error, GroupScoring, GroupSelectionOperator, GroupedNeuralBackend, GroupedRelu2Spec,
-    LinearOperator, LinearSpec, NeuralBackend, ParameterSpec, Parameterized, Tensor,
-    TopKGroupSelectionSpec, TopKGroupSelectorSpec,
+    LinearSpec, NeuralBackend, ParameterSpec, Parameterized, Tensor, TopKGroupSelectionSpec,
+    TopKGroupSelectorSpec,
 };
 use eredu_runtime::{
     ResidentExpertProvider, RoutedExpertProvider, RoutedExpertRequest,
@@ -58,25 +58,37 @@ impl<B: NeuralBackend> DenseMlp<B> {
         })
     }
 
-    fn hidden(
-        &mut self,
-        input: &B::Tensor,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<B::Tensor, Error> {
-        self.up_proj
-            .forward(input, context)?
-            .maximum_scalar(0.0, context)?
-            .square(context)
-    }
-
     /// Executes replicated dense computation.
     pub fn forward(
         &mut self,
         input: &B::Tensor,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
-        let hidden = self.hidden(input, context)?;
-        self.down_proj.forward(&hidden, context)
+        self.forward_instrumented(
+            input,
+            None,
+            context,
+            &mut crate::decoder::ComponentInstrumentation::disabled(),
+        )
+    }
+
+    /// Executes genuine non-gated unit hooks before the down projection.
+    pub fn forward_instrumented(
+        &mut self,
+        input: &B::Tensor,
+        parallel: Option<&B::ParallelContext>,
+        context: &<B::Tensor as Tensor>::Context,
+        instrumentation: &mut crate::decoder::ComponentInstrumentation<'_, B::Tensor>,
+    ) -> Result<B::Tensor, Error> {
+        crate::decoder::unary::forward::<B>(
+            input,
+            &mut self.up_proj,
+            &mut self.down_proj,
+            crate::decoder::unary::Activation::ReluSquared,
+            parallel,
+            context,
+            instrumentation,
+        )
     }
 }
 
@@ -88,8 +100,12 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> DenseMlp<B> {
         parallel: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
-        let hidden = self.hidden(input, context)?;
-        B::row_parallel_linear(&mut self.down_proj, &hidden, parallel, context)
+        self.forward_instrumented(
+            input,
+            Some(parallel),
+            context,
+            &mut crate::decoder::ComponentInstrumentation::disabled(),
+        )
     }
 }
 
@@ -99,6 +115,8 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> DenseMlp<B> {
 pub struct SparseMoe<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> {
     #[parameter(skip)]
     layer: usize,
+    #[parameter(skip)]
+    resident_unit_coordinates: Option<(eredu_core::component::ComponentCoordinateMap, bool)>,
     /// Grouped correction-bias router.
     pub gate: B::Selector,
     /// Packed routed experts.
@@ -178,6 +196,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> SparseMoe<B> 
         let experts = B::grouped_relu2(spec, context)?;
         Ok(Self {
             layer,
+            resident_unit_coordinates: None,
             gate,
             experts,
             shared_experts: DenseMlp::new(
@@ -220,6 +239,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> SparseMoe<B> 
             .forward_relu2_routed(
                 &mut self.experts,
                 RoutedExpertRequest {
+                    unit_observer: None,
                     bank: eredu_runtime::RoutedBankId::new(0),
                     layer: self.layer,
                     input,
@@ -228,7 +248,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> SparseMoe<B> 
                 },
                 context,
             )
-            .map_err(|error| Error::backend(error.to_string()))?;
+            .map_err(Error::backend_source)?;
         routed.add(&self.shared_experts.forward(input, context)?, context)
     }
 
@@ -256,20 +276,27 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> SparseMoe<B> 
             path,
             observer,
         )?;
-        let routed = provider
-            .forward_relu2_routed(
-                &mut self.experts,
-                RoutedExpertRequest {
-                    bank: eredu_runtime::RoutedBankId::new(0),
-                    layer: self.layer,
-                    input,
-                    routes: &routes,
-                    pass,
-                },
-                context,
-            )
-            .map_err(|error| Error::backend(error.to_string()))?;
-        let shared = self.shared_experts.forward(input, context)?;
+        let routed = eredu_runtime::with_routed_unit_observer(
+            observer,
+            path,
+            RoutedExpertRequest {
+                unit_observer: None,
+                bank: eredu_runtime::RoutedBankId::new(0),
+                layer: self.layer,
+                input,
+                routes: &routes,
+                pass,
+            },
+            |request| {
+                eredu_runtime::with_resident_unit_coordinates(
+                    self.resident_unit_coordinates.as_ref(),
+                    request,
+                    |request| provider.forward_relu2_routed(&mut self.experts, request, context),
+                )
+            },
+        )
+        .map_err(eredu_runtime::ObservedExpertProviderError::into_neural_error)?;
+        let shared = self.forward_shared_observed(path, input, None, context, observer)?;
         let combined = routed.add(&shared, context)?;
         observer.observe_routing(eredu_runtime::RoutingObservation {
             path,
@@ -284,6 +311,118 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> SparseMoe<B> 
             expert_count,
         })?;
         eredu_runtime::observe_and_intervene(observer, &format!("{path}.output"), &combined)
+    }
+
+    /// Observes actual TP expert units and the reduced routed/shared result.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_parallel_observed_with_provider<O, P>(
+        &mut self,
+        path: &str,
+        expert_count: i32,
+        input: &B::Tensor,
+        pass: eredu_runtime::ExpertPass,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+        observer: &mut O,
+        provider: &mut P,
+    ) -> Result<B::Tensor, Error>
+    where
+        O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
+        P: TensorParallelRoutedExpertProvider<B>,
+        P::Error: std::fmt::Display,
+    {
+        let routes = eredu_runtime::select_routes_with_observer(
+            &mut self.gate,
+            input,
+            context,
+            path,
+            observer,
+        )?;
+        let routed = eredu_runtime::with_routed_unit_observer(
+            observer,
+            path,
+            RoutedExpertRequest {
+                unit_observer: None,
+                bank: eredu_runtime::RoutedBankId::new(0),
+                layer: self.layer,
+                input,
+                routes: &routes,
+                pass,
+            },
+            |request| {
+                eredu_runtime::with_resident_unit_coordinates(
+                    self.resident_unit_coordinates.as_ref(),
+                    request,
+                    |request| {
+                        provider.forward_relu2_routed_tensor_parallel(
+                            &mut self.experts,
+                            request,
+                            B::parallel_size(parallel),
+                            context,
+                        )
+                    },
+                )
+            },
+        )
+        .map_err(eredu_runtime::ObservedExpertProviderError::into_neural_error)?;
+        let routed =
+            eredu_runtime::reduce_routed_expert_tensor_parallel::<B>(routed, parallel, context)?;
+        let shared =
+            self.forward_shared_observed(path, input, Some(parallel), context, observer)?;
+        let combined = routed.add(&shared, context)?;
+        observer.observe_routing(eredu_runtime::RoutingObservation {
+            path,
+            selected_experts: routes.group_indices(),
+            selected_scores: routes.selected_scores(),
+            coefficients: routes.coefficients(),
+            routed_output: &routed,
+            local_routed_output: None,
+            reduced_routed_output: Some(&routed),
+            shared_output: Some(&shared),
+            combined_output: Some(&combined),
+            expert_count,
+        })?;
+        eredu_runtime::observe_and_intervene(observer, &format!("{path}.output"), &combined)
+    }
+
+    pub(crate) fn bind_resident_unit_coordinates(
+        &mut self,
+        coordinates: eredu_core::component::ComponentCoordinateMap,
+        partitioned: bool,
+    ) {
+        self.resident_unit_coordinates = Some((coordinates, partitioned));
+    }
+
+    // The block's routing seam is a sibling of its always-executed shared branch.
+    // Preserve the existing public routing-path convention and scope the shared
+    // unary driver to the same logical invocation, including appended MTP units.
+    fn forward_shared_observed<O>(
+        &mut self,
+        routing_path: &str,
+        input: &B::Tensor,
+        parallel: Option<&B::ParallelContext>,
+        context: &<B::Tensor as Tensor>::Context,
+        observer: &mut O,
+    ) -> Result<B::Tensor, Error>
+    where
+        O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
+    {
+        let unit_path = routing_path
+            .strip_suffix(".routing")
+            .unwrap_or(routing_path);
+        let path = format!("{unit_path}.shared");
+        let mut borrowed = eredu_runtime::BorrowedActivationObserver(observer);
+        let mut instrumentation =
+            crate::decoder::ComponentInstrumentation::new(&path, &mut borrowed);
+        let input = instrumentation.apply("feed_forward.input", input.clone())?;
+        let output = self.shared_experts.forward_instrumented(
+            &input,
+            parallel,
+            context,
+            &mut instrumentation,
+        )?;
+        let output = instrumentation.apply("feed_forward.write", output)?;
+        instrumentation.apply("feed_forward.output", output)
     }
 
     /// Executes TP shared projections while the provider owns routed experts.
@@ -304,6 +443,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> SparseMoe<B> 
             .forward_relu2_routed_tensor_parallel(
                 &mut self.experts,
                 RoutedExpertRequest {
+                    unit_observer: None,
                     bank: eredu_runtime::RoutedBankId::new(0),
                     layer: self.layer,
                     input,
@@ -313,7 +453,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> SparseMoe<B> 
                 B::parallel_size(parallel),
                 context,
             )
-            .map_err(|error| Error::backend(error.to_string()))?;
+            .map_err(Error::backend_source)?;
         let routed =
             eredu_runtime::reduce_routed_expert_tensor_parallel::<B>(routed, parallel, context)?;
         routed.add(

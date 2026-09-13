@@ -17,6 +17,7 @@ use super::{
     moe::{RouteSource, RoutedPlusShared},
     LayerPolicy, V3Args, V4Args,
 };
+use crate::decoder::ComponentInstrumentation;
 
 /// Ordinary DeepSeek SwiGLU used by dense-prefix V3 layers.
 #[derive(Debug, Clone, Parameterized)]
@@ -151,6 +152,90 @@ where
         })
     }
 
+    /// The common serial/parallel/provider driver. Coefficients are existing
+    /// mechanism outputs; disabled instrumentation creates no diagnostic views.
+    #[allow(clippy::too_many_arguments)]
+    fn forward_cycle<C, R, F>(
+        &mut self,
+        input: &B::Tensor,
+        input_ids: &B::Tensor,
+        mask: Option<&B::Tensor>,
+        cache: Option<&mut C>,
+        context: &<B::Tensor as Tensor>::Context,
+        instrumentation: &mut ComponentInstrumentation<'_, B::Tensor>,
+        mut reduce: R,
+        feed_forward: F,
+    ) -> Result<B::Tensor, Error>
+    where
+        C: PoolingAttentionCache<B::Tensor>,
+        R: FnMut(B::Tensor, &<B::Tensor as Tensor>::Context) -> Result<B::Tensor, Error>,
+        F: FnOnce(
+            &mut RoutedPlusShared<B>,
+            &B::Tensor,
+            RouteSource<'_, B::Tensor>,
+            &<B::Tensor as Tensor>::Context,
+            &mut R,
+            &mut ComponentInstrumentation<'_, B::Tensor>,
+        ) -> Result<B::Tensor, Error>,
+    {
+        let attention_state =
+            self.attention_connection
+                .collapse(input, self.normalization_epsilon, context)?;
+        let collapsed = observe_v4_collapse(instrumentation, "hyper.attention", &attention_state)?;
+        let normalized = self.attention_norm.forward(
+            collapsed.as_ref().unwrap_or(&attention_state.collapsed),
+            context,
+        )?;
+        let normalized = instrumentation.apply("compressed_attention.input", normalized)?;
+        let attention = instrumentation.with_scope("compressed_attention", |instrumentation| {
+            self.attention
+                .forward_instrumented(&normalized, mask, cache, context, instrumentation)
+        })?;
+        let attention = reduce(attention, context)?;
+        let attention = instrumentation.apply("compressed_attention.output", attention)?;
+        let hidden =
+            self.attention_connection
+                .expand(&attention, input, &attention_state, context)?;
+        let hidden = instrumentation.apply("hyper.attention.streams", hidden)?;
+
+        let feed_forward_state =
+            self.feed_forward_connection
+                .collapse(&hidden, self.normalization_epsilon, context)?;
+        let collapsed =
+            observe_v4_collapse(instrumentation, "hyper.feed_forward", &feed_forward_state)?;
+        let normalized = self.feed_forward_norm.forward(
+            collapsed.as_ref().unwrap_or(&feed_forward_state.collapsed),
+            context,
+        )?;
+        let normalized = instrumentation.apply("feed_forward.input", normalized)?;
+        let selected = self
+            .token_experts
+            .as_ref()
+            .map(|table| {
+                table
+                    .as_ref()
+                    .take_axis(&input_ids.reshape(&[-1], context)?, 0, context)
+            })
+            .transpose()?;
+        if let Some(selected) = &selected {
+            instrumentation.observe("routing.selected_indexes", selected)?;
+        }
+        let source = selected
+            .as_ref()
+            .map_or(RouteSource::Learned, RouteSource::Selected);
+        let feed_forward = feed_forward(
+            &mut self.feed_forward,
+            &normalized,
+            source,
+            context,
+            &mut reduce,
+            instrumentation,
+        )?;
+        let feed_forward = instrumentation.apply("feed_forward.contribution", feed_forward)?;
+        self.feed_forward_connection
+            .expand(&feed_forward, &hidden, &feed_forward_state, context)
+    }
+
     /// Executes both V4 hyper-connection residual cycles.
     pub fn forward<C: PoolingAttentionCache<B::Tensor>>(
         &mut self,
@@ -160,35 +245,16 @@ where
         cache: Option<&mut C>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
-        let residual = input;
-        let state =
-            self.attention_connection
-                .collapse(input, self.normalization_epsilon, context)?;
-        let normalized = self.attention_norm.forward(&state.collapsed, context)?;
-        let attention = self.attention.forward(&normalized, mask, cache, context)?;
-        let hidden = self
-            .attention_connection
-            .expand(&attention, residual, &state, context)?;
-
-        let residual = &hidden;
-        let state =
-            self.feed_forward_connection
-                .collapse(&hidden, self.normalization_epsilon, context)?;
-        let normalized = self.feed_forward_norm.forward(&state.collapsed, context)?;
-        let selected = self
-            .token_experts
-            .as_ref()
-            .map(|table| {
-                let tokens = input_ids.reshape(&[-1], context)?;
-                table.as_ref().take_axis(&tokens, 0, context)
-            })
-            .transpose()?;
-        let source = selected
-            .as_ref()
-            .map_or(RouteSource::Learned, RouteSource::Selected);
-        let feed_forward = self.feed_forward.forward(&normalized, source, context)?;
-        self.feed_forward_connection
-            .expand(&feed_forward, residual, &state, context)
+        let mut provider = ResidentExpertProvider;
+        self.forward_with_provider(
+            input,
+            input_ids,
+            mask,
+            cache,
+            ExpertPass::Decode,
+            &mut provider,
+            context,
+        )
     }
 
     /// Executes the V4 block with routed experts supplied by runtime policy.
@@ -208,40 +274,18 @@ where
         P: RoutedExpertProvider<B>,
         P::Error: std::fmt::Display,
     {
-        let residual = input;
-        let state =
-            self.attention_connection
-                .collapse(input, self.normalization_epsilon, context)?;
-        let normalized = self.attention_norm.forward(&state.collapsed, context)?;
-        let attention = self.attention.forward(&normalized, mask, cache, context)?;
-        let hidden = self
-            .attention_connection
-            .expand(&attention, residual, &state, context)?;
-        let state =
-            self.feed_forward_connection
-                .collapse(&hidden, self.normalization_epsilon, context)?;
-        let normalized = self.feed_forward_norm.forward(&state.collapsed, context)?;
-        let selected = self
-            .token_experts
-            .as_ref()
-            .map(|table| {
-                table
-                    .as_ref()
-                    .take_axis(&input_ids.reshape(&[-1], context)?, 0, context)
-            })
-            .transpose()?;
-        let source = selected
-            .as_ref()
-            .map_or(RouteSource::Learned, RouteSource::Selected);
-        let feed_forward = self.feed_forward.forward_with_provider(
-            &normalized,
-            source,
-            pass,
-            provider,
+        self.forward_cycle(
+            input,
+            input_ids,
+            mask,
+            cache,
             context,
-        )?;
-        self.feed_forward_connection
-            .expand(&feed_forward, &hidden, &state, context)
+            &mut ComponentInstrumentation::disabled(),
+            |value, _| Ok(value),
+            |feed_forward, normalized, source, context, _, _| {
+                feed_forward.forward_with_provider(normalized, source, pass, provider, context)
+            },
+        )
     }
 
     /// Executes a tensor-partitioned V4 block, reducing the partial attention
@@ -253,45 +297,24 @@ where
         mask: Option<&B::Tensor>,
         cache: Option<&mut C>,
         context: &<B::Tensor as Tensor>::Context,
-        mut reduce: F,
+        reduce: F,
     ) -> Result<B::Tensor, Error>
     where
         C: PoolingAttentionCache<B::Tensor>,
         F: FnMut(B::Tensor, &<B::Tensor as Tensor>::Context) -> Result<B::Tensor, Error>,
     {
-        let state =
-            self.attention_connection
-                .collapse(input, self.normalization_epsilon, context)?;
-        let normalized = self.attention_norm.forward(&state.collapsed, context)?;
-        let attention = reduce(
-            self.attention.forward(&normalized, mask, cache, context)?,
+        self.forward_cycle(
+            input,
+            input_ids,
+            mask,
+            cache,
             context,
-        )?;
-        let hidden = self
-            .attention_connection
-            .expand(&attention, input, &state, context)?;
-        let state =
-            self.feed_forward_connection
-                .collapse(&hidden, self.normalization_epsilon, context)?;
-        let normalized = self.feed_forward_norm.forward(&state.collapsed, context)?;
-        let selected = self
-            .token_experts
-            .as_ref()
-            .map(|table| {
-                table
-                    .as_ref()
-                    .take_axis(&input_ids.reshape(&[-1], context)?, 0, context)
-            })
-            .transpose()?;
-        let source = selected
-            .as_ref()
-            .map_or(RouteSource::Learned, RouteSource::Selected);
-        let feed_forward = reduce(
-            self.feed_forward.forward(&normalized, source, context)?,
-            context,
-        )?;
-        self.feed_forward_connection
-            .expand(&feed_forward, &hidden, &state, context)
+            &mut ComponentInstrumentation::disabled(),
+            reduce,
+            |feed_forward, normalized, source, context, reduce, _| {
+                reduce(feed_forward.forward(normalized, source, context)?, context)
+            },
+        )
     }
 
     /// Tensor-partitioned V4 execution with runtime-supplied routed experts.
@@ -305,7 +328,7 @@ where
         pass: ExpertPass,
         provider: &mut P,
         context: &<B::Tensor as Tensor>::Context,
-        mut reduce: F,
+        reduce: F,
     ) -> Result<B::Tensor, Error>
     where
         C: PoolingAttentionCache<B::Tensor>,
@@ -313,43 +336,114 @@ where
         P::Error: std::fmt::Display,
         F: FnMut(B::Tensor, &<B::Tensor as Tensor>::Context) -> Result<B::Tensor, Error>,
     {
-        let state =
-            self.attention_connection
-                .collapse(input, self.normalization_epsilon, context)?;
-        let normalized = self.attention_norm.forward(&state.collapsed, context)?;
-        let attention = reduce(
-            self.attention.forward(&normalized, mask, cache, context)?,
+        self.forward_cycle(
+            input,
+            input_ids,
+            mask,
+            cache,
             context,
-        )?;
-        let hidden = self
-            .attention_connection
-            .expand(&attention, input, &state, context)?;
-        let state =
-            self.feed_forward_connection
-                .collapse(&hidden, self.normalization_epsilon, context)?;
-        let normalized = self.feed_forward_norm.forward(&state.collapsed, context)?;
-        let selected = self
-            .token_experts
-            .as_ref()
-            .map(|table| {
-                table
-                    .as_ref()
-                    .take_axis(&input_ids.reshape(&[-1], context)?, 0, context)
-            })
-            .transpose()?;
-        let source = selected
-            .as_ref()
-            .map_or(RouteSource::Learned, RouteSource::Selected);
-        let feed_forward = self.feed_forward.forward_tensor_parallel_with_provider(
-            &normalized,
-            source,
-            pass,
-            provider,
+            &mut ComponentInstrumentation::disabled(),
+            reduce,
+            |feed_forward, normalized, source, context, reduce, _| {
+                feed_forward.forward_tensor_parallel_with_provider(
+                    normalized, source, pass, provider, context, reduce,
+                )
+            },
+        )
+    }
+
+    /// Observes resident tensor-parallel units before the ordinary fused
+    /// expert/shared reduction and records complete hyper-stream expansions.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_parallel_observed<C, O, F>(
+        &mut self,
+        path: &str,
+        input: &B::Tensor,
+        input_ids: &B::Tensor,
+        mask: Option<&B::Tensor>,
+        cache: Option<&mut C>,
+        context: &<B::Tensor as Tensor>::Context,
+        observer: &mut O,
+        reduce: F,
+    ) -> Result<B::Tensor, Error>
+    where
+        C: PoolingAttentionCache<B::Tensor>,
+        O: ActivationObserver<B::Tensor, Error> + ?Sized,
+        F: FnMut(B::Tensor, &<B::Tensor as Tensor>::Context) -> Result<B::Tensor, Error>,
+    {
+        let mut borrowed = eredu_runtime::BorrowedActivationObserver(observer);
+        let mut instrumentation = ComponentInstrumentation::new(path, &mut borrowed);
+        let input = instrumentation.apply("input", input.clone())?;
+        let output = self.forward_cycle(
+            &input,
+            input_ids,
+            mask,
+            cache,
             context,
-            &mut reduce,
+            &mut instrumentation,
+            reduce,
+            |feed_forward, normalized, source, context, reduce, instrumentation| {
+                feed_forward.forward_tensor_parallel_resident_observed(
+                    &format!("{path}.feed_forward"),
+                    normalized,
+                    source,
+                    ExpertPass::Decode,
+                    context,
+                    instrumentation.observer().expect("observed V4 block"),
+                    reduce,
+                )
+            },
         )?;
-        self.feed_forward_connection
-            .expand(&feed_forward, &hidden, &state, context)
+        instrumentation.apply("output", output)
+    }
+
+    /// The same component boundaries with runtime-supplied tensor-parallel banks.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_parallel_observed_with_provider<C, O, P, F>(
+        &mut self,
+        path: &str,
+        input: &B::Tensor,
+        input_ids: &B::Tensor,
+        mask: Option<&B::Tensor>,
+        cache: Option<&mut C>,
+        pass: ExpertPass,
+        provider: &mut P,
+        context: &<B::Tensor as Tensor>::Context,
+        observer: &mut O,
+        reduce: F,
+    ) -> Result<B::Tensor, Error>
+    where
+        C: PoolingAttentionCache<B::Tensor>,
+        O: ActivationObserver<B::Tensor, Error> + ?Sized,
+        P: eredu_runtime::TensorParallelRoutedExpertProvider<B>,
+        P::Error: std::fmt::Display,
+        F: FnMut(B::Tensor, &<B::Tensor as Tensor>::Context) -> Result<B::Tensor, Error>,
+    {
+        let mut borrowed = eredu_runtime::BorrowedActivationObserver(observer);
+        let mut instrumentation = ComponentInstrumentation::new(path, &mut borrowed);
+        let input = instrumentation.apply("input", input.clone())?;
+        let output = self.forward_cycle(
+            &input,
+            input_ids,
+            mask,
+            cache,
+            context,
+            &mut instrumentation,
+            reduce,
+            |feed_forward, normalized, source, context, reduce, instrumentation| {
+                feed_forward.forward_tensor_parallel_with_provider_observed(
+                    &format!("{path}.feed_forward"),
+                    normalized,
+                    source,
+                    pass,
+                    provider,
+                    context,
+                    instrumentation.observer().expect("observed V4 block"),
+                    reduce,
+                )
+            },
+        )?;
+        instrumentation.apply("output", output)
     }
 
     /// Projects one target capture into this block's attention cache without
@@ -363,10 +457,53 @@ where
         cache: &mut C,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<(), Error> {
-        let state =
-            self.attention_connection
-                .collapse(input, self.normalization_epsilon, context)?;
-        let normalized = self.attention_norm.forward(&state.collapsed, context)?;
+        self.prefill_attention_cache_instrumented(
+            input,
+            cache,
+            context,
+            &mut ComponentInstrumentation::disabled(),
+        )
+    }
+
+    /// Observes only the inputs that actually affect a context-cache update.
+    /// The discarded attention write and the unexecuted FFN are not exposed as
+    /// causal component seams in this invocation.
+    pub fn prefill_attention_cache_observed<C: PoolingAttentionCache<B::Tensor>>(
+        &mut self,
+        path: &str,
+        input: &B::Tensor,
+        cache: &mut C,
+        context: &<B::Tensor as Tensor>::Context,
+        observer: &mut dyn ActivationObserver<B::Tensor, Error>,
+    ) -> Result<(), Error> {
+        self.prefill_attention_cache_instrumented(
+            input,
+            cache,
+            context,
+            &mut ComponentInstrumentation::new(path, observer),
+        )
+    }
+
+    fn prefill_attention_cache_instrumented<C: PoolingAttentionCache<B::Tensor>>(
+        &mut self,
+        input: &B::Tensor,
+        cache: &mut C,
+        context: &<B::Tensor as Tensor>::Context,
+        instrumentation: &mut ComponentInstrumentation<'_, B::Tensor>,
+    ) -> Result<(), Error> {
+        let effective = if instrumentation.enabled() {
+            Some(instrumentation.apply("input", input.clone())?)
+        } else {
+            None
+        };
+        let state = self.attention_connection.collapse(
+            effective.as_ref().unwrap_or(input),
+            self.normalization_epsilon,
+            context,
+        )?;
+        let collapsed = instrumentation.apply("collapsed", state.collapsed)?;
+        let normalized = self.attention_norm.forward(&collapsed, context)?;
+        let normalized = instrumentation.apply("normalized", normalized)?;
         self.attention
             .forward(&normalized, None, Some(cache), context)?;
         Ok(())
@@ -423,79 +560,49 @@ where
         P: RoutedExpertProvider<B>,
         P::Error: std::fmt::Display,
     {
-        let input = observe_and_intervene(observer, &format!("{path}.input"), input)?;
-        let attention_state =
-            self.attention_connection
-                .collapse(&input, self.normalization_epsilon, context)?;
-        let collapsed = observe_and_intervene(
-            observer,
-            &format!("{path}.hyper.attention.collapsed"),
-            &attention_state.collapsed,
-        )?;
-        let normalized = self.attention_norm.forward(&collapsed, context)?;
-        let attention = self.attention.forward_observed(
-            &format!("{path}.compressed_attention"),
-            &normalized,
+        let mut borrowed = eredu_runtime::BorrowedActivationObserver(observer);
+        let mut instrumentation = ComponentInstrumentation::new(path, &mut borrowed);
+        let input = instrumentation.apply("input", input.clone())?;
+        let output = self.forward_cycle(
+            &input,
+            input_ids,
             mask,
             cache,
             context,
-            observer,
+            &mut instrumentation,
+            |value, _| Ok(value),
+            |feed_forward, normalized, source, context, _, instrumentation| {
+                feed_forward.forward_with_provider_observed(
+                    &format!("{path}.feed_forward"),
+                    normalized,
+                    source,
+                    pass,
+                    provider,
+                    context,
+                    instrumentation.observer().expect("observed V4 block"),
+                )
+            },
         )?;
-        let attention = observe_and_intervene(
-            observer,
-            &format!("{path}.compressed_attention.output"),
-            &attention,
-        )?;
-        let hidden =
-            self.attention_connection
-                .expand(&attention, &input, &attention_state, context)?;
-        let hidden = observe_and_intervene(
-            observer,
-            &format!("{path}.hyper.attention.streams"),
-            &hidden,
-        )?;
-
-        let feed_forward_state =
-            self.feed_forward_connection
-                .collapse(&hidden, self.normalization_epsilon, context)?;
-        let collapsed = observe_and_intervene(
-            observer,
-            &format!("{path}.hyper.feed_forward.collapsed"),
-            &feed_forward_state.collapsed,
-        )?;
-        let normalized = self.feed_forward_norm.forward(&collapsed, context)?;
-        let selected = self
-            .token_experts
-            .as_ref()
-            .map(|table| {
-                table
-                    .as_ref()
-                    .take_axis(&input_ids.reshape(&[-1], context)?, 0, context)
-            })
-            .transpose()?;
-        if let Some(selected) = &selected {
-            observer.observe(&format!("{path}.routing.selected_indexes"), selected)?;
-        }
-        let source = selected
-            .as_ref()
-            .map_or(RouteSource::Learned, RouteSource::Selected);
-        let feed_forward = self.feed_forward.forward_with_provider_observed(
-            &format!("{path}.feed_forward"),
-            &normalized,
-            source,
-            pass,
-            provider,
-            context,
-            observer,
-        )?;
-        let output = self.feed_forward_connection.expand(
-            &feed_forward,
-            &hidden,
-            &feed_forward_state,
-            context,
-        )?;
-        observe_and_intervene(observer, &format!("{path}.output"), &output)
+        instrumentation.apply("output", output)
     }
+}
+
+fn observe_v4_collapse<T: Tensor>(
+    instrumentation: &mut ComponentInstrumentation<'_, T>,
+    scope: &str,
+    state: &eredu_nn::HyperConnectionState<T>,
+) -> Result<Option<T>, Error> {
+    if !instrumentation.enabled() {
+        return Ok(None);
+    }
+    instrumentation.with_scope(scope, |instrumentation| {
+        instrumentation.observe("pre", &state.pre)?;
+        instrumentation.observe("post", &state.post)?;
+        instrumentation.observe("combination", &state.combination)?;
+        instrumentation
+            .apply("collapsed", state.collapsed.clone())
+            .map(Some)
+    })
 }
 
 impl<B: NeuralBackend> DenseSwiGlu<B> {
@@ -533,11 +640,38 @@ impl<B: NeuralBackend> DenseSwiGlu<B> {
         input: &B::Tensor,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
+        self.forward_instrumented(input, context, &mut ComponentInstrumentation::disabled())
+    }
+
+    fn forward_instrumented(
+        &mut self,
+        input: &B::Tensor,
+        context: &<B::Tensor as Tensor>::Context,
+        instrumentation: &mut ComponentInstrumentation<'_, B::Tensor>,
+    ) -> Result<B::Tensor, Error> {
+        let write = self.forward_partial_instrumented(input, context, instrumentation)?;
+        let write = instrumentation.apply("feed_forward.write", write)?;
+        instrumentation.apply("feed_forward.output", write)
+    }
+
+    fn forward_partial_instrumented(
+        &mut self,
+        input: &B::Tensor,
+        context: &<B::Tensor as Tensor>::Context,
+        instrumentation: &mut ComponentInstrumentation<'_, B::Tensor>,
+    ) -> Result<B::Tensor, Error> {
         let gate = self.gate.forward(input, context)?;
         let up = self.up.forward(input, context)?;
         let activated =
             B::gated_product(gate, up, eredu_nn::GatedProductPolicy::default(), context)?;
-        self.down.forward(&activated, context)
+        let activated = instrumentation.apply("feed_forward.units", activated)?;
+        instrumentation.project::<B>(
+            "feed_forward.write_input",
+            &mut self.down,
+            &activated,
+            None,
+            context,
+        )
     }
 }
 
@@ -549,19 +683,71 @@ fn forward_v3_block<B, C, F>(
     mask: Option<&B::Tensor>,
     cache: Option<&mut C>,
     context: &<B::Tensor as Tensor>::Context,
+    instrumentation: &mut ComponentInstrumentation<'_, B::Tensor>,
     feed_forward: F,
 ) -> Result<B::Tensor, Error>
 where
     B: BlockwiseAttentionBackend,
     C: CompressedAttentionCache<B::Tensor>,
-    F: FnOnce(&B::Tensor, &<B::Tensor as Tensor>::Context) -> Result<B::Tensor, Error>,
+    F: FnOnce(
+        &B::Tensor,
+        &<B::Tensor as Tensor>::Context,
+        &mut ComponentInstrumentation<'_, B::Tensor>,
+    ) -> Result<B::Tensor, Error>,
+{
+    forward_v3_block_reduced(
+        attention,
+        input_norm,
+        post_attention_norm,
+        input,
+        mask,
+        cache,
+        context,
+        instrumentation,
+        |value, _| Ok(value),
+        |input, context, instrumentation, _| feed_forward(input, context, instrumentation),
+    )
+}
+
+fn forward_v3_block_reduced<B, C, F, R>(
+    attention: &mut V3Attention<B>,
+    input_norm: &mut B::Normalization,
+    post_attention_norm: &mut B::Normalization,
+    input: &B::Tensor,
+    mask: Option<&B::Tensor>,
+    cache: Option<&mut C>,
+    context: &<B::Tensor as Tensor>::Context,
+    instrumentation: &mut ComponentInstrumentation<'_, B::Tensor>,
+    mut reduce: R,
+    feed_forward: F,
+) -> Result<B::Tensor, Error>
+where
+    R: FnMut(B::Tensor, &<B::Tensor as Tensor>::Context) -> Result<B::Tensor, Error>,
+    B: BlockwiseAttentionBackend,
+    C: CompressedAttentionCache<B::Tensor>,
+    F: FnOnce(
+        &B::Tensor,
+        &<B::Tensor as Tensor>::Context,
+        &mut ComponentInstrumentation<'_, B::Tensor>,
+        &mut R,
+    ) -> Result<B::Tensor, Error>,
 {
     let normalized = input_norm.forward(input, context)?;
-    let attention = attention.forward(&normalized, mask, cache, context)?;
+    let normalized = instrumentation.apply("attention.input", normalized)?;
+    let attention =
+        attention.forward_instrumented(&normalized, mask, cache, context, instrumentation)?;
+    let attention = instrumentation.apply("attention.write", reduce(attention, context)?)?;
+    // Retain the existing complete MLA-output intervention identity.
+    let attention = instrumentation.apply("compressed_attention.output", attention)?;
     let residual = input.add(&attention, context)?;
+    let residual = instrumentation.apply("attention.residual", residual)?;
     let normalized = post_attention_norm.forward(&residual, context)?;
-    let feed_forward = feed_forward(&normalized, context)?;
-    residual.add(&feed_forward, context)
+    let normalized = instrumentation.apply("feed_forward.input", normalized)?;
+    let feed_forward = feed_forward(&normalized, context, instrumentation, &mut reduce)?;
+    instrumentation.apply(
+        "feed_forward.residual",
+        residual.add(&feed_forward, context)?,
+    )
 }
 
 /// One V3 decoder block whose validated schedule contains no routed experts.
@@ -623,6 +809,25 @@ impl<B: BlockwiseAttentionBackend> DenseV3Block<B> {
         cache: Option<&mut C>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
+        self.forward_instrumented(
+            input,
+            mask,
+            cache,
+            context,
+            &mut ComponentInstrumentation::disabled(),
+        )
+    }
+
+    /// Runs the same compressed-attention and dense-unit boundaries with an
+    /// admitted observer. The traversal owns block input/output publication.
+    pub fn forward_instrumented<C: CompressedAttentionCache<B::Tensor>>(
+        &mut self,
+        input: &B::Tensor,
+        mask: Option<&B::Tensor>,
+        cache: Option<&mut C>,
+        context: &<B::Tensor as Tensor>::Context,
+        instrumentation: &mut ComponentInstrumentation<'_, B::Tensor>,
+    ) -> Result<B::Tensor, Error> {
         let Self {
             attention,
             feed_forward,
@@ -637,7 +842,10 @@ impl<B: BlockwiseAttentionBackend> DenseV3Block<B> {
             mask,
             cache,
             context,
-            |normalized, context| feed_forward.forward(normalized, context),
+            instrumentation,
+            |normalized, context, instrumentation| {
+                feed_forward.forward_instrumented(normalized, context, instrumentation)
+            },
         )
     }
 }
@@ -773,7 +981,8 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend + BlockwiseAtt
             mask,
             cache,
             context,
-            |normalized, context| match feed_forward {
+            &mut ComponentInstrumentation::disabled(),
+            |normalized, context, _| match feed_forward {
                 V3FeedForward::Dense(mlp) => mlp.forward(normalized, context),
                 V3FeedForward::Routed(moe) => {
                     moe.forward(normalized, RouteSource::Learned, context)
@@ -844,6 +1053,60 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend + BlockwiseAtt
         residual.add(&reduce(feed_forward, context)?, context)
     }
 
+    /// Observes the ordinary resident TP path. Dense writes are already reduced;
+    /// shared sparse writes supply declared additive terms before the fused sum.
+    pub fn forward_parallel_observed<C, O, F>(
+        &mut self,
+        path: &str,
+        input: &B::Tensor,
+        mask: Option<&B::Tensor>,
+        cache: Option<&mut C>,
+        context: &<B::Tensor as Tensor>::Context,
+        observer: &mut O,
+        reduce: F,
+    ) -> Result<B::Tensor, Error>
+    where
+        C: CompressedAttentionCache<B::Tensor>,
+        O: ActivationObserver<B::Tensor, Error> + ?Sized,
+        F: FnMut(B::Tensor, &<B::Tensor as Tensor>::Context) -> Result<B::Tensor, Error>,
+    {
+        let mut borrowed = eredu_runtime::BorrowedActivationObserver(observer);
+        forward_v3_block_reduced(
+            &mut self.attention,
+            &mut self.input_norm,
+            &mut self.post_attention_norm,
+            input,
+            mask,
+            cache,
+            context,
+            &mut ComponentInstrumentation::new(path, &mut borrowed),
+            reduce,
+            |input, context, instrumentation, reduce| match &mut self.feed_forward {
+                V3FeedForward::Dense(mlp) => {
+                    let partial =
+                        mlp.forward_partial_instrumented(input, context, instrumentation)?;
+                    let write =
+                        instrumentation.apply("feed_forward.write", reduce(partial, context)?)?;
+                    instrumentation.apply("feed_forward.output", write)
+                }
+                V3FeedForward::Routed(moe) => {
+                    let output = moe.forward_tensor_parallel_resident_observed(
+                        &format!("{path}.feed_forward"),
+                        input,
+                        RouteSource::Learned,
+                        ExpertPass::Decode,
+                        context,
+                        instrumentation
+                            .observer()
+                            .expect("observed V3 block retains its observer"),
+                        reduce,
+                    )?;
+                    instrumentation.apply("feed_forward.contribution", output)
+                }
+            },
+        )
+    }
+
     /// Tensor-partitioned V3 execution with runtime-supplied routed experts.
     #[allow(clippy::too_many_arguments)]
     pub fn forward_parallel_with_provider<C, P, F>(
@@ -881,6 +1144,67 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend + BlockwiseAtt
             )?,
         };
         residual.add(&feed_forward, context)
+    }
+
+    /// Provider-aware TP hooks at the actual component boundaries. The shared
+    /// branch emits additive write terms; the existing fused reduction supplies
+    /// the complete feed-forward output before the residual addition.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_parallel_observed_with_provider<C, P, O, F>(
+        &mut self,
+        path: &str,
+        input: &B::Tensor,
+        mask: Option<&B::Tensor>,
+        cache: Option<&mut C>,
+        pass: ExpertPass,
+        provider: &mut P,
+        context: &<B::Tensor as Tensor>::Context,
+        observer: &mut O,
+        reduce: F,
+    ) -> Result<B::Tensor, Error>
+    where
+        C: CompressedAttentionCache<B::Tensor>,
+        P: eredu_runtime::TensorParallelRoutedExpertProvider<B>,
+        P::Error: std::fmt::Display,
+        O: ActivationObserver<B::Tensor, Error> + ?Sized,
+        F: FnMut(B::Tensor, &<B::Tensor as Tensor>::Context) -> Result<B::Tensor, Error>,
+    {
+        let mut borrowed = eredu_runtime::BorrowedActivationObserver(observer);
+        forward_v3_block_reduced(
+            &mut self.attention,
+            &mut self.input_norm,
+            &mut self.post_attention_norm,
+            input,
+            mask,
+            cache,
+            context,
+            &mut ComponentInstrumentation::new(path, &mut borrowed),
+            reduce,
+            |input, context, instrumentation, reduce| match &mut self.feed_forward {
+                V3FeedForward::Dense(mlp) => {
+                    let partial =
+                        mlp.forward_partial_instrumented(input, context, instrumentation)?;
+                    let write =
+                        instrumentation.apply("feed_forward.write", reduce(partial, context)?)?;
+                    instrumentation.apply("feed_forward.output", write)
+                }
+                V3FeedForward::Routed(moe) => {
+                    let output = moe.forward_tensor_parallel_with_provider_observed(
+                        &format!("{path}.feed_forward"),
+                        input,
+                        RouteSource::Learned,
+                        pass,
+                        provider,
+                        context,
+                        instrumentation
+                            .observer()
+                            .expect("observed V3 block retains its observer"),
+                        reduce,
+                    )?;
+                    instrumentation.apply("feed_forward.contribution", output)
+                }
+            },
+        )
     }
 
     /// Executes the V3 block with stable MLA, routing, and intervention points.
@@ -930,29 +1254,61 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend + BlockwiseAtt
         P::Error: std::fmt::Display,
     {
         let input = observe_and_intervene(observer, &format!("{path}.input"), input)?;
-        let normalized = self.input_norm.forward(&input, context)?;
-        let attention = self.attention.forward(&normalized, mask, cache, context)?;
-        let attention = observe_and_intervene(
-            observer,
-            &format!("{path}.compressed_attention.output"),
-            &attention,
+        let output = self.forward_internal_observed_with_provider(
+            path, &input, mask, cache, pass, provider, context, observer,
         )?;
-        let residual = input.add(&attention, context)?;
-        let normalized = self.post_attention_norm.forward(&residual, context)?;
-        let feed_forward = match &mut self.feed_forward {
-            V3FeedForward::Dense(mlp) => mlp.forward(&normalized, context)?,
-            V3FeedForward::Routed(moe) => moe.forward_with_provider_observed(
-                &format!("{path}.feed_forward"),
-                &normalized,
-                RouteSource::Learned,
-                pass,
-                provider,
-                context,
-                observer,
-            )?,
-        };
-        let output = residual.add(&feed_forward, context)?;
         observe_and_intervene(observer, &format!("{path}.output"), &output)
+    }
+
+    /// Internal hooks; the traversal owns the unit input and output observations.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn forward_internal_observed_with_provider<C, O, P>(
+        &mut self,
+        path: &str,
+        input: &B::Tensor,
+        mask: Option<&B::Tensor>,
+        cache: Option<&mut C>,
+        pass: ExpertPass,
+        provider: &mut P,
+        context: &<B::Tensor as Tensor>::Context,
+        observer: &mut O,
+    ) -> Result<B::Tensor, Error>
+    where
+        C: CompressedAttentionCache<B::Tensor>,
+        O: ActivationObserver<B::Tensor, Error> + ?Sized,
+        P: RoutedExpertProvider<B>,
+        P::Error: std::fmt::Display,
+    {
+        let mut borrowed = eredu_runtime::BorrowedActivationObserver(observer);
+        forward_v3_block(
+            &mut self.attention,
+            &mut self.input_norm,
+            &mut self.post_attention_norm,
+            input,
+            mask,
+            cache,
+            context,
+            &mut ComponentInstrumentation::new(path, &mut borrowed),
+            |normalized, context, instrumentation| match &mut self.feed_forward {
+                V3FeedForward::Dense(mlp) => {
+                    mlp.forward_instrumented(normalized, context, instrumentation)
+                }
+                V3FeedForward::Routed(moe) => {
+                    let output = moe.forward_with_provider_observed(
+                        &format!("{path}.feed_forward"),
+                        normalized,
+                        RouteSource::Learned,
+                        pass,
+                        provider,
+                        context,
+                        instrumentation
+                            .observer()
+                            .expect("observed V3 block retains its observer"),
+                    )?;
+                    instrumentation.apply("feed_forward.contribution", output)
+                }
+            },
+        )
     }
 }
 

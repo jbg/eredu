@@ -9,7 +9,7 @@ pub(super) fn bind_linear_companion(
 }
 
 pub(super) fn compute<T>(result: Result<T, safemlx::error::Exception>) -> Result<T, ComputeError> {
-    result.map_err(ComputeError::backend)
+    result.map_err(ComputeError::backend_source)
 }
 
 pub(super) fn compute_tensor(
@@ -64,10 +64,11 @@ impl BlockwiseAttentionBackend for MlxNeuralBackend {
 
 pub(super) fn parameter_topology(
     module: &impl PhysicalParameters,
-    weight: ParameterSpec,
+    mut weight: ParameterSpec,
     bias: Option<ParameterSpec>,
     format: &LinearFormatSpec,
 ) -> Result<BTreeMap<String, ParameterSpec>, ComputeError> {
+    weight.linear_row_layout = format.row_layout();
     format.validate_for_weight(&weight)?;
     module
         .parameters()
@@ -333,6 +334,7 @@ impl<M: PhysicalParameters> MlxNamedModule<M> {
     pub(super) fn bind_local_parameters(
         &mut self,
         mut bindings: BTreeMap<String, Array>,
+        floating_shapes: &[(&str, [i32; 3])],
     ) -> Result<(), ComputeError> {
         let expected = self.topology.keys().cloned().collect::<BTreeSet<_>>();
         let actual = bindings.keys().cloned().collect::<BTreeSet<_>>();
@@ -347,13 +349,15 @@ impl<M: PhysicalParameters> MlxNamedModule<M> {
             let value = bindings
                 .get(local.as_ref())
                 .expect("equal compact binding sets contain every native parameter");
-            if parameter.shape() != value.shape() {
-                return Err(ComputeError::backend(format!(
-                    "compact grouped binding {local:?} has shape {:?}, expected {:?}",
-                    value.shape(),
-                    parameter.shape()
-                )));
-            }
+            validate_compact_binding(
+                local.as_ref(),
+                parameter,
+                value,
+                floating_shapes
+                    .iter()
+                    .find(|(name, _)| *name == local.as_ref())
+                    .map(|(_, shape)| shape.as_slice()),
+            )?;
         }
         for (local, parameter) in self.inner.parameters_mut().flatten() {
             let value = bindings
@@ -363,6 +367,34 @@ impl<M: PhysicalParameters> MlxNamedModule<M> {
         }
         Ok(())
     }
+}
+
+/// Packed placeholders retain source encoding geometry. A promoted floating
+/// weight instead has the exact logical geometry supplied by its operator spec.
+pub(super) fn validate_compact_binding(
+    name: &str,
+    placeholder: &Array,
+    value: &Array,
+    floating_shape: Option<&[i32]>,
+) -> Result<(), ComputeError> {
+    let floating = matches!(
+        value.dtype(),
+        Dtype::Float32 | Dtype::Float16 | Dtype::Bfloat16
+    );
+    let expected = if floating {
+        floating_shape.unwrap_or_else(|| placeholder.shape())
+    } else {
+        placeholder.shape()
+    };
+    if value.shape() != expected
+        || (floating_shape.is_some() && !floating && value.dtype() != placeholder.dtype())
+    {
+        return Err(ComputeError::backend(format!(
+            "compact grouped binding {name:?} has shape {:?} and dtype {:?}, expected shape {expected:?} with the declared encoding or a floating weight",
+            value.shape(), value.dtype(),
+        )));
+    }
+    Ok(())
 }
 
 impl<M> std::ops::Deref for MlxNamedModule<M> {

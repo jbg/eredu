@@ -1,8 +1,8 @@
-//! Exact resident TP/PP construction for dense prediction-free Nemotron-H.
+//! Exact TP/PP target construction and retained prediction-shared roles for Nemotron-H.
 
 use eredu_nn::{
     AttentionCache, EmbeddingLookupPolicy, EmbeddingOperator, EmbeddingSpec, Error, LinearOperator,
-    LinearSpec, NormalizationConstructionSpec, NormalizationOperator, ParameterSpec, Tensor,
+    LinearSpec, NormalizationConstructionSpec, ParameterSpec, Tensor,
 };
 use eredu_runtime::{
     ArchitectureParameterDescription, ExecutionGraph, LayerRuntimeState, LayeredArchitecture,
@@ -15,7 +15,7 @@ use super::{
     EmbeddedInput, LayerPolicy, ModelArgs, PartitionLocalGeometry, RetainedValues, TargetBoundary,
     TargetBoundarySchema,
 };
-use crate::decoder::PartitionStaticModules;
+use crate::decoder::{ComponentInstrumentation, PartitionStaticModules};
 
 /// Request-local target values retained across one partitioned pass.
 pub struct PartitionedForwardContext<T> {
@@ -46,7 +46,7 @@ where
 {
     let ownership = partition.ownership();
     let embedding_name = "model.embeddings.weight";
-    let embeddings = (ownership.owns_input()
+    let embeddings = (ownership.stores_static_role("embedding")
         || (ownership.owns_output() && args.tie_word_embeddings))
         .then(|| {
             B::vocabulary_parallel_embedding(
@@ -77,7 +77,7 @@ where
             )
         })
         .transpose()?;
-    let lm_head = (ownership.owns_output() && !args.tie_word_embeddings)
+    let lm_head = (ownership.stores_static_role("output") && !args.tie_word_embeddings)
         .then(|| {
             let name = "lm_head.weight";
             B::vocabulary_parallel_linear(
@@ -292,18 +292,48 @@ where
         parallel: Option<&B::ParallelContext>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
-        let norm = self
-            .static_modules
-            .norm
-            .as_mut()
-            .ok_or_else(|| Error::backend("Nemotron-H partition does not own final norm"))?;
-        let hidden = norm.forward(hidden, context)?;
-        match (parallel, self.static_modules.lm_head.as_mut()) {
-            (Some(parallel), Some(head)) => {
-                B::vocabulary_parallel_project(head, &hidden, parallel, context)
+        self.finish_local_instrumented(
+            hidden,
+            parallel,
+            context,
+            &mut ComponentInstrumentation::disabled(),
+        )
+    }
+
+    fn finish_local_instrumented(
+        &mut self,
+        hidden: &B::Tensor,
+        parallel: Option<&B::ParallelContext>,
+        context: &<B::Tensor as Tensor>::Context,
+        instrumentation: &mut ComponentInstrumentation<'_, B::Tensor>,
+    ) -> Result<B::Tensor, Error> {
+        let norm = self.static_modules.norm.as_mut().ok_or_else(|| {
+            Error::backend("Nemotron-H partition does not own final normalization")
+        })?;
+        let hidden = instrumentation.normalize_readout(hidden, norm, context)?;
+        self.project_prediction_instrumented(&hidden, parallel, context, instrumentation)
+    }
+
+    pub(crate) fn project_prediction_instrumented(
+        &mut self,
+        hidden: &B::Tensor,
+        parallel: Option<&B::ParallelContext>,
+        context: &<B::Tensor as Tensor>::Context,
+        instrumentation: &mut ComponentInstrumentation<'_, B::Tensor>,
+    ) -> Result<B::Tensor, Error> {
+        let logits = match (parallel, self.static_modules.lm_head.as_mut()) {
+            (Some(parallel), Some(head)) => instrumentation.project_vocabulary::<B>(
+                "projection_input",
+                head,
+                &hidden,
+                parallel,
+                context,
+            ),
+            (None, Some(head)) => {
+                instrumentation.project::<B>("projection_input", head, &hidden, None, context)
             }
-            (None, Some(head)) => head.forward(&hidden, context),
-            (Some(parallel), None) => B::vocabulary_parallel_embedding_project(
+            (Some(parallel), None) => instrumentation.project_vocabulary_embedding::<B>(
+                "projection_input",
                 self.static_modules.embeddings.as_mut().ok_or_else(|| {
                     Error::backend("tied Nemotron-H output partition has no embedding")
                 })?,
@@ -311,13 +341,17 @@ where
                 parallel,
                 context,
             ),
-            (None, None) => self
-                .static_modules
-                .embeddings
-                .as_mut()
-                .ok_or_else(|| Error::backend("tied Nemotron-H output partition has no embedding"))?
-                .as_linear(&hidden, context),
-        }
+            (None, None) => instrumentation.project_embedding(
+                "projection_input",
+                self.static_modules.embeddings.as_mut().ok_or_else(|| {
+                    Error::backend("tied Nemotron-H output partition has no embedding")
+                })?,
+                &hidden,
+                context,
+            ),
+        }?;
+        let logits = instrumentation.apply("linear", logits)?;
+        Ok(logits)
     }
 
     /// Embeds one prediction token through the target-owned vocabulary table.
@@ -470,6 +504,10 @@ where
         B::Tensor: 'a;
     type Error = Error;
 
+    fn observation_hooks(&self) -> eredu_runtime::inspection::ObservationHookSupport {
+        eredu_runtime::inspection::ObservationHookSupport::internal(true, true, true)
+    }
+
     fn group_transport(&self, _group: usize) -> eredu_runtime::ArchitectureGroupTransport {
         crate::transport::decoder()
     }
@@ -560,6 +598,24 @@ where
         )
     }
 
+    fn begin_forward_observed<'a, O>(
+        &mut self,
+        input: Self::Input<'a>,
+        state: &mut S,
+        context: &<B::Tensor as Tensor>::Context,
+        observer: &mut O,
+    ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error>
+    where
+        O: eredu_runtime::ActivationObserver<B::Tensor, Self::Error> + ?Sized,
+    {
+        let mut forward = self.begin_forward(input, state, context)?;
+        let mut observer = eredu_runtime::BorrowedActivationObserver(observer);
+        forward.hidden = ComponentInstrumentation::new("readout", &mut observer)
+            .apply("embedding", forward.hidden)?;
+        forward.context.embedded = forward.hidden.clone();
+        Ok(forward)
+    }
+
     fn begin_execution_group(
         &mut self,
         group: usize,
@@ -598,6 +654,34 @@ where
             forward.mask.as_ref(),
             state.layer(ordinal).map_err(Error::backend)?,
             context,
+        )
+    }
+
+    fn forward_unit_observed<O>(
+        &mut self,
+        group: usize,
+        index: usize,
+        unit: &mut Self::Unit,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &mut Self::ForwardContext,
+        context: &<B::Tensor as Tensor>::Context,
+        observer: &mut O,
+    ) -> Result<B::Tensor, Self::Error>
+    where
+        O: eredu_runtime::ActivationObserver<B::Tensor, Self::Error> + ?Sized,
+    {
+        let path = <Self as LayeredArchitecture<B, S>>::unit_path(self, group, index)?;
+        let ordinal = self.local_state_ordinal(index)?;
+        unit.forward_observed_with_provider(
+            &path,
+            self.args.n_routed_experts,
+            hidden,
+            forward.mask.as_ref(),
+            state.layer(ordinal).map_err(Error::backend)?,
+            context,
+            observer,
+            &mut eredu_runtime::ResidentExpertProvider,
         )
     }
 
@@ -640,6 +724,26 @@ where
         self.finish_local(hidden, None, context)
     }
 
+    fn finish_forward_observed<O>(
+        &mut self,
+        hidden: &B::Tensor,
+        _state: &mut S,
+        _forward: &Self::ForwardContext,
+        context: &<B::Tensor as Tensor>::Context,
+        observer: &mut O,
+    ) -> Result<B::Tensor, Self::Error>
+    where
+        O: eredu_runtime::ActivationObserver<B::Tensor, Self::Error> + ?Sized,
+    {
+        let mut observer = eredu_runtime::BorrowedActivationObserver(observer);
+        self.finish_local_instrumented(
+            hidden,
+            None,
+            context,
+            &mut ComponentInstrumentation::new("readout", &mut observer),
+        )
+    }
+
     fn retained_context_values<'a>(
         &'a self,
         forward: &'a Self::ForwardContext,
@@ -662,6 +766,10 @@ where
     S: LayerRuntimeState<B>,
     S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
 {
+    fn parallel_observation_hooks(&self) -> eredu_runtime::inspection::ObservationHookSupport {
+        eredu_runtime::inspection::ObservationHookSupport::internal(true, true, true)
+    }
+
     fn begin_forward_parallel<'a>(
         &mut self,
         input: Self::Input<'a>,
@@ -695,6 +803,25 @@ where
         )
     }
 
+    fn begin_forward_parallel_observed<'a, O>(
+        &mut self,
+        input: Self::Input<'a>,
+        state: &mut S,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+        observer: &mut O,
+    ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error>
+    where
+        O: eredu_runtime::ActivationObserver<B::Tensor, Self::Error> + ?Sized,
+    {
+        let mut forward = self.begin_forward_parallel(input, state, parallel, context)?;
+        let mut observer = eredu_runtime::BorrowedActivationObserver(observer);
+        forward.hidden = ComponentInstrumentation::new("readout", &mut observer)
+            .apply("embedding", forward.hidden)?;
+        forward.context.embedded = forward.hidden.clone();
+        Ok(forward)
+    }
+
     fn forward_unit_parallel(
         &mut self,
         group: usize,
@@ -722,6 +849,36 @@ where
         )
     }
 
+    fn forward_unit_parallel_observed<O>(
+        &mut self,
+        group: usize,
+        index: usize,
+        unit: &mut Self::Unit,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &mut Self::ForwardContext,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+        observer: &mut O,
+    ) -> Result<B::Tensor, Self::Error>
+    where
+        O: eredu_runtime::ActivationObserver<B::Tensor, Self::Error> + ?Sized,
+    {
+        let path = <Self as LayeredArchitecture<B, S>>::unit_path(self, group, index)?;
+        let ordinal = self.local_state_ordinal(index)?;
+        unit.forward_parallel_observed_with_provider(
+            &path,
+            self.args.n_routed_experts,
+            hidden,
+            forward.mask.as_ref(),
+            state.layer(ordinal).map_err(Error::backend)?,
+            parallel,
+            context,
+            observer,
+            &mut eredu_runtime::ResidentExpertProvider,
+        )
+    }
+
     fn finish_forward_parallel(
         &mut self,
         hidden: &B::Tensor,
@@ -732,6 +889,27 @@ where
     ) -> Result<B::Tensor, Self::Error> {
         self.finish_local(hidden, Some(parallel), context)
     }
+
+    fn finish_forward_parallel_observed<O>(
+        &mut self,
+        hidden: &B::Tensor,
+        _state: &mut S,
+        _forward: &Self::ForwardContext,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+        observer: &mut O,
+    ) -> Result<B::Tensor, Self::Error>
+    where
+        O: eredu_runtime::ActivationObserver<B::Tensor, Self::Error> + ?Sized,
+    {
+        let mut observer = eredu_runtime::BorrowedActivationObserver(observer);
+        self.finish_local_instrumented(
+            hidden,
+            Some(parallel),
+            context,
+            &mut ComponentInstrumentation::new("readout", &mut observer),
+        )
+    }
 }
 
 impl<B, S> RoutedLayeredArchitecture<B, S> for PartitionedLayeredModel<B>
@@ -740,6 +918,46 @@ where
     S: LayerRuntimeState<B>,
     S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
 {
+    fn routed_unit_observations(&self) -> bool {
+        true
+    }
+
+    fn routed_sparse_observations(&self) -> bool {
+        true
+    }
+
+    fn forward_unit_observed_with_provider<P, O>(
+        &mut self,
+        group: usize,
+        index: usize,
+        unit: &mut Self::Unit,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &mut Self::ForwardContext,
+        _pass: eredu_runtime::ExpertPass,
+        provider: &mut P,
+        context: &<B::Tensor as Tensor>::Context,
+        observer: &mut O,
+    ) -> Result<B::Tensor, Self::Error>
+    where
+        P: RoutedExpertProvider<B>,
+        P::Error: std::fmt::Display,
+        O: eredu_runtime::ActivationObserver<B::Tensor, Self::Error> + ?Sized,
+    {
+        let path = <Self as LayeredArchitecture<B, S>>::unit_path(self, group, index)?;
+        let ordinal = self.local_state_ordinal(index)?;
+        unit.forward_observed_with_provider(
+            &path,
+            self.args.n_routed_experts,
+            hidden,
+            forward.mask.as_ref(),
+            state.layer(ordinal).map_err(Error::backend)?,
+            context,
+            observer,
+            provider,
+        )
+    }
+
     fn forward_unit_with_provider<P>(
         &mut self,
         group: usize,
@@ -778,6 +996,48 @@ where
     S: LayerRuntimeState<B>,
     S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
 {
+    fn parallel_routed_unit_observations(&self) -> bool {
+        true
+    }
+
+    fn parallel_routed_sparse_observations(&self) -> bool {
+        true
+    }
+
+    fn forward_unit_parallel_observed_with_provider<P, O>(
+        &mut self,
+        group: usize,
+        index: usize,
+        unit: &mut Self::Unit,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &mut Self::ForwardContext,
+        _pass: eredu_runtime::ExpertPass,
+        provider: &mut P,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+        observer: &mut O,
+    ) -> Result<B::Tensor, Self::Error>
+    where
+        P: eredu_runtime::TensorParallelRoutedExpertProvider<B>,
+        P::Error: std::fmt::Display,
+        O: eredu_runtime::ActivationObserver<B::Tensor, Self::Error> + ?Sized,
+    {
+        let path = <Self as LayeredArchitecture<B, S>>::unit_path(self, group, index)?;
+        let ordinal = self.local_state_ordinal(index)?;
+        unit.forward_parallel_observed_with_provider(
+            &path,
+            self.args.n_routed_experts,
+            hidden,
+            forward.mask.as_ref(),
+            state.layer(ordinal).map_err(Error::backend)?,
+            parallel,
+            context,
+            observer,
+            provider,
+        )
+    }
+
     fn forward_unit_parallel_with_provider<P>(
         &mut self,
         group: usize,
@@ -819,6 +1079,13 @@ where
     S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
 {
     type Boundary = TargetBoundarySchema;
+
+    fn partition_observation_hooks(
+        &self,
+        _tensor_parallel: bool,
+    ) -> eredu_runtime::inspection::ObservationHookSupport {
+        eredu_runtime::inspection::ObservationHookSupport::internal(true, true, true)
+    }
 
     fn boundary_schema(&self) -> Result<Self::Boundary, Self::Error> {
         Ok(TargetBoundarySchema::from_args(&self.args))
@@ -902,6 +1169,44 @@ where
         )
     }
 
+    fn begin_partition_observed<'a, O>(
+        &mut self,
+        input: LayeredPartitionInput<'a, B::Tensor, TargetBoundary<B::Tensor>>,
+        mask: Option<&B::Tensor>,
+        state: &mut S,
+        expected: &StateLayout,
+        first_state_ordinal: usize,
+        parallel: Option<&B::ParallelContext>,
+        context: &<B::Tensor as Tensor>::Context,
+        observer: &mut O,
+    ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error>
+    where
+        O: eredu_runtime::ActivationObserver<B::Tensor, Self::Error> + ?Sized,
+    {
+        let embedded = matches!(&input, LayeredPartitionInput::Tokens(_));
+        let mut forward = match parallel {
+            Some(parallel) => self.begin_partition_parallel(
+                input,
+                mask,
+                state,
+                expected,
+                first_state_ordinal,
+                parallel,
+                context,
+            ),
+            None => {
+                self.begin_partition(input, mask, state, expected, first_state_ordinal, context)
+            }
+        }?;
+        if embedded {
+            let mut observer = eredu_runtime::BorrowedActivationObserver(observer);
+            forward.hidden = ComponentInstrumentation::new("readout", &mut observer)
+                .apply("embedding", forward.hidden)?;
+            forward.context.embedded = forward.hidden.clone();
+        }
+        Ok(forward)
+    }
+
     fn finish_partition(
         &mut self,
         hidden: &B::Tensor,
@@ -925,6 +1230,35 @@ where
                 auxiliary: TargetBoundary::new(forward.tokens.clone(), forward.embedded.clone()),
             })
         }
+    }
+
+    fn finish_partition_observed<O>(
+        &mut self,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &Self::ForwardContext,
+        owns_output: bool,
+        parallel: Option<&B::ParallelContext>,
+        context: &<B::Tensor as Tensor>::Context,
+        observer: &mut O,
+    ) -> Result<
+        eredu_runtime::LayeredPartitionOutput<B::Tensor, TargetBoundary<B::Tensor>>,
+        Self::Error,
+    >
+    where
+        O: eredu_runtime::ActivationObserver<B::Tensor, Self::Error> + ?Sized,
+    {
+        if !owns_output {
+            return self.finish_partition(hidden, state, forward, false, parallel, context);
+        }
+        let mut observer = eredu_runtime::BorrowedActivationObserver(observer);
+        let mut instrumentation = ComponentInstrumentation::new("readout", &mut observer);
+        let output =
+            self.finish_local_instrumented(hidden, parallel, context, &mut instrumentation)?;
+        Ok(eredu_runtime::LayeredPartitionOutput::Final {
+            output,
+            retained: None,
+        })
     }
 }
 

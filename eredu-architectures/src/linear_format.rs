@@ -64,7 +64,7 @@ pub(crate) fn standard_expert_format(
     weight_name: &str,
     format: LinearFormat,
 ) -> Result<LinearFormatSpec, Error> {
-    match format {
+    let declaration = match format {
         LinearFormat::Dense | LinearFormat::GgufIQuant { .. } => LinearFormatSpec::unscaled(format),
         LinearFormat::MxFp4 | LinearFormat::E4M3BlockFp8(_) => LinearFormatSpec::scaled(
             format,
@@ -75,6 +75,11 @@ pub(crate) fn standard_expert_format(
             companion(weight_name, format!("{weight_name}_scales"), "scale")?,
             companion(weight_name, format!("{weight_name}_biases"), "affine-bias")?,
         ),
+    }?;
+    if matches!(format, LinearFormat::E4M3BlockFp8(_)) && weight_name.ends_with(".gate_up_proj") {
+        declaration.with_row_layout(eredu_nn::LinearRowLayout::equal_partitions(2)?)
+    } else {
+        Ok(declaration)
     }
 }
 
@@ -129,6 +134,91 @@ pub(crate) fn input_partition_alignment(format: LinearFormat) -> i32 {
             .expect("packed format")
             .group_size(),
     }
+}
+
+/// Retains a complete partial FP8 block while requiring aligned encoded splits.
+pub(crate) fn input_partition_units(
+    name: &str,
+    semantic_units: usize,
+    elements_per_unit: usize,
+    format: LinearFormat,
+) -> Result<usize, ParallelPlanError> {
+    let alignment = usize::try_from(input_partition_alignment(format))
+        .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?;
+    match format {
+        LinearFormat::E4M3BlockFp8(_) => eredu_runtime::aligned_partition_units_with_tail(
+            name,
+            semantic_units,
+            elements_per_unit,
+            alignment,
+        ),
+        _ => eredu_runtime::aligned_partition_units(
+            name,
+            semantic_units,
+            elements_per_unit,
+            alignment,
+        ),
+    }
+}
+
+/// Retains complete FP8 input blocks and a short final block in a dense FFN.
+/// Read rows, output columns and declared scale companions share the same
+/// logical chunks. The cold declaration has no companions yet; format
+/// expansion applies the same physical coordinate conversion to those members.
+pub(crate) fn dense_ffn_partition_tail(
+    group: eredu_runtime::ParameterGroupSpec,
+    intermediate: usize,
+    output_format: LinearFormat,
+    format_of: impl Fn(&str) -> LinearFormat,
+) -> Result<eredu_runtime::ParameterGroupSpec, ParallelPlanError> {
+    let LinearFormat::E4M3BlockFp8(block) = output_format else {
+        return Ok(group);
+    };
+    block
+        .validate()
+        .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?;
+    let chunk = usize::try_from(block.block_columns)
+        .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?;
+    if intermediate.is_multiple_of(chunk) {
+        return Ok(group);
+    }
+    eredu_runtime::partition_parameter_group_chunks(group, intermediate.div_ceil(chunk), |member| {
+        let Some(owner) = member.linear_companion_of() else {
+            return Ok(chunk);
+        };
+        let LinearFormat::E4M3BlockFp8(format) = format_of(owner) else {
+            // Dense FFN read projections shard output rows. Affine and MXFP4
+            // companions retain these rows; only their input axis is packed.
+            return Ok(chunk);
+        };
+        format
+            .validate()
+            .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?;
+        let axis = match member.sharding() {
+            eredu_runtime::MemberSharding::Partitioned { axis }
+            | eredu_runtime::MemberSharding::PartitionedSegments { axis, .. } => *axis,
+            _ => {
+                return Err(ParallelPlanError::InvalidTensor(
+                    "dense FFN companion has no partition axis".into(),
+                ))
+            }
+        };
+        let divisor = match member.global_shape().len().checked_sub(axis) {
+            Some(2) => format.block_rows as usize,
+            Some(1) => format.block_columns as usize,
+            _ => {
+                return Err(ParallelPlanError::InvalidTensor(
+                    "dense FFN companion axis is not a matrix axis".into(),
+                ))
+            }
+        };
+        if !chunk.is_multiple_of(divisor) {
+            return Err(ParallelPlanError::InvalidTensor(
+                "dense FFN chunk splits a scale block".into(),
+            ));
+        }
+        Ok(chunk / divisor)
+    })
 }
 
 /// Canonical executable encoding of one physical GGUF matrix.

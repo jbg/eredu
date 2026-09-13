@@ -23,10 +23,7 @@ use ref_cast::RefCast;
 
 use crate::MlxTensor;
 
-pub type RetainedArrayIter<'a> = std::iter::Map<
-    std::iter::Chain<std::option::Iter<'a, Array>, std::option::Iter<'a, Array>>,
-    fn(&'a Array) -> &'a MlxTensor,
->;
+pub type RetainedArrayIter<'a> = std::iter::Flatten<std::array::IntoIter<Option<&'a MlxTensor>, 2>>;
 type RetainedArrayVecIter<'a> =
     std::iter::Map<std::vec::IntoIter<&'a Array>, fn(&'a Array) -> &'a MlxTensor>;
 
@@ -67,6 +64,20 @@ pub trait KeyValueCache {
         _arithmetic: eredu_nn::AttentionArithmetic,
         _stream: &Stream,
     ) -> Result<Option<Array>, Exception> {
+        Ok(None)
+    }
+
+    /// Scans retained blocks with learned relative-position profiles.
+    fn paged_relative_attention(
+        &mut self,
+        _input: &eredu_nn::RelativeAttentionInput<'_, MlxTensor>,
+        _stream: &Stream,
+    ) -> Result<Option<Array>, Exception> {
+        if self.is_paged() {
+            return Err(Exception::custom(
+                "paged cache lacks relative attention scanning",
+            ));
+        }
         Ok(None)
     }
 

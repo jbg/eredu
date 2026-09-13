@@ -1,0 +1,89 @@
+{
+  "accepted": true,
+  "report_only": false,
+  "controlled_required": true,
+  "write_reconstruction_required": true,
+  "write_reconstruction": {
+    "groups": 150,
+    "components": 921600,
+    "exact_physical_writes": 136,
+    "max_write_abs": 0.00048828125,
+    "max_projection_associativity_error": 2.302839945400592e-07,
+    "signed_projection_atol": 1e-06,
+    "signed_projection_rtol": 1e-06
+  },
+  "bf16_logit_ulps": 1,
+  "atol": 0.001,
+  "rtol": 0.001,
+  "compared_values": 18971970,
+  "failures": [],
+  "provenance": {
+    "repository": "LiquidAI/LFM2-8B-A1B",
+    "revision": "c1c44ff9fc00db3ebf4516970563f5f383d23670",
+    "path": "/private/tmp/eredu-lfm2-sparse-validation/hf-cache/models--LiquidAI--LFM2-8B-A1B/snapshots/c1c44ff9fc00db3ebf4516970563f5f383d23670",
+    "weights_sha256": {
+      "model-00001-of-00004.safetensors": "927feafae7d99f40046cd365e8780fe2c36c72ba207ce3024ba54bf884599600",
+      "model-00002-of-00004.safetensors": "e41140e9841cf338ed537fad0e0d0f16fbeebe0784719188ef7f2999b531d97e",
+      "model-00003-of-00004.safetensors": "3e3b6236812186ae90f27a3d074f802d5251eab54840b8eca5eea8b730b7a789",
+      "model-00004-of-00004.safetensors": "4f3cbb6a6a853785186b259fc7b23a5706cca8e53691ab3036a539596ffe38ea"
+    },
+    "remote_lfs_sha256": {
+      "model-00001-of-00004.safetensors": "927feafae7d99f40046cd365e8780fe2c36c72ba207ce3024ba54bf884599600",
+      "model-00002-of-00004.safetensors": "e41140e9841cf338ed537fad0e0d0f16fbeebe0784719188ef7f2999b531d97e",
+      "model-00003-of-00004.safetensors": "3e3b6236812186ae90f27a3d074f802d5251eab54840b8eca5eea8b730b7a789",
+      "model-00004-of-00004.safetensors": "4f3cbb6a6a853785186b259fc7b23a5706cca8e53691ab3036a539596ffe38ea"
+    }
+  },
+  "reference_sha256": "8f331021b821e487806c66ef460eb6117fba5984b750fa49947c1f59f61c0e75",
+  "native_sha256": "183d18e56718604dd93d93a12f77a9f787e118b9299cba64908a05410c221cc5",
+  "parameter_usage": {
+    "captures": 991,
+    "retained_bytes": 931657150624,
+    "host_bytes": 46952096,
+    "encoded_bytes": 64920824
+  },
+  "controlled": {
+    "baseline": {
+      "ordinary_equal": true,
+      "cached_restore_equal": true,
+      "sibling_equal": true,
+      "parent_after_sibling_equal": true,
+      "predictions_checked": 14,
+      "snapshot_retained_limit": 4898947072
+    },
+    "deletion": {
+      "ordinary_equal": true,
+      "cached_restore_equal": true,
+      "sibling_equal": true,
+      "parent_after_sibling_equal": true,
+      "predictions_checked": 14,
+      "snapshot_retained_limit": 4898947072
+    },
+    "keep_only": {
+      "ordinary_equal": true,
+      "cached_restore_equal": true,
+      "sibling_equal": true,
+      "parent_after_sibling_equal": true,
+      "predictions_checked": 14,
+      "snapshot_retained_limit": 4898947072
+    },
+    "overlay": {
+      "ordinary_equal": true,
+      "cached_restore_equal": true,
+      "sibling_equal": true,
+      "parent_after_sibling_equal": true,
+      "predictions_checked": 14,
+      "snapshot_retained_limit": 4898947072
+    },
+    "restored": {
+      "ordinary_equal": true,
+      "cached_restore_equal": true,
+      "sibling_equal": true,
+      "parent_after_sibling_equal": true,
+      "predictions_checked": 14,
+      "snapshot_retained_limit": 4898947072
+    }
+  },
+  "independent_signed_max_abs": 1.3412446175919968e-07,
+  "scope": "Final prefill position, all component groups, five trials with 70 controlled predictions; periodic signed write directions. Final vocabulary score reconstruction remains separate."
+}

@@ -66,6 +66,15 @@ impl eredu_architectures::prediction_extension::PredictionExtensionMaterializer<
     type ModelState = ReferencePredictionState;
     type Context<'a> = ReferencePredictionMaterializationContext<'a>;
 
+    fn complete_prediction_values<'a>(
+        values: impl IntoIterator<Item = &'a ReferenceTensor>,
+        _context: &<ReferenceTensor as eredu_nn::Tensor>::Context,
+    ) -> Result<(), eredu_core::BackendFailure> {
+        // The reference tensors are eager; consume the complete dependency set.
+        for _value in values {}
+        Ok(())
+    }
+
     fn materialize_module<M>(
         context: &mut Self::Context<'_>,
         prepared: eredu_architectures::prediction_extension::PreparedPredictionUnit<M>,
@@ -110,16 +119,9 @@ impl eredu_architectures::prediction_extension::PredictionExtensionMaterializer<
                     .map(|dimension| u64::try_from(*dimension).unwrap())
                     .product::<u64>()
                     * 4;
-                let binding = self
-                    .recipes
-                    .remove(metadata.id.as_str())
-                    .map(|recipe| {
-                        eredu_runtime::WeightBinding::from_recipe(
-                        metadata.id.as_str(),
-                        recipe,
-                        bytes,
-                    )
-                    });
+                let binding = self.recipes.remove(metadata.id.as_str()).map(|recipe| {
+                    eredu_runtime::WeightBinding::from_recipe(metadata.id.as_str(), recipe, bytes)
+                });
                 if let Some(binding) = binding {
                     self.values.push(binding.unwrap());
                 } else {
@@ -142,12 +144,9 @@ impl eredu_architectures::prediction_extension::PredictionExtensionMaterializer<
                 recipes.keys().collect::<Vec<_>>(),
             )));
         }
-        let materialized = eredu_runtime::materialize_bindings::<ReferenceBackend>(
-            context.store,
-            &values,
-            &(),
-        )
-        .map_err(|error| Error::backend(error.to_string()))?;
+        let materialized =
+            eredu_runtime::materialize_bindings::<ReferenceBackend>(context.store, &values, &())
+                .map_err(|error| Error::backend(error.to_string()))?;
         eredu_runtime::bind_materialized_unit::<ReferenceBackend, _>(&mut local, materialized)
             .map_err(|error| Error::backend(error.to_string()))?;
         Ok(ReferencePredictionModule(local))
@@ -535,6 +534,10 @@ where
         Error::backend(error.to_string())
     }
 
+    fn session_failure(error: eredu_core::BackendFailure) -> Error {
+        Error::backend_source(error)
+    }
+
     fn take_telemetry() -> Result<Self::Telemetry, Error> {
         Ok(())
     }
@@ -548,6 +551,10 @@ impl eredu_architectures::speculative_execution::SpeculativeTensorMechanisms
     type Context<'a> = ();
     type Completion = ReferenceExternalCompletion;
     type Error = Error;
+
+    fn observation_error(message: &'static str) -> Self::Error {
+        Error::backend(message)
+    }
 
     fn empty_prediction_input() -> Self::Error {
         Error::backend("reference embedded input is empty")
@@ -1076,7 +1083,10 @@ fn reference_text_capabilities(
                 })
         }),
     )
-    .with_floating_state_dtype(execution.floating_state_source().unwrap().clone(), eredu_runtime::StateStorageDtype::F32)
+    .with_floating_state_dtype(
+        execution.floating_state_source().unwrap().clone(),
+        eredu_runtime::StateStorageDtype::F32,
+    )
     .with_transactions(true, true)
     .with_reset(true);
     eredu_runtime::BackendMechanismCapabilities::new(
@@ -1216,15 +1226,14 @@ impl eredu_architectures::ExternalAssistantPreparationVisitor for ReferenceAssis
         self,
         prepared: eredu_architectures::PreparedExternalAssistantSource<A>,
     ) -> Result<Self::Output<A>, Self::Error> {
-        let (store, checkpoint, _identity, _source_config, config, _tasks) =
-            prepared.into_parts();
+        let (store, checkpoint, _identity, _source_config, config, _tasks) = prepared.into_parts();
         if matches!(
             checkpoint,
             eredu_architectures::ExternalAssistantCheckpoint::Gguf { .. }
         ) {
-                return Err(Error::backend(
-                    "reference production proof requires its SafeTensors fixture",
-                ));
+            return Err(Error::backend(
+                "reference production proof requires its SafeTensors fixture",
+            ));
         }
         let mut module = A::module::<ReferenceBackend>(config.clone(), &())?;
         struct Bindings(Vec<eredu_runtime::WeightBinding>);
@@ -1471,7 +1480,10 @@ impl eredu_core::Completion for ReferenceExternalCompletion {
                 .retained_at_wait
                 .set(control.retained_at_wait.get() + self.retained.len());
         }
-        if matches!(self.mode, ReferenceCompletionMode::FailWait | ReferenceCompletionMode::Never) {
+        if matches!(
+            self.mode,
+            ReferenceCompletionMode::FailWait | ReferenceCompletionMode::Never
+        ) {
             if let Some(control) = &self.control {
                 control.failures.set(control.failures.get() + 1);
             }

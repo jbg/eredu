@@ -41,7 +41,11 @@ pub(crate) trait Guarded: Sized {
                     .expect("MLX operation failed but no error was set")
                     .what;
                 let location = std::panic::Location::caller();
-                Err(Exception { what, location })
+                Err(Exception {
+                    what,
+                    location,
+                    source: None,
+                })
             }
         }
     }
@@ -328,6 +332,7 @@ impl Guard<crate::DeviceType> for safemlx_sys::mlx_device_type {
             _ => Err(Exception {
                 what: "Unknown device type".to_string(),
                 location: std::panic::Location::caller(),
+                source: None,
             }),
         }
     }

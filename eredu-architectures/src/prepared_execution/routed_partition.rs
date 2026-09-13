@@ -92,9 +92,108 @@ where
         BTreeMap<eredu_runtime::RoutedBankId, Retained>,
     ) -> Result<O, E>,
 {
-    use crate::routed_text::PlannedAddressableBank;
-    let exchange = prepared.prepared().selected().expert_group().is_some();
-    let options = match prepared.bank_residency() {
+    let selection = PreparedPartitionBanks::new(
+        prepared.bank_residency(),
+        prepared.banks().clone(),
+        prepared.prepared().selected().expert_group().is_some(),
+    );
+    let (providers, retained) = construct_partition_bank_providers(&selection, |_, options| {
+        make_banks(&prepared, options)
+    })?;
+    finish(native, prepared, providers, retained).map_err(PreparedExecutionError::Backend)
+}
+
+/// Exact bank residency, sources and ownership retained by a partition.
+/// Construction is architecture-owned; native binders supply only cache mechanisms.
+#[derive(Clone)]
+pub struct PreparedPartitionBanks {
+    residency: ParameterBankResidency,
+    banks: BTreeMap<eredu_runtime::RoutedBankId, crate::routed_text::SelectedRoutedBank>,
+    expert_exchange: bool,
+}
+impl PreparedPartitionBanks {
+    pub(crate) fn new(
+        residency: ParameterBankResidency,
+        banks: BTreeMap<eredu_runtime::RoutedBankId, crate::routed_text::SelectedRoutedBank>,
+        expert_exchange: bool,
+    ) -> Self {
+        Self {
+            residency,
+            banks,
+            expert_exchange,
+        }
+    }
+
+    /// The selected immutable-weight cache policy.
+    pub const fn residency(&self) -> ParameterBankResidency {
+        self.residency
+    }
+    /// Every local bank, including idle owners with no local members.
+    pub fn banks(
+        &self,
+    ) -> &BTreeMap<eredu_runtime::RoutedBankId, crate::routed_text::SelectedRoutedBank> {
+        &self.banks
+    }
+    /// Exact physical member work admitted for these bank owners.
+    pub fn addressable_members(&self) -> Vec<eredu_runtime::AddressableBankMember> {
+        self.banks
+            .values()
+            .flat_map(|bank| bank.addressable_members().iter().cloned())
+            .collect()
+    }
+    /// Parameters excluded from ordinary unit materialization when acquired independently.
+    pub fn addressable_logical_targets(&self) -> std::collections::BTreeSet<String> {
+        if !matches!(self.residency, ParameterBankResidency::IndependentCache(_)) {
+            return Default::default();
+        }
+        self.banks
+            .values()
+            .flat_map(|bank| {
+                bank.catalog()
+                    .logical_targets()
+                    .into_iter()
+                    .chain(
+                        bank.addressable_members()
+                            .iter()
+                            .flat_map(|member| member.parameters())
+                            .flat_map(|parameter| parameter.task().output_companions())
+                            .map(|companion| companion.name()),
+                    )
+                    .map(str::to_owned)
+            })
+            .collect()
+    }
+}
+
+/// Realizes retained partition banks through one shared resident/addressable driver.
+/// All addressable banks share the single cache constructed by `make_banks`.
+pub fn construct_partition_bank_providers<B, Bank, Movement, Retained, MakeBanks, E>(
+    selection: &PreparedPartitionBanks,
+    make_banks: MakeBanks,
+) -> Result<
+    (
+        PartitionBankProviders<B>,
+        BTreeMap<eredu_runtime::RoutedBankId, Retained>,
+    ),
+    PreparedExecutionError<E>,
+>
+where
+    B: eredu_nn::TensorParallelGroupedNeuralBackend + 'static,
+    Bank: AddressableGroupedBank<B> + 'static,
+    Bank::Error: std::fmt::Display,
+    Movement: IndexedMovement<B> + 'static,
+    Movement::Error: std::fmt::Display,
+    MakeBanks: FnOnce(
+        &PreparedPartitionBanks,
+        ParameterBankLoadOptions,
+    ) -> Result<
+        BTreeMap<eredu_runtime::RoutedBankId, PartitionBankMechanisms<Bank, Movement, Retained>>,
+        E,
+    >,
+{
+    use crate::routed_text::{PartitionUnitProvider, PlannedAddressableBank, PlannedResidentBank};
+    let exchange = selection.expert_exchange;
+    let options = match selection.residency() {
         ParameterBankResidency::WithLayer => None,
         ParameterBankResidency::IndependentCache(options) => Some(options),
         _ => {
@@ -103,22 +202,15 @@ where
             ))
         }
     };
-    if options.is_none() {
-        let providers = prepared
-            .resident_partition_providers()
-            .map_err(|e| PreparedExecutionError::Architecture(e.to_string()))?;
-        return finish(native, prepared, providers, BTreeMap::new())
-            .map_err(PreparedExecutionError::Backend);
-    }
     let mut mechanisms =
-        if let Some(options) = options.filter(|_| !prepared.addressable_members().is_empty()) {
-            make_banks(&prepared, options).map_err(PreparedExecutionError::Backend)?
+        if let Some(options) = options.filter(|_| !selection.addressable_members().is_empty()) {
+            make_banks(selection, options).map_err(PreparedExecutionError::Backend)?
         } else {
             BTreeMap::new()
         };
     let mut retained = BTreeMap::new();
     let mut providers = BTreeMap::new();
-    for (id, bank) in prepared.banks() {
+    for (id, bank) in selection.banks() {
         let provider: Box<
             dyn eredu_runtime::TensorParallelRoutedExpertProvider<
                 B,
@@ -135,7 +227,8 @@ where
                 ))
             })?;
             retained.insert(*id, mechanism.retained);
-            Box::new(
+            Box::new(PartitionUnitProvider::new(
+                bank,
                 PlannedAddressableBank::from_partitioned(
                     bank,
                     exchange,
@@ -145,9 +238,13 @@ where
                     options,
                 )
                 .map_err(|e| PreparedExecutionError::Architecture(e.to_string()))?,
-            )
+            ))
         } else {
-            unreachable!("resident collection was constructed above")
+            Box::new(PartitionUnitProvider::new(
+                bank,
+                PlannedResidentBank::from_partitioned(bank, exchange)
+                    .map_err(|e| PreparedExecutionError::Architecture(e.to_string()))?,
+            ))
         };
         providers.insert(*id, provider);
     }
@@ -158,5 +255,5 @@ where
     }
     let providers = eredu_runtime::RoutedBankProviders::new(providers)
         .map_err(|e| PreparedExecutionError::Architecture(e.to_string()))?;
-    finish(native, prepared, providers, retained).map_err(PreparedExecutionError::Backend)
+    Ok((providers, retained))
 }

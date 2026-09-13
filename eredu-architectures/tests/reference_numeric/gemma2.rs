@@ -349,10 +349,32 @@ fn gemma2_published_gguf_layout_preserves_logits_norm_convention_and_quantizatio
         )
         .unwrap();
     let gguf = eredu_architectures::configuration::inspect_artifact(&path).unwrap();
-    assert_eq!(
-        gguf.architecture_plan().architecture_descriptor(),
-        safe.architecture_plan().architecture_descriptor()
+    let mut gguf_descriptor = gguf.architecture_plan().architecture_descriptor();
+    let safe_descriptor = safe.architecture_plan().architecture_descriptor();
+    // GGUF stores the complete gain; HF stores its offset from one. The new
+    // component equations must expose that distinction for effective queries.
+    // Translate only that storage convention when comparing the topology.
+    let translate = |normalization: &mut eredu_core::component::ComponentNormalization| {
+        assert_eq!(
+            normalization.gain_offset,
+            eredu_core::component::ComponentScalar::new(0.0)
+        );
+        normalization.gain_offset = eredu_core::component::ComponentScalar::new(1.0);
+    };
+    for component in &mut gguf_descriptor.components {
+        translate(&mut component.input_normalization);
+        if let Some(normalization) = &mut component.output_normalization {
+            translate(normalization);
+        }
+    }
+    translate(
+        &mut gguf_descriptor
+            .component_readout
+            .as_mut()
+            .unwrap()
+            .normalization,
     );
+    assert_eq!(gguf_descriptor, safe_descriptor);
     let actual = execute_numeric_replicated_inspection(&gguf, &context, &input, None);
     for (a, e) in actual.outputs.iter().zip(&expected.outputs) {
         assert_tensor_close(a, e, "Gemma 2 GGUF/HF scale conventions");

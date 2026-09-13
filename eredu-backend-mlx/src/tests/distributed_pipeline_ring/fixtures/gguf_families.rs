@@ -160,7 +160,23 @@ fn deepseek_gguf_tensors() -> Vec<GgufFixtureTensor> {
 }
 
 fn write_deepseek_gguf_fixture(path: &Path) {
-    let tensors = deepseek_gguf_tensors();
+    write_deepseek_gguf_fixture_with_components(path, false);
+}
+
+fn write_deepseek_gguf_fixture_with_components(path: &Path, components: bool) {
+    let mut tensors = deepseek_gguf_tensors();
+    if components {
+        // Match the dense component fixture's signal scale without changing
+        // the existing general-purpose checkpoint and persistence fixtures.
+        for tensor in &mut tensors {
+            if !tensor.name.contains("norm") {
+                for bytes in tensor.data.chunks_exact_mut(4) {
+                    let value = f32::from_le_bytes(bytes.try_into().unwrap()) * 8.0;
+                    bytes.copy_from_slice(&value.to_le_bytes());
+                }
+            }
+        }
+    }
     let inputs = tensors
         .iter()
         .map(|tensor| TensorInput {
@@ -176,6 +192,52 @@ fn write_deepseek_gguf_fixture(path: &Path) {
             &deepseek_gguf_metadata(),
             &inputs,
         )
+        .unwrap();
+}
+
+fn write_deepseek_dense_gguf_fixture(path: &Path) {
+    let mut metadata = deepseek_gguf_metadata();
+    metadata.insert(
+        "deepseek2.leading_dense_block_count".into(),
+        GgufMetadataValue::Uint32(2),
+    );
+    let mut tensors = deepseek_gguf_tensors();
+    tensors.retain(|tensor| {
+        (!tensor.name.starts_with("blk.1.ffn_") || tensor.name == "blk.1.ffn_norm.weight")
+            && tensor.name != "blk.1.exp_probs_b.bias"
+    });
+    for (name, shape, phase) in [
+        ("blk.1.ffn_gate.weight", vec![12, 16], 32),
+        ("blk.1.ffn_up.weight", vec![12, 16], 33),
+        ("blk.1.ffn_down.weight", vec![16, 12], 34),
+    ] {
+        tensors.push(f32_gguf_tensor(
+            name,
+            shape,
+            patterned_values(192, 0.003, phase),
+        ));
+    }
+    // Retain the published split KV-B representation and amplify the finite
+    // nonzero matrix fixture so component interventions cannot pass as noise.
+    for tensor in &mut tensors {
+        if !tensor.name.contains("norm") {
+            for bytes in tensor.data.chunks_exact_mut(4) {
+                let value = f32::from_le_bytes(bytes.try_into().unwrap()) * 8.0;
+                bytes.copy_from_slice(&value.to_le_bytes());
+            }
+        }
+    }
+    let inputs = tensors
+        .iter()
+        .map(|tensor| TensorInput {
+            name: &tensor.name,
+            dimensions: &tensor.dimensions,
+            ggml_type: GgmlType::F32,
+            data: &tensor.data,
+        })
+        .collect::<Vec<_>>();
+    Writer::default()
+        .write(std::fs::File::create(path).unwrap(), &metadata, &inputs)
         .unwrap();
 }
 
@@ -327,8 +389,15 @@ fn kimi_linear_gguf_specs() -> Vec<GgufFixtureTensor> {
     specs
 }
 
-fn write_kimi_linear_gguf_fixture(path: &Path) {
-    let specs = kimi_linear_gguf_specs();
+fn write_kimi_linear_gguf_fixture(path: &Path, components: bool) {
+    let mut specs = kimi_linear_gguf_specs();
+    if components {
+        for tensor in &mut specs {
+            tensor.data = (0..tensor.data.len() / 4)
+                .flat_map(|index| kimi_component_value(&tensor.name, index).to_le_bytes())
+                .collect();
+        }
+    }
     let tensors = specs
         .iter()
         .map(|tensor| TensorInput {

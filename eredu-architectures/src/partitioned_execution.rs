@@ -1,5 +1,10 @@
 //! Architecture-owned admission and typed handoff for partitioned execution.
 
+mod deepseek_dense;
+#[path = "partitioned_parameters.rs"]
+mod parameter_access;
+mod qwen_hybrid;
+
 use std::{
     borrow::Borrow,
     collections::{BTreeMap, BTreeSet},
@@ -120,6 +125,16 @@ where
         + eredu_runtime::ParallelLayeredArchitecture<B, S>,
     B::ParallelContext: Sized,
 {
+    /// Whether this selected strategy calls the architecture's internal hooks.
+    fn emits_internal_observations(&self, _architecture: &A, _tensor_parallel: bool) -> bool {
+        false
+    }
+
+    /// Whether sparse provider hooks are retained by the selected unit call.
+    fn emits_routed_observations(&self, _architecture: &A, _tensor_parallel: bool) -> bool {
+        false
+    }
+
     /// Whether inactive pipeline stages must enter routed collective waves.
     fn has_cross_stage_collective_waves(&self) -> bool {
         false
@@ -145,6 +160,45 @@ where
         G: Borrow<B::CommunicationGroup>,
         R: Borrow<B::CommunicationRoute>,
         I: eredu_runtime::CommunicationTensorMetadata<B>;
+
+    /// Executes internal component boundaries through the selected unit strategy.
+    /// Strategies with specialized providers override this alongside their ordinary call.
+    #[allow(clippy::too_many_arguments)]
+    fn forward_unit_observed<G, R, I, O>(
+        &mut self,
+        architecture: &mut A,
+        address: eredu_runtime::ExecutionUnitAddress,
+        unit: &mut A::Unit,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &mut A::ForwardContext,
+        pass: eredu_runtime::ExpertPass,
+        parallel: Option<&B::ParallelContext>,
+        communication: &eredu_runtime::PartitionCommunication<B, G, R, I>,
+        communication_executor: &B::Executor,
+        context: &<B::Tensor as eredu_nn::Tensor>::Context,
+        _observer: &mut O,
+    ) -> Result<B::Tensor, A::Error>
+    where
+        G: Borrow<B::CommunicationGroup>,
+        R: Borrow<B::CommunicationRoute>,
+        I: eredu_runtime::CommunicationTensorMetadata<B>,
+        O: eredu_runtime::ActivationObserver<B::Tensor, A::Error> + ?Sized,
+    {
+        self.forward_unit(
+            architecture,
+            address,
+            unit,
+            hidden,
+            state,
+            forward,
+            pass,
+            parallel,
+            communication,
+            communication_executor,
+            context,
+        )
+    }
 
     /// Submits architecture-selected zero work for one inactive pipeline stage.
     #[allow(clippy::too_many_arguments)]
@@ -186,6 +240,19 @@ where
         + eredu_runtime::ParallelLayeredArchitecture<B, S>,
     B::ParallelContext: Sized,
 {
+    fn emits_internal_observations(&self, _architecture: &A, _tensor_parallel: bool) -> bool {
+        true
+    }
+
+    fn emits_routed_observations(&self, architecture: &A, tensor_parallel: bool) -> bool {
+        let hooks = if tensor_parallel {
+            architecture.parallel_observation_hooks()
+        } else {
+            architecture.observation_hooks()
+        };
+        hooks.supports(eredu_runtime::inspection::ObservationHookSite::RoutedUnits)
+    }
+
     fn forward_unit<G, R, I>(
         &mut self,
         architecture: &mut A,
@@ -227,6 +294,52 @@ where
             ),
         }
     }
+
+    fn forward_unit_observed<G, R, I, O>(
+        &mut self,
+        architecture: &mut A,
+        address: eredu_runtime::ExecutionUnitAddress,
+        unit: &mut A::Unit,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &mut A::ForwardContext,
+        _pass: eredu_runtime::ExpertPass,
+        parallel: Option<&B::ParallelContext>,
+        _communication: &eredu_runtime::PartitionCommunication<B, G, R, I>,
+        _communication_executor: &B::Executor,
+        context: &<B::Tensor as eredu_nn::Tensor>::Context,
+        observer: &mut O,
+    ) -> Result<B::Tensor, A::Error>
+    where
+        G: Borrow<B::CommunicationGroup>,
+        R: Borrow<B::CommunicationRoute>,
+        I: eredu_runtime::CommunicationTensorMetadata<B>,
+        O: eredu_runtime::ActivationObserver<B::Tensor, A::Error> + ?Sized,
+    {
+        match parallel {
+            Some(parallel) => architecture.forward_unit_parallel_observed(
+                address.group(),
+                address.index(),
+                unit,
+                hidden,
+                state,
+                forward,
+                parallel,
+                context,
+                observer,
+            ),
+            None => architecture.forward_unit_observed(
+                address.group(),
+                address.index(),
+                unit,
+                hidden,
+                state,
+                forward,
+                context,
+                observer,
+            ),
+        }
+    }
 }
 
 /// Architecture-selected direct or routed composite unit execution.
@@ -242,12 +355,14 @@ impl<Provider, Movement> SelectedCompositePartitionUnitStrategy<Provider, Moveme
         provider: Provider,
         realizations: BTreeMap<eredu_runtime::RoutedBankId, crate::routed_text::RoutedGroupedPlan>,
         expert_group: Option<eredu_core::CollectiveGroupId>,
+        tensor_group: Option<eredu_core::CollectiveGroupId>,
         movement: Movement,
     ) -> Self {
         Self::Routed(RoutedPipelinePartitionUnitStrategy::from_grouped_plans(
             provider,
             realizations,
             expert_group,
+            tensor_group,
             movement,
         ))
     }
@@ -257,6 +372,7 @@ impl<Provider, Movement> SelectedCompositePartitionUnitStrategy<Provider, Moveme
         provider: Provider,
         realization: crate::ExpertRealizationPlan<E>,
         expert_group: Option<eredu_core::CollectiveGroupId>,
+        tensor_group: Option<eredu_core::CollectiveGroupId>,
         movement: Movement,
     ) -> Self
     where
@@ -266,6 +382,7 @@ impl<Provider, Movement> SelectedCompositePartitionUnitStrategy<Provider, Moveme
             provider,
             realization,
             expert_group,
+            tensor_group,
             movement,
         ))
     }
@@ -277,6 +394,7 @@ impl<Provider, Movement> SelectedCompositePartitionUnitStrategy<Provider, Moveme
         expert_group: eredu_core::CollectiveGroupId,
         movement: Movement,
         tensor_group: Option<eredu_core::CollectiveGroupId>,
+        wave_group: eredu_core::CollectiveGroupId,
         collective_waves: RoutedExpertCollectiveWaveSchedule,
     ) -> Result<Self, String>
     where
@@ -288,6 +406,7 @@ impl<Provider, Movement> SelectedCompositePartitionUnitStrategy<Provider, Moveme
             expert_group,
             movement,
             tensor_group,
+            wave_group,
             collective_waves,
         )
         .map(Self::Routed)
@@ -299,6 +418,7 @@ impl<Provider, Movement> SelectedCompositePartitionUnitStrategy<Provider, Moveme
         expert_group: eredu_core::CollectiveGroupId,
         movement: Movement,
         tensor_group: Option<eredu_core::CollectiveGroupId>,
+        wave_group: eredu_core::CollectiveGroupId,
         collective_waves: RoutedExpertCollectiveWaveSchedule,
     ) -> Self {
         Self::Routed(RoutedPipelinePartitionUnitStrategy {
@@ -307,6 +427,7 @@ impl<Provider, Movement> SelectedCompositePartitionUnitStrategy<Provider, Moveme
             expert_group: Some(expert_group),
             movement,
             tensor_group,
+            wave_group: Some(wave_group),
             collective_waves: Some(collective_waves),
         })
     }
@@ -320,7 +441,8 @@ where
         > + eredu_runtime::CommunicationBackend
         + eredu_nn::TensorParallelGroupedNeuralBackend
         + eredu_runtime::EvenGatherBackend
-        + eredu_runtime::VariableAllToAllBackend,
+        + eredu_runtime::VariableAllToAllBackend
+        + eredu_runtime::FailureAgreementBackend,
     S: eredu_runtime::RuntimeState<B>,
     A: crate::composite_execution::CompositeArchitecture<B, S, Error = eredu_nn::Error>
         + eredu_runtime::ParallelRoutedLayeredArchitecture<B, S>,
@@ -332,6 +454,36 @@ where
 {
     fn has_cross_stage_collective_waves(&self) -> bool {
         matches!(self, Self::Routed(strategy) if strategy.collective_waves.is_some())
+    }
+
+    fn emits_internal_observations(&self, architecture: &A, tensor_parallel: bool) -> bool {
+        match self {
+            Self::Direct => CompositePartitionUnitStrategy::emits_internal_observations(
+                &DirectCompositePartitionUnitStrategy,
+                architecture,
+                tensor_parallel,
+            ),
+            Self::Routed(strategy) => CompositePartitionUnitStrategy::emits_internal_observations(
+                strategy,
+                architecture,
+                tensor_parallel,
+            ),
+        }
+    }
+
+    fn emits_routed_observations(&self, architecture: &A, tensor_parallel: bool) -> bool {
+        match self {
+            Self::Direct => CompositePartitionUnitStrategy::emits_routed_observations(
+                &DirectCompositePartitionUnitStrategy,
+                architecture,
+                tensor_parallel,
+            ),
+            Self::Routed(strategy) => CompositePartitionUnitStrategy::emits_routed_observations(
+                strategy,
+                architecture,
+                tensor_parallel,
+            ),
+        }
     }
 
     fn forward_unit<G, R, I>(
@@ -384,6 +536,60 @@ where
         }
     }
 
+    fn forward_unit_observed<G, R, I, O>(
+        &mut self,
+        architecture: &mut A,
+        address: eredu_runtime::ExecutionUnitAddress,
+        unit: &mut A::Unit,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &mut A::ForwardContext,
+        pass: eredu_runtime::ExpertPass,
+        parallel: Option<&B::ParallelContext>,
+        communication: &eredu_runtime::PartitionCommunication<B, G, R, I>,
+        communication_executor: &B::Executor,
+        context: &<B::Tensor as eredu_nn::Tensor>::Context,
+        observer: &mut O,
+    ) -> Result<B::Tensor, A::Error>
+    where
+        G: Borrow<B::CommunicationGroup>,
+        R: Borrow<B::CommunicationRoute>,
+        I: eredu_runtime::CommunicationTensorMetadata<B>,
+        O: eredu_runtime::ActivationObserver<B::Tensor, A::Error> + ?Sized,
+    {
+        match self {
+            Self::Direct => DirectCompositePartitionUnitStrategy.forward_unit_observed(
+                architecture,
+                address,
+                unit,
+                hidden,
+                state,
+                forward,
+                pass,
+                parallel,
+                communication,
+                communication_executor,
+                context,
+                observer,
+            ),
+            Self::Routed(strategy) => CompositePartitionUnitStrategy::forward_unit_observed(
+                strategy,
+                architecture,
+                address,
+                unit,
+                hidden,
+                state,
+                forward,
+                pass,
+                parallel,
+                communication,
+                communication_executor,
+                context,
+                observer,
+            ),
+        }
+    }
+
     fn participate_inactive_pipeline_wave<G, R, I, F>(
         &mut self,
         wave: usize,
@@ -422,6 +628,11 @@ where
                     expert_group,
                     waves,
                     strategy.tensor_group,
+                    strategy.wave_group.ok_or_else(|| {
+                        eredu_nn::Error::backend(
+                            "routed composite wave has no selected agreement group",
+                        )
+                    })?,
                     wave,
                     communication,
                     communication_executor,
@@ -770,7 +981,7 @@ where
     sequence_length: i32,
     forward: Option<eredu_runtime::LayeredForwardState<B::Tensor, A::ForwardContext>>,
     group_outputs: Vec<Option<B::Tensor>>,
-    pending_group_boundaries: Vec<Option<(ResolvedBoundaryWireSchema, Vec<B::Tensor>)>>,
+    pending_group_boundaries: Vec<Option<(usize, ResolvedBoundaryWireSchema, Vec<B::Tensor>)>>,
     incoming_decoder: Option<(
         B::Tensor,
         <A::Boundary as ArchitectureBoundary>::Boundary<B::Tensor>,
@@ -842,7 +1053,7 @@ where
     A::InputPartPlan: 'static,
     A::Error: std::fmt::Display,
     P: eredu_runtime::LayerwisePolicy<B, A::Unit>,
-    P::Error: std::fmt::Display,
+    P::Error: std::error::Error + Send + Sync + 'static,
     F: PartitionTensorAllocator<B>,
     U: CompositePartitionUnitStrategy<A, B, S>,
     G: Borrow<B::CommunicationGroup>,
@@ -850,6 +1061,23 @@ where
     I: eredu_runtime::CommunicationTensorMetadata<B>,
     B::ParallelContext: Sized,
 {
+    fn observation_hooks(&self) -> eredu_runtime::inspection::ObservationHookSupport {
+        let architecture = self.architecture.inner();
+        let tensor_parallel = self.parallel.is_some();
+        let hooks = architecture.partition_observation_hooks(tensor_parallel);
+        hooks
+            .with_units(
+                hooks.supports(eredu_runtime::inspection::ObservationHookSite::Unit)
+                    && self
+                        .unit_strategy
+                        .emits_internal_observations(architecture, tensor_parallel),
+            )
+            .with_routed_units(
+                self.unit_strategy
+                    .emits_routed_observations(architecture, tensor_parallel),
+            )
+    }
+
     type Pass<'a> = CompositePartitionPass<'a, A, B, S>;
 
     fn begin<'a>(
@@ -1061,7 +1289,7 @@ where
                 }
                 communication
                     .complete_execution_dependencies(values, communication_executor)
-                    .map_err(|error| eredu_nn::Error::backend(error.to_string()))?;
+                    .map_err(eredu_nn::Error::backend_source)?;
                 return Ok(());
             }
             let Some(waves) = pass
@@ -1096,7 +1324,7 @@ where
                 .collect::<Result<Vec<_>, _>>()?;
             communication
                 .all_reduce_sum_wave(values, tensor_group, communication_executor)
-                .map_err(|error| eredu_nn::Error::backend(error.to_string()))?;
+                .map_err(eredu_nn::Error::backend_source)?;
             return Ok(());
         }
         if active {
@@ -1134,12 +1362,16 @@ where
             }
             communication
                 .complete_execution_dependencies(values, communication_executor)
-                .map_err(|error| eredu_nn::Error::backend(error.to_string()))?;
+                .map_err(eredu_nn::Error::backend_source)?;
             return Ok(());
         }
         self.unit_strategy.participate_inactive_pipeline_wave(
             wave,
-            pass.forward.is_none(),
+            pass.forward.as_ref().is_none_or(|forward| {
+                self.architecture
+                    .inner()
+                    .primary_ingress_collectives_pending(&forward.context)
+            }),
             pass.primary_ingress_collectives.as_deref(),
             communication,
             communication_executor,
@@ -1183,7 +1415,7 @@ where
         let group_unit_count = self
             .architecture
             .group_unit_count(group)
-            .map_err(|error| eredu_nn::Error::backend(error.to_string()))?;
+            .map_err(eredu_nn::Error::backend_source)?;
         let owns_group_input = actual_range.start == 0;
         let owns_group_output = actual_range.end == group_unit_count;
 
@@ -1218,7 +1450,7 @@ where
                             context,
                         ),
                     }
-                    .map_err(|error| eredu_nn::Error::backend(error.to_string()))?;
+                    .map_err(eredu_nn::Error::backend_source)?;
                     pass.forward = Some(forward);
                     resumed = true;
                 }
@@ -1236,14 +1468,24 @@ where
                     .begin_forward_parallel(input, state, parallel, context),
                 None => self.architecture.begin_forward(input, state, context),
             }
-            .map_err(|error| eredu_nn::Error::backend(error.to_string()))?;
+            .map_err(eredu_nn::Error::backend_source)?;
             pass.forward = Some(forward);
         }
 
         {
             let forward = pass.forward.as_mut().expect("composite forward installed");
             for source_group in 0..pass.pending_group_boundaries.len() {
-                let Some((schema, auxiliary)) = pass.pending_group_boundaries[source_group].take()
+                // Independent roots can return their results before another
+                // root executes. Preserve each boundary until its declared
+                // destination starts; an intervening group cannot consume it.
+                if !pass.pending_group_boundaries[source_group]
+                    .as_ref()
+                    .is_some_and(|(destination, _, _)| *destination == group)
+                {
+                    continue;
+                }
+                let Some((destination, schema, auxiliary)) =
+                    pass.pending_group_boundaries[source_group].take()
                 else {
                     continue;
                 };
@@ -1258,12 +1500,12 @@ where
                     .inner_mut()
                     .accept_partition_boundary(
                         source_group,
-                        group,
+                        destination,
                         &schema,
                         values,
                         &mut forward.context,
                     )
-                    .map_err(|error| eredu_nn::Error::backend(error.to_string()))?;
+                    .map_err(eredu_nn::Error::backend_source)?;
                 pass.group_outputs[source_group] = Some(installed.unwrap_or(fallback));
             }
         }
@@ -1271,16 +1513,29 @@ where
             .then(|| pass.group_outputs[group].take())
             .flatten()
             .map(|hidden| {
-                if pass.group_continuation_geometry[group].is_some()
+                let hidden = if pass.group_continuation_geometry[group].is_some()
                     && self
                         .architecture
                         .inner()
                         .prepared_group_continuation_batched(group)
                 {
-                    hidden.squeeze_axes(&[0], context)
+                    hidden.squeeze_axes(&[0], context)?
                 } else {
-                    Ok(hidden)
-                }
+                    hidden
+                };
+                self.architecture
+                    .inner()
+                    .decode_group_continuation(
+                        group,
+                        hidden,
+                        &pass
+                            .forward
+                            .as_ref()
+                            .expect("composite forward installed")
+                            .context,
+                        context,
+                    )
+                    .map_err(eredu_nn::Error::backend_source)
             })
             .transpose()?;
         let forward = pass.forward.as_mut().expect("composite forward installed");
@@ -1296,12 +1551,12 @@ where
                     self.parallel.as_ref(),
                     context,
                 )
-                .map_err(|error| eredu_nn::Error::backend(error.to_string()))?
+                .map_err(eredu_nn::Error::backend_source)?
         } else {
             let dependency_groups = self
                 .architecture
                 .execution_graph()
-                .map_err(|error| eredu_nn::Error::backend(error.to_string()))?
+                .map_err(eredu_nn::Error::backend_source)?
                 .dependencies(group)
                 .into_iter()
                 .flatten()
@@ -1332,11 +1587,11 @@ where
                             context,
                         ),
                     }
-                    .map_err(|error| eredu_nn::Error::backend(error.to_string()))?;
+                    .map_err(eredu_nn::Error::backend_source)?;
                     if let Some(path) =
                         self.architecture
                             .group_input_observation_path(dependency)
-                            .map_err(|error| eredu_nn::Error::backend(error.to_string()))?
+                            .map_err(eredu_nn::Error::backend_source)?
                     {
                         dependency_hidden = eredu_runtime::observe_and_intervene(
                             observer,
@@ -1361,11 +1616,11 @@ where
                             context,
                         ),
                     }
-                    .map_err(|error| eredu_nn::Error::backend(error.to_string()))?;
+                    .map_err(eredu_nn::Error::backend_source)?;
                     if let Some(path) = self
                         .architecture
                         .group_output_observation_path(dependency)
-                        .map_err(|error| eredu_nn::Error::backend(error.to_string()))?
+                        .map_err(eredu_nn::Error::backend_source)?
                     {
                         dependency_hidden = eredu_runtime::observe_and_intervene(
                             observer,
@@ -1418,20 +1673,20 @@ where
                     context,
                 ),
             }
-            .map_err(|error| eredu_nn::Error::backend(error.to_string()))?
+            .map_err(eredu_nn::Error::backend_source)?
         };
         if owns_group_input {
             if let Some(path) = self
                 .architecture
                 .group_input_observation_path(group)
-                .map_err(|error| eredu_nn::Error::backend(error.to_string()))?
+                .map_err(eredu_nn::Error::backend_source)?
             {
                 hidden = eredu_runtime::observe_and_intervene(observer, &path, &hidden)?;
             }
         }
         let mut policy =
             eredu_runtime::LayerwisePolicyForward::begin(&mut self.policy, &hidden, context)
-                .map_err(|error| eredu_nn::Error::backend(error.to_string()))?;
+                .map_err(eredu_nn::Error::backend_source)?;
         for (storage_ordinal, address) in selected_units.iter().copied() {
             let lease = policy
                 .acquire(storage_ordinal, address, |context| {
@@ -1440,21 +1695,29 @@ where
                 })
                 .map_err(|error| match error {
                     eredu_runtime::LayerwiseAcquireError::Architecture(error) => {
-                        eredu_nn::Error::backend(error.to_string())
+                        eredu_nn::Error::backend_source(error)
                     }
                     eredu_runtime::LayerwiseAcquireError::Policy(error) => {
-                        eredu_nn::Error::backend(error.to_string())
+                        eredu_nn::Error::backend_source(error)
                     }
                 })?;
             let path = self
                 .architecture
                 .unit_path(address.group(), address.index())
-                .map_err(|error| eredu_nn::Error::backend(error.to_string()))?;
-            hidden =
-                eredu_runtime::observe_and_intervene(observer, &format!("{path}.input"), &hidden)?;
+                .map_err(eredu_nn::Error::backend_source)?;
+            let unit_boundaries = self
+                .architecture
+                .observes_unit_boundaries(address.group(), address.index());
+            if !unit_boundaries {
+                hidden = eredu_runtime::observe_and_intervene(
+                    observer,
+                    &format!("{path}.input"),
+                    &hidden,
+                )?;
+            }
             hidden = self
                 .unit_strategy
-                .forward_unit(
+                .forward_unit_observed(
                     self.architecture.inner_mut(),
                     address,
                     lease,
@@ -1466,10 +1729,16 @@ where
                     _communication,
                     _communication_executor,
                     context,
+                    observer,
                 )
-                .map_err(|error| eredu_nn::Error::backend(error.to_string()))?;
-            hidden =
-                eredu_runtime::observe_and_intervene(observer, &format!("{path}.output"), &hidden)?;
+                .map_err(eredu_nn::Error::backend_source)?;
+            if !unit_boundaries {
+                hidden = eredu_runtime::observe_and_intervene(
+                    observer,
+                    &format!("{path}.output"),
+                    &hidden,
+                )?;
+            }
             let state_values = if driver.optional_state_layout().is_some() {
                 let global = self.architecture.state_ordinal(
                     address.group(),
@@ -1485,7 +1754,7 @@ where
                     })?;
                 state
                     .retained_values(local, address.with_index(global))
-                    .map_err(|error| eredu_nn::Error::backend(error.to_string()))?
+                    .map_err(eredu_nn::Error::backend_source)?
                     .collect::<Vec<_>>()
             } else {
                 Vec::new()
@@ -1497,7 +1766,7 @@ where
             );
             policy
                 .complete(&hidden, state_values.into_iter(), context_values)
-                .map_err(|error| eredu_nn::Error::backend(error.to_string()))?;
+                .map_err(eredu_nn::Error::backend_source)?;
         }
         hidden = if group != self.primary_group && !owns_group_output {
             hidden
@@ -1511,7 +1780,7 @@ where
                     self.parallel.as_ref(),
                     context,
                 )
-                .map_err(|error| eredu_nn::Error::backend(error.to_string()))?
+                .map_err(eredu_nn::Error::backend_source)?
         } else {
             match self.parallel.as_ref() {
                 Some(parallel) => self.architecture.complete_execution_group_parallel(
@@ -1530,13 +1799,13 @@ where
                     context,
                 ),
             }
-            .map_err(|error| eredu_nn::Error::backend(error.to_string()))?
+            .map_err(eredu_nn::Error::backend_source)?
         };
         if owns_group_output {
             if let Some(path) = self
                 .architecture
                 .group_output_observation_path(group)
-                .map_err(|error| eredu_nn::Error::backend(error.to_string()))?
+                .map_err(eredu_nn::Error::backend_source)?
             {
                 hidden = eredu_runtime::observe_and_intervene(observer, &path, &hidden)?;
             }
@@ -1546,20 +1815,36 @@ where
         if group == self.primary_group {
             let result = self
                 .architecture
-                .finish_partition(
+                .finish_partition_observed(
                     &hidden,
                     state,
                     &forward.context,
                     driver.owns_output(),
                     self.parallel.as_ref(),
                     context,
+                    observer,
                 )
-                .map_err(|error| eredu_nn::Error::backend(error.to_string()))?;
+                .map_err(eredu_nn::Error::backend_source)?;
             if let eredu_runtime::LayeredPartitionOutput::Final { output, .. } = &result {
                 pass.final_output = Some(output.clone());
             }
             pass.partition_output = Some(result);
         }
+        let completed = if group == self.primary_group {
+            match pass
+                .partition_output
+                .as_ref()
+                .expect("completed primary group")
+            {
+                eredu_runtime::LayeredPartitionOutput::Final { output, .. } => output,
+                eredu_runtime::LayeredPartitionOutput::Boundary { hidden, .. } => hidden,
+            }
+        } else {
+            &hidden
+        };
+        policy
+            .finish(completed)
+            .map_err(eredu_nn::Error::backend_source)?;
         Ok(())
     }
 
@@ -1588,7 +1873,7 @@ where
                         )
                         .and_then(|tensor| {
                             eredu_runtime::ArchitectureBoundaryValue::new(spec.role(), tensor)
-                                .map_err(|error| eredu_nn::Error::backend(error.to_string()))
+                                .map_err(eredu_nn::Error::backend_source)
                         })
                 })
                 .collect();
@@ -1607,11 +1892,11 @@ where
             let boundary = self
                 .architecture
                 .boundary_schema()
-                .map_err(|error| eredu_nn::Error::backend(error.to_string()))?
+                .map_err(eredu_nn::Error::backend_source)?
                 .encode(auxiliary)
-                .map_err(|error| eredu_nn::Error::backend(error.to_string()))?;
+                .map_err(eredu_nn::Error::backend_source)?;
             let primary = eredu_runtime::ArchitectureBoundaryValue::new("hidden", hidden)
-                .map_err(|error| eredu_nn::Error::backend(error.to_string()))?;
+                .map_err(eredu_nn::Error::backend_source)?;
             std::iter::once(primary).chain(boundary).collect::<Vec<_>>()
         } else {
             let mut hidden = pass.group_outputs[route.source_group]
@@ -1629,6 +1914,13 @@ where
             {
                 hidden = hidden.expand_dims(0, context)?;
             }
+            if route.source_group == route.destination_group {
+                hidden = self
+                    .architecture
+                    .inner()
+                    .encode_group_continuation(route.source_group, hidden, context)
+                    .map_err(eredu_nn::Error::backend_source)?;
+            }
             let forward = pass.forward.as_ref().ok_or_else(|| {
                 eredu_nn::Error::backend("composite boundary has no architecture context")
             })?;
@@ -1642,7 +1934,7 @@ where
                     &hidden,
                     &forward.context,
                 )
-                .map_err(|error| eredu_nn::Error::backend(error.to_string()))?
+                .map_err(eredu_nn::Error::backend_source)?
             {
                 values
             } else {
@@ -1653,7 +1945,7 @@ where
                 }
                 vec![
                     eredu_runtime::ArchitectureBoundaryValue::new(schema.primary().role(), hidden)
-                        .map_err(|error| eredu_nn::Error::backend(error.to_string()))?,
+                        .map_err(eredu_nn::Error::backend_source)?,
                 ]
             }
         };
@@ -1678,7 +1970,7 @@ where
                     tensor
                 };
                 eredu_runtime::ArchitectureBoundaryValue::new(role, tensor)
-                    .map_err(|error| eredu_nn::Error::backend(error.to_string()))
+                    .map_err(eredu_nn::Error::backend_source)
             })
             .collect()
     }
@@ -1716,16 +2008,16 @@ where
                 &pass.group_boundary_sequences,
                 continuation,
             )
-            .map_err(|error| eredu_nn::Error::backend(error.to_string()))?;
+            .map_err(eredu_nn::Error::backend_source)?;
         let actual = if let Some(schema) = family_schema {
             schema
         } else if decoder_continuation {
             self.architecture
                 .boundary_schema()
-                .map_err(|error| eredu_nn::Error::backend(error.to_string()))?
+                .map_err(eredu_nn::Error::backend_source)?
                 .wire_schema()
                 .and_then(|schema| schema.resolve(pass.batch_size, pass.sequence_length))
-                .map_err(|error| eredu_nn::Error::backend(error.to_string()))?
+                .map_err(eredu_nn::Error::backend_source)?
         } else {
             let hidden = *selected.primary().shape().last().ok_or_else(|| {
                 eredu_nn::Error::backend("composite route primary activation has no hidden extent")
@@ -1750,7 +2042,7 @@ where
                 [],
             )
             .and_then(|schema| schema.resolve(pass.batch_size, sequence))
-            .map_err(|error| eredu_nn::Error::backend(error.to_string()))?
+            .map_err(eredu_nn::Error::backend_source)?
         };
         validate_composite_invocation_schema(selected, &actual)?;
         Ok(actual)
@@ -1783,7 +2075,7 @@ where
                         std::iter::once(hidden).chain(values).collect(),
                         &mut forward.context,
                     )
-                    .map_err(|error| eredu_nn::Error::backend(error.to_string()))?
+                    .map_err(eredu_nn::Error::backend_source)?
                     .ok_or_else(|| {
                         eredu_nn::Error::backend(
                             "composite architecture did not resume its decoder boundary",
@@ -1795,9 +2087,9 @@ where
                 let auxiliary = self
                     .architecture
                     .boundary_schema()
-                    .map_err(|error| eredu_nn::Error::backend(error.to_string()))?
+                    .map_err(eredu_nn::Error::backend_source)?
                     .decode(values.collect())
-                    .map_err(|error| eredu_nn::Error::backend(error.to_string()))?;
+                    .map_err(eredu_nn::Error::backend_source)?;
                 pass.incoming_decoder = Some((hidden, auxiliary));
             }
         } else {
@@ -1818,7 +2110,7 @@ where
             // A primary-only dependency can still carry architecture state:
             // the destination must enter the same typed acceptance hook even
             // when the selected edge has zero auxiliary tensors.
-            *pending = Some((schema.clone(), auxiliary));
+            *pending = Some((route.destination_group, schema.clone(), auxiliary));
             pass.group_outputs[route.source_group] = Some(hidden);
         }
         Ok(())
@@ -2020,13 +2312,17 @@ where
         + eredu_runtime::ParallelLayeredArchitecture<B, S>
         + 'static,
     P: eredu_runtime::LayerwisePolicy<B, A::Unit>,
-    P::Error: std::fmt::Display,
+    P::Error: std::error::Error + Send + Sync + 'static,
     G: Borrow<B::CommunicationGroup>,
     R: Borrow<B::CommunicationRoute>,
     I: eredu_runtime::CommunicationTensorMetadata<B>,
     B::ParallelContext: Sized,
 {
     type Pass<'a> = DirectResidentPartitionPass<'a, A, B, S>;
+
+    fn observation_hooks(&self) -> eredu_runtime::inspection::ObservationHookSupport {
+        self.runtime.architecture().parallel_observation_hooks()
+    }
 
     fn begin<'a>(
         &mut self,
@@ -2076,30 +2372,17 @@ where
             .ok_or_else(|| eredu_nn::Error::backend("direct partition executed more than once"))?;
         let output = self
             .runtime
-            .forward_parallel_with_unit_executor_and_context_hook(
+            .forward_parallel_with_observer_and_context(
                 input,
                 state,
                 &self.parallel,
                 context,
-                |architecture, group, index, unit, hidden, state, forward, parallel, context| {
-                    let path = architecture.unit_path(group, index)?;
-                    let input = eredu_runtime::observe_and_intervene(
-                        observer,
-                        &format!("{path}.input"),
-                        hidden,
-                    )?;
-                    let output = architecture.forward_unit_parallel(
-                        group, index, unit, &input, state, forward, parallel, context,
-                    )?;
-                    eredu_runtime::observe_and_intervene(
-                        observer,
-                        &format!("{path}.output"),
-                        &output,
-                    )
-                },
-                |_, _, _| Ok(()),
+                observer,
             )
-            .map_err(|error| eredu_nn::Error::backend(error.to_string()))?;
+            .map_err(|error| match error {
+                eredu_runtime::LayerwiseRuntimeError::Architecture(error) => error,
+                other => eredu_nn::Error::backend_source(other),
+            })?;
         pass.output = Some(output);
         Ok(())
     }
@@ -2184,6 +2467,7 @@ where
     provider: Provider,
     realizations: BTreeMap<eredu_runtime::RoutedBankId, crate::routed_text::RoutedGroupedPlan>,
     expert_group: Option<eredu_core::CollectiveGroupId>,
+    tensor_group: Option<eredu_core::CollectiveGroupId>,
     movement: Movement,
 }
 
@@ -2205,6 +2489,7 @@ where
         provider: Provider,
         realizations: BTreeMap<eredu_runtime::RoutedBankId, crate::routed_text::RoutedGroupedPlan>,
         expert_group: Option<eredu_core::CollectiveGroupId>,
+        tensor_group: Option<eredu_core::CollectiveGroupId>,
         movement: Movement,
     ) -> Self {
         Self {
@@ -2213,6 +2498,7 @@ where
             provider,
             realizations,
             expert_group,
+            tensor_group,
             movement,
         }
     }
@@ -2224,6 +2510,7 @@ where
         provider: Provider,
         realization: crate::ExpertRealizationPlan<E>,
         expert_group: Option<eredu_core::CollectiveGroupId>,
+        tensor_group: Option<eredu_core::CollectiveGroupId>,
         movement: Movement,
     ) -> Self
     where
@@ -2238,6 +2525,7 @@ where
                 realization.into(),
             )]),
             expert_group,
+            tensor_group,
             movement,
         }
     }
@@ -2256,7 +2544,7 @@ where
     marker: PhantomData<fn() -> S>,
 }
 
-struct LocalAddressableExpertProvider<'a, B, Provider>
+struct LocalAddressableExpertProvider<'a, 'observer, B, Provider>
 where
     B: eredu_nn::TensorParallelGroupedNeuralBackend,
     Provider: eredu_runtime::TensorParallelRoutedExpertProvider<B>,
@@ -2265,129 +2553,184 @@ where
     resident_bank: &'a mut B::GatedProductGroups,
     partitions: usize,
     context: &'a <B::Tensor as eredu_nn::Tensor>::Context,
+    unit_observer: Option<&'observer mut dyn eredu_runtime::RoutedUnitObserver<B::Tensor>>,
 }
 
 impl<B, Provider> eredu_runtime::AddressableExpertRouteProvider<B::Tensor>
-    for LocalAddressableExpertProvider<'_, B, Provider>
+    for LocalAddressableExpertProvider<'_, '_, B, Provider>
 where
     B: eredu_nn::TensorParallelGroupedNeuralBackend,
     Provider: eredu_runtime::TensorParallelRoutedExpertProvider<B>,
     Provider::Error: std::fmt::Display,
 {
-    type Error = String;
+    type Error = crate::RoutedTextExecutionError;
 
     fn execute_addressable_routes(
         &mut self,
         request: eredu_runtime::AddressableExpertRouteRequest<'_, B::Tensor>,
     ) -> Result<B::Tensor, Self::Error> {
-        if request.access != request.pass.parameter_bank_access()
-            || request.combination != eredu_runtime::ExpertRouteCombination::CoefficientWeightedSum
-            || request.owner_local_experts.len() != request.global_experts.len()
-        {
-            return Err("partitioned local expert request changed selected semantics".into());
-        }
-        if request.owner_local_experts.is_empty() {
-            return request
-                .input
-                .zeros_like(self.context)
-                .map_err(|error| error.to_string());
-        }
-        let local = request
-            .owner_local_experts
-            .iter()
-            .copied()
-            .map(|value| i32::try_from(value).map_err(|_| "owner-local expert exceeds i32"))
-            .collect::<Result<Vec<_>, _>>()?;
-        let rows = i32::try_from(local.len()).map_err(|_| "expert route rows exceed i32")?;
-        let indices = B::Tensor::from_i32_slice(&local, &[rows, 1], self.context)
-            .map_err(|error| error.to_string())?;
-        let routes = eredu_nn::GroupSelection::new(
-            indices,
-            request.selected_scores.clone(),
-            request.coefficients.clone(),
-        );
-        self.provider
-            .forward_compact_grouped(
-                self.resident_bank,
-                eredu_runtime::RoutedExpertRequest {
-                    bank: request.bank,
-                    layer: request.unit,
-                    input: request.input,
-                    routes: &routes,
-                    pass: request.pass,
-                },
-                self.context,
-            )
-            .map_err(|error| error.to_string())
+        eredu_runtime::with_exchanged_unit_observer(
+            &mut self.unit_observer,
+            request.unit_origins,
+            |observer| {
+                eredu_runtime::with_routed_unit_invocation(
+                    observer,
+                    eredu_runtime::RoutedUnitInvocation {
+                        input: request.input,
+                        origins: None,
+                        unit_coordinates: None,
+                    },
+                    |observer| {
+                        if request.access != request.pass.parameter_bank_access()
+                            || request.combination
+                                != eredu_runtime::ExpertRouteCombination::CoefficientWeightedSum
+                            || request.owner_local_experts.len() != request.global_experts.len()
+                        {
+                            return Err(
+                                "partitioned local expert request changed selected semantics"
+                                    .into(),
+                            );
+                        }
+                        if request.owner_local_experts.is_empty() {
+                            return request
+                                .input
+                                .zeros_like(self.context)
+                                .map_err(crate::RoutedTextExecutionError::from_error);
+                        }
+                        let local = request
+                            .owner_local_experts
+                            .iter()
+                            .copied()
+                            .map(|value| {
+                                i32::try_from(value).map_err(|_| "owner-local expert exceeds i32")
+                            })
+                            .collect::<Result<Vec<_>, _>>()?;
+                        let rows = i32::try_from(local.len())
+                            .map_err(|_| "expert route rows exceed i32")?;
+                        let indices = B::Tensor::from_i32_slice(&local, &[rows, 1], self.context)
+                            .map_err(crate::RoutedTextExecutionError::from_error)?;
+                        let routes = eredu_nn::GroupSelection::new(
+                            indices,
+                            request.selected_scores.clone(),
+                            request.coefficients.clone(),
+                        );
+                        self.provider
+                            .forward_compact_grouped(
+                                self.resident_bank,
+                                eredu_runtime::RoutedExpertRequest {
+                                    unit_observer: observer,
+                                    bank: request.bank,
+                                    layer: request.unit,
+                                    input: request.input,
+                                    routes: &routes,
+                                    pass: request.pass,
+                                },
+                                self.context,
+                            )
+                            .map_err(crate::RoutedTextExecutionError::from_error)
+                    },
+                    crate::RoutedTextExecutionError::from_error,
+                )
+            },
+        )
     }
 
     fn execute_addressable_routes_tensor_parallel(
         &mut self,
         request: eredu_runtime::AddressableExpertRouteRequest<'_, B::Tensor>,
     ) -> Result<eredu_runtime::RoutedExpertTensorParallelOutput<B::Tensor>, Self::Error> {
-        if request.access != request.pass.parameter_bank_access()
-            || request.combination != eredu_runtime::ExpertRouteCombination::CoefficientWeightedSum
-            || request.owner_local_experts.len() != request.global_experts.len()
-        {
-            return Err("partitioned local expert request changed selected semantics".into());
-        }
-        if request.owner_local_experts.is_empty() {
-            let output = request
-                .input
-                .zeros_like(self.context)
-                .map_err(|error| error.to_string())?;
-            let post_reduce = match self.resident_bank.spec().layout() {
-                eredu_nn::GatedProductGroupLayout::Packed { down, .. } => {
-                    down.bias().is_some().then(|| output.clone())
-                }
-                eredu_nn::GatedProductGroupLayout::Independent(groups) => {
-                    let has_bias = groups
-                        .first()
-                        .is_some_and(|group| group.down().bias().is_some());
-                    if groups
-                        .iter()
-                        .any(|group| group.down().bias().is_some() != has_bias)
-                    {
-                        return Err(
+        eredu_runtime::with_exchanged_unit_observer(
+            &mut self.unit_observer,
+            request.unit_origins,
+            |observer| {
+                eredu_runtime::with_routed_unit_invocation(
+                    observer,
+                    eredu_runtime::RoutedUnitInvocation {
+                        input: request.input,
+                        origins: None,
+                        unit_coordinates: None,
+                    },
+                    |observer| {
+                        if request.access != request.pass.parameter_bank_access()
+                            || request.combination
+                                != eredu_runtime::ExpertRouteCombination::CoefficientWeightedSum
+                            || request.owner_local_experts.len() != request.global_experts.len()
+                        {
+                            return Err(
+                                "partitioned local expert request changed selected semantics"
+                                    .into(),
+                            );
+                        }
+                        if request.owner_local_experts.is_empty() {
+                            let output = request
+                                .input
+                                .zeros_like(self.context)
+                                .map_err(crate::RoutedTextExecutionError::from_error)?;
+                            let post_reduce = match self.resident_bank.spec().layout() {
+                                eredu_nn::GatedProductGroupLayout::Packed { down, .. } => {
+                                    down.bias().is_some().then(|| output.clone())
+                                }
+                                eredu_nn::GatedProductGroupLayout::Independent(groups) => {
+                                    let has_bias = groups
+                                        .first()
+                                        .is_some_and(|group| group.down().bias().is_some());
+                                    if groups
+                                        .iter()
+                                        .any(|group| group.down().bias().is_some() != has_bias)
+                                    {
+                                        return Err(
                             "partitioned local expert bank mixes biased and unbiased groups".into(),
                         );
-                    }
-                    has_bias.then(|| output.clone())
-                }
-                _ => return Err("unsupported partitioned local expert bank layout".into()),
-            };
-            return Ok(eredu_runtime::RoutedExpertTensorParallelOutput::Partial(
-                eredu_nn::TensorParallelGroupedOutput::new(output, post_reduce),
-            ));
-        }
-        let local = request
-            .owner_local_experts
-            .iter()
-            .copied()
-            .map(|value| i32::try_from(value).map_err(|_| "owner-local expert exceeds i32"))
-            .collect::<Result<Vec<_>, _>>()?;
-        let rows = i32::try_from(local.len()).map_err(|_| "expert route rows exceed i32")?;
-        let indices = B::Tensor::from_i32_slice(&local, &[rows, 1], self.context)
-            .map_err(|error| error.to_string())?;
-        let routes = eredu_nn::GroupSelection::new(
-            indices,
-            request.selected_scores.clone(),
-            request.coefficients.clone(),
-        );
-        self.provider
-            .forward_compact_grouped_tensor_parallel(
-                self.resident_bank,
-                eredu_runtime::RoutedExpertRequest {
-                    bank: request.bank,
-                    layer: request.unit,
-                    input: request.input,
-                    routes: &routes,
-                    pass: request.pass,
-                },
-                self.partitions,
-                self.context,
-            )
-            .map_err(|error| error.to_string())
+                                    }
+                                    has_bias.then(|| output.clone())
+                                }
+                                _ => {
+                                    return Err(
+                                        "unsupported partitioned local expert bank layout".into()
+                                    )
+                                }
+                            };
+                            return Ok(eredu_runtime::RoutedExpertTensorParallelOutput::Partial(
+                                eredu_nn::TensorParallelGroupedOutput::new(output, post_reduce),
+                            ));
+                        }
+                        let local = request
+                            .owner_local_experts
+                            .iter()
+                            .copied()
+                            .map(|value| {
+                                i32::try_from(value).map_err(|_| "owner-local expert exceeds i32")
+                            })
+                            .collect::<Result<Vec<_>, _>>()?;
+                        let rows = i32::try_from(local.len())
+                            .map_err(|_| "expert route rows exceed i32")?;
+                        let indices = B::Tensor::from_i32_slice(&local, &[rows, 1], self.context)
+                            .map_err(crate::RoutedTextExecutionError::from_error)?;
+                        let routes = eredu_nn::GroupSelection::new(
+                            indices,
+                            request.selected_scores.clone(),
+                            request.coefficients.clone(),
+                        );
+                        self.provider
+                            .forward_compact_grouped_tensor_parallel(
+                                self.resident_bank,
+                                eredu_runtime::RoutedExpertRequest {
+                                    unit_observer: observer,
+                                    bank: request.bank,
+                                    layer: request.unit,
+                                    input: request.input,
+                                    routes: &routes,
+                                    pass: request.pass,
+                                },
+                                self.partitions,
+                                self.context,
+                            )
+                            .map_err(crate::RoutedTextExecutionError::from_error)
+                    },
+                    crate::RoutedTextExecutionError::from_error,
+                )
+            },
+        )
     }
 }
 
@@ -2410,7 +2753,7 @@ where
     Provider: eredu_runtime::RoutedExpertProvider<B>,
     Provider::Error: std::fmt::Display,
 {
-    type Error = String;
+    type Error = crate::RoutedTextExecutionError;
     fn execute_addressable_routes(
         &mut self,
         request: eredu_runtime::AddressableExpertRouteRequest<'_, B::Tensor>,
@@ -2431,7 +2774,7 @@ where
                         self.context,
                     )
                 })
-                .map_err(|error| error.to_string());
+                .map_err(crate::RoutedTextExecutionError::from_error);
         }
         let local = request
             .owner_local_experts
@@ -2441,7 +2784,7 @@ where
             .collect::<Result<Vec<_>, _>>()?;
         let rows = i32::try_from(local.len()).map_err(|_| "projection route rows exceed i32")?;
         let indices = B::Tensor::from_i32_slice(&local, &[rows, 1], self.context)
-            .map_err(|error| error.to_string())?;
+            .map_err(crate::RoutedTextExecutionError::from_error)?;
         let routes = eredu_nn::GroupSelection::new(
             indices,
             request.selected_scores.clone(),
@@ -2451,6 +2794,7 @@ where
             .forward_linear_routed(
                 self.resident_bank,
                 eredu_runtime::RoutedExpertRequest {
+                    unit_observer: None,
                     bank: request.bank,
                     layer: request.unit,
                     input: request.input,
@@ -2459,11 +2803,11 @@ where
                 },
                 self.context,
             )
-            .map_err(|error| error.to_string())
+            .map_err(crate::RoutedTextExecutionError::from_error)
     }
 }
 
-struct LocalAddressableRelu2ExpertProvider<'a, B, Provider>
+struct LocalAddressableRelu2ExpertProvider<'a, 'observer, B, Provider>
 where
     B: eredu_nn::TensorParallelGroupedNeuralBackend,
     Provider: eredu_runtime::TensorParallelRoutedExpertProvider<B>,
@@ -2472,116 +2816,193 @@ where
     resident_bank: &'a mut B::Relu2Groups,
     partitions: usize,
     context: &'a <B::Tensor as eredu_nn::Tensor>::Context,
+    unit_observer: Option<&'observer mut dyn eredu_runtime::RoutedUnitObserver<B::Tensor>>,
 }
 
 impl<B, Provider> eredu_runtime::AddressableExpertRouteProvider<B::Tensor>
-    for LocalAddressableRelu2ExpertProvider<'_, B, Provider>
+    for LocalAddressableRelu2ExpertProvider<'_, '_, B, Provider>
 where
     B: eredu_nn::TensorParallelGroupedNeuralBackend,
     Provider: eredu_runtime::TensorParallelRoutedExpertProvider<B>,
     Provider::Error: std::fmt::Display,
 {
-    type Error = String;
+    type Error = crate::RoutedTextExecutionError;
 
     fn execute_addressable_routes(
         &mut self,
         request: eredu_runtime::AddressableExpertRouteRequest<'_, B::Tensor>,
     ) -> Result<B::Tensor, Self::Error> {
-        if request.access != request.pass.parameter_bank_access()
-            || request.combination != eredu_runtime::ExpertRouteCombination::CoefficientWeightedSum
-            || request.owner_local_experts.len() != request.global_experts.len()
-        {
-            return Err("partitioned local expert request changed selected semantics".into());
-        }
-        if request.owner_local_experts.is_empty() {
-            return request
-                .input
-                .zeros_like(self.context)
-                .map_err(|error| error.to_string());
-        }
-        let local = request
-            .owner_local_experts
-            .iter()
-            .copied()
-            .map(|value| i32::try_from(value).map_err(|_| "owner-local expert exceeds i32"))
-            .collect::<Result<Vec<_>, _>>()?;
-        let rows = i32::try_from(local.len()).map_err(|_| "expert route rows exceed i32")?;
-        let indices = B::Tensor::from_i32_slice(&local, &[rows, 1], self.context)
-            .map_err(|error| error.to_string())?;
-        let routes = eredu_nn::GroupSelection::new(
-            indices,
-            request.selected_scores.clone(),
-            request.coefficients.clone(),
-        );
-        self.provider
-            .forward_relu2_routed(
-                self.resident_bank,
-                eredu_runtime::RoutedExpertRequest {
-                    bank: request.bank,
-                    layer: request.unit,
-                    input: request.input,
-                    routes: &routes,
-                    pass: request.pass,
-                },
-                self.context,
-            )
-            .map_err(|error| error.to_string())
+        eredu_runtime::with_exchanged_unit_observer(
+            &mut self.unit_observer,
+            request.unit_origins,
+            |observer| {
+                eredu_runtime::with_routed_unit_invocation(
+                    observer,
+                    eredu_runtime::RoutedUnitInvocation {
+                        input: request.input,
+                        origins: None,
+                        unit_coordinates: None,
+                    },
+                    |observer| {
+                        if request.access != request.pass.parameter_bank_access()
+                            || request.combination
+                                != eredu_runtime::ExpertRouteCombination::CoefficientWeightedSum
+                            || request.owner_local_experts.len() != request.global_experts.len()
+                        {
+                            return Err(
+                                "partitioned local expert request changed selected semantics"
+                                    .into(),
+                            );
+                        }
+                        if request.owner_local_experts.is_empty() {
+                            return request
+                                .input
+                                .zeros_like(self.context)
+                                .map_err(crate::RoutedTextExecutionError::from_error);
+                        }
+                        let local = request
+                            .owner_local_experts
+                            .iter()
+                            .copied()
+                            .map(|value| {
+                                i32::try_from(value).map_err(|_| "owner-local expert exceeds i32")
+                            })
+                            .collect::<Result<Vec<_>, _>>()?;
+                        let rows = i32::try_from(local.len())
+                            .map_err(|_| "expert route rows exceed i32")?;
+                        let indices = B::Tensor::from_i32_slice(&local, &[rows, 1], self.context)
+                            .map_err(crate::RoutedTextExecutionError::from_error)?;
+                        let routes = eredu_nn::GroupSelection::new(
+                            indices,
+                            request.selected_scores.clone(),
+                            request.coefficients.clone(),
+                        );
+                        self.provider
+                            .forward_relu2_routed(
+                                self.resident_bank,
+                                eredu_runtime::RoutedExpertRequest {
+                                    unit_observer: observer,
+                                    bank: request.bank,
+                                    layer: request.unit,
+                                    input: request.input,
+                                    routes: &routes,
+                                    pass: request.pass,
+                                },
+                                self.context,
+                            )
+                            .map_err(crate::RoutedTextExecutionError::from_error)
+                    },
+                    crate::RoutedTextExecutionError::from_error,
+                )
+            },
+        )
     }
 
     fn execute_addressable_routes_tensor_parallel(
         &mut self,
         request: eredu_runtime::AddressableExpertRouteRequest<'_, B::Tensor>,
     ) -> Result<eredu_runtime::RoutedExpertTensorParallelOutput<B::Tensor>, Self::Error> {
-        if request.access != request.pass.parameter_bank_access()
-            || request.combination != eredu_runtime::ExpertRouteCombination::CoefficientWeightedSum
-            || request.owner_local_experts.len() != request.global_experts.len()
-        {
-            return Err("partitioned local expert request changed selected semantics".into());
-        }
-        if request.owner_local_experts.is_empty() {
-            let output = request
-                .input
-                .zeros_like(self.context)
-                .map_err(|error| error.to_string())?;
-            let post_reduce = self
-                .resident_bank
-                .spec()
-                .down()
-                .bias()
-                .is_some()
-                .then(|| output.clone());
-            return Ok(eredu_runtime::RoutedExpertTensorParallelOutput::Partial(
-                eredu_nn::TensorParallelGroupedOutput::new(output, post_reduce),
-            ));
-        }
-        let local = request
-            .owner_local_experts
-            .iter()
-            .copied()
-            .map(|value| i32::try_from(value).map_err(|_| "owner-local expert exceeds i32"))
-            .collect::<Result<Vec<_>, _>>()?;
-        let rows = i32::try_from(local.len()).map_err(|_| "expert route rows exceed i32")?;
-        let indices = B::Tensor::from_i32_slice(&local, &[rows, 1], self.context)
-            .map_err(|error| error.to_string())?;
-        let routes = eredu_nn::GroupSelection::new(
-            indices,
-            request.selected_scores.clone(),
-            request.coefficients.clone(),
-        );
-        self.provider
-            .forward_relu2_routed_tensor_parallel(
-                self.resident_bank,
-                eredu_runtime::RoutedExpertRequest {
-                    bank: request.bank,
-                    layer: request.unit,
-                    input: request.input,
-                    routes: &routes,
-                    pass: request.pass,
-                },
-                self.partitions,
-                self.context,
-            )
-            .map_err(|error| error.to_string())
+        eredu_runtime::with_exchanged_unit_observer(
+            &mut self.unit_observer,
+            request.unit_origins,
+            |observer| {
+                eredu_runtime::with_routed_unit_invocation(
+                    observer,
+                    eredu_runtime::RoutedUnitInvocation {
+                        input: request.input,
+                        origins: None,
+                        unit_coordinates: None,
+                    },
+                    |observer| {
+                        if request.access != request.pass.parameter_bank_access()
+                            || request.combination
+                                != eredu_runtime::ExpertRouteCombination::CoefficientWeightedSum
+                            || request.owner_local_experts.len() != request.global_experts.len()
+                        {
+                            return Err(
+                                "partitioned local expert request changed selected semantics"
+                                    .into(),
+                            );
+                        }
+                        if request.owner_local_experts.is_empty() {
+                            let output = request
+                                .input
+                                .zeros_like(self.context)
+                                .map_err(crate::RoutedTextExecutionError::from_error)?;
+                            let post_reduce = self
+                                .resident_bank
+                                .spec()
+                                .down()
+                                .bias()
+                                .is_some()
+                                .then(|| output.clone());
+                            return Ok(eredu_runtime::RoutedExpertTensorParallelOutput::Partial(
+                                eredu_nn::TensorParallelGroupedOutput::new(output, post_reduce),
+                            ));
+                        }
+                        let local = request
+                            .owner_local_experts
+                            .iter()
+                            .copied()
+                            .map(|value| {
+                                i32::try_from(value).map_err(|_| "owner-local expert exceeds i32")
+                            })
+                            .collect::<Result<Vec<_>, _>>()?;
+                        let rows = i32::try_from(local.len())
+                            .map_err(|_| "expert route rows exceed i32")?;
+                        let indices = B::Tensor::from_i32_slice(&local, &[rows, 1], self.context)
+                            .map_err(crate::RoutedTextExecutionError::from_error)?;
+                        let routes = eredu_nn::GroupSelection::new(
+                            indices,
+                            request.selected_scores.clone(),
+                            request.coefficients.clone(),
+                        );
+                        self.provider
+                            .forward_relu2_routed_tensor_parallel(
+                                self.resident_bank,
+                                eredu_runtime::RoutedExpertRequest {
+                                    unit_observer: observer,
+                                    bank: request.bank,
+                                    layer: request.unit,
+                                    input: request.input,
+                                    routes: &routes,
+                                    pass: request.pass,
+                                },
+                                self.partitions,
+                                self.context,
+                            )
+                            .map_err(crate::RoutedTextExecutionError::from_error)
+                    },
+                    crate::RoutedTextExecutionError::from_error,
+                )
+            },
+        )
+    }
+}
+
+fn agree_provider_tensor_work<B, G, R, I>(
+    communication: &eredu_runtime::PartitionCommunication<B, G, R, I>,
+    executor: &B::Executor,
+    group: Option<eredu_core::CollectiveGroupId>,
+    success: bool,
+) -> Result<bool, eredu_nn::Error>
+where
+    B: eredu_runtime::FailureAgreementBackend,
+    G: Borrow<B::CommunicationGroup>,
+    R: Borrow<B::CommunicationRoute>,
+    I: eredu_runtime::CommunicationTensorMetadata<B>,
+{
+    match group {
+        None => Ok(success),
+        Some(group) => eredu_runtime::PartitionCommitAgreement::agree_phase(
+            &mut eredu_runtime::OpaqueFailureAgreement,
+            communication,
+            group,
+            eredu_runtime::DistributedExecutionPhase::Execution,
+            success,
+            executor,
+        )
+        .map_err(eredu_nn::Error::backend_source),
     }
 }
 
@@ -2589,17 +3010,55 @@ struct PartitionRoutedExpertProvider<'a, B, Provider, Movement, G, R, I>
 where
     B: eredu_nn::TensorParallelGroupedNeuralBackend
         + eredu_runtime::EvenGatherBackend
-        + eredu_runtime::VariableAllToAllBackend,
+        + eredu_runtime::VariableAllToAllBackend
+        + eredu_runtime::FailureAgreementBackend,
     Provider: eredu_runtime::TensorParallelRoutedExpertProvider<B>,
 {
     provider: &'a mut Provider,
     realizations: &'a BTreeMap<eredu_runtime::RoutedBankId, crate::routed_text::RoutedGroupedPlan>,
     expert_group: eredu_core::CollectiveGroupId,
+    tensor_group: Option<eredu_core::CollectiveGroupId>,
+    wave_group: Option<eredu_core::CollectiveGroupId>,
     movement: &'a mut Movement,
     communication: &'a eredu_runtime::PartitionCommunication<B, G, R, I>,
     communication_executor: &'a B::Executor,
     partitions: usize,
     context: &'a <B::Tensor as eredu_nn::Tensor>::Context,
+}
+
+impl<B, Provider, Movement, G, R, I>
+    PartitionRoutedExpertProvider<'_, B, Provider, Movement, G, R, I>
+where
+    B: eredu_nn::TensorParallelGroupedNeuralBackend
+        + eredu_runtime::EvenGatherBackend
+        + eredu_runtime::VariableAllToAllBackend
+        + eredu_runtime::FailureAgreementBackend,
+    Provider: eredu_runtime::TensorParallelRoutedExpertProvider<B>,
+    G: Borrow<B::CommunicationGroup>,
+    R: Borrow<B::CommunicationRoute>,
+    I: eredu_runtime::CommunicationTensorMetadata<B>,
+{
+    fn agree_replicated<T>(
+        &self,
+        result: Result<T, crate::RoutedTextExecutionError>,
+    ) -> Result<T, crate::RoutedTextExecutionError> {
+        let agreed = crate::expert_residency::agree_partition_provider_work(
+            self.communication,
+            self.communication_executor,
+            self.tensor_group,
+            self.expert_group,
+            self.wave_group,
+            result.is_ok(),
+        );
+        match (result, agreed) {
+            (Err(error), _) => Err(error),
+            (Ok(_), Err(error)) => Err(crate::RoutedTextExecutionError::from_error(error)),
+            (Ok(_), Ok(false)) => Err(crate::RoutedTextExecutionError::from_error(
+                crate::RoutedMechanismExecutionError::ProviderRejected,
+            )),
+            (Ok(output), Ok(true)) => Ok(output),
+        }
+    }
 }
 
 fn prepare_partition_route_inputs<B, Spec>(
@@ -2615,7 +3074,7 @@ fn prepare_partition_route_inputs<B, Spec>(
         B::Tensor,
         crate::ExpertRoutePackingPlan,
     ),
-    String,
+    crate::RoutedTextExecutionError,
 >
 where
     B: eredu_nn::NeuralBackend,
@@ -2641,18 +3100,18 @@ where
     }
     let input = input
         .reshape(&[rows, hidden], context)
-        .map_err(|error| error.to_string())?;
+        .map_err(crate::RoutedTextExecutionError::from_error)?;
     let reshape_routes = |value: &B::Tensor| {
         value
             .reshape(&[rows, route_count], context)
-            .map_err(|error| error.to_string())
+            .map_err(crate::RoutedTextExecutionError::from_error)
     };
     let indices = reshape_routes(routes.group_indices())?;
     let scores = reshape_routes(routes.selected_scores())?;
     let coefficients = reshape_routes(routes.coefficients())?;
     let global_experts = indices
         .to_i32_vec(context)
-        .map_err(|error| error.to_string())?
+        .map_err(crate::RoutedTextExecutionError::from_error)?
         .into_iter()
         .map(|value| usize::try_from(value).map_err(|_| "negative routed expert identity"))
         .collect::<Result<Vec<_>, _>>()?;
@@ -2662,7 +3121,7 @@ where
         usize::try_from(route_count).map_err(|_| "route cardinality is negative")?,
         &global_experts,
     )
-    .map_err(|error| error.to_string())?;
+    .map_err(crate::RoutedTextExecutionError::from_error)?;
     Ok((input_shape, input, scores, coefficients, packing))
 }
 
@@ -2671,7 +3130,8 @@ impl<B, Provider, Movement, G, R, I> eredu_runtime::RoutedExpertProvider<B>
 where
     B: eredu_nn::TensorParallelGroupedNeuralBackend
         + eredu_runtime::EvenGatherBackend
-        + eredu_runtime::VariableAllToAllBackend,
+        + eredu_runtime::VariableAllToAllBackend
+        + eredu_runtime::FailureAgreementBackend,
     Provider: eredu_runtime::TensorParallelRoutedExpertProvider<B>,
     Provider::Error: std::fmt::Display,
     Movement: eredu_runtime::ExpertRouteTensorMovement<B::Tensor>,
@@ -2680,7 +3140,7 @@ where
     R: Borrow<B::CommunicationRoute>,
     I: eredu_runtime::CommunicationTensorMetadata<B>,
 {
-    type Error = String;
+    type Error = crate::RoutedTextExecutionError;
 
     fn routing_control(
         &mut self,
@@ -2689,7 +3149,7 @@ where
     ) -> Result<Option<eredu_nn::routing_intervention::GroupSelectionControl>, Self::Error> {
         self.provider
             .routing_control(bank, rows)
-            .map_err(|e| e.to_string())
+            .map_err(crate::RoutedTextExecutionError::from_error)
     }
     fn routing_applied(
         &mut self,
@@ -2699,7 +3159,7 @@ where
     ) -> Result<(), Self::Error> {
         self.provider
             .routing_applied(bank, original, effective)
-            .map_err(|e| e.to_string())
+            .map_err(crate::RoutedTextExecutionError::from_error)
     }
     fn routing_failed(&mut self, bank: eredu_runtime::RoutedBankId, message: &str) {
         self.provider.routing_failed(bank, message);
@@ -2708,7 +3168,7 @@ where
     fn forward_grouped(
         &mut self,
         resident_bank: &mut B::GatedProductGroups,
-        request: eredu_runtime::RoutedExpertRequest<'_, B::Tensor>,
+        request: eredu_runtime::RoutedExpertRequest<'_, '_, B::Tensor>,
         context: &<B::Tensor as eredu_nn::Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error> {
         let realization = self
@@ -2717,6 +3177,14 @@ where
             .ok_or("partition request names an unprepared bank")?
             .gated()
             .ok_or("partitioned grouped bank differs from the selected routed equation")?;
+        if realization.unit_is_replicated(request.layer) {
+            let result = self
+                .provider
+                .forward_grouped(resident_bank, request, context)
+                .map_err(crate::RoutedTextExecutionError::from_error);
+            return self.agree_replicated(result);
+        }
+
         let (input_shape, input, scores, coefficients, packing) =
             prepare_partition_route_inputs::<B, eredu_nn::GroupedGatedProductSpec>(
                 realization,
@@ -2732,14 +3200,16 @@ where
             self.communication_executor,
             context,
         )
-        .map_err(|error| error.to_string())?;
+        .map_err(crate::RoutedTextExecutionError::from_error)?;
         let mut forward = crate::PartitionExpertRouteExchange::new(
             &counts,
             crate::ExpertRouteExchangeDirection::Forward,
             self.communication,
             self.communication_executor,
             context,
-        );
+        )
+        .with_provider_tensor_group(self.tensor_group)
+        .with_provider_wave_group(self.wave_group);
         let mut reverse = crate::PartitionExpertRouteExchange::new(
             &counts,
             crate::ExpertRouteExchangeDirection::Reverse,
@@ -2749,6 +3219,7 @@ where
         );
         let reduction = resident_bank.spec().reduction();
         let mut local = LocalAddressableExpertProvider::<B, Provider> {
+            unit_observer: request.unit_observer,
             provider: self.provider,
             resident_bank,
             partitions: self.partitions,
@@ -2774,23 +3245,36 @@ where
             &mut reverse,
             &mut local,
         )
-        .map_err(|error| error.to_string())?
+        .map_err(crate::RoutedTextExecutionError::from_error)?
         .reshape(&input_shape, context)
-        .map_err(|error| error.to_string())
+        .map_err(crate::RoutedTextExecutionError::from_error)
     }
 
     fn forward_linear_routed(
         &mut self,
         resident_bank: &mut B::LinearGroups,
-        request: eredu_runtime::RoutedExpertRequest<'_, B::Tensor>,
+        request: eredu_runtime::RoutedExpertRequest<'_, '_, B::Tensor>,
         context: &<B::Tensor as eredu_nn::Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error> {
+        if request.unit_observer.is_some() {
+            return Err(crate::RoutedTextExecutionError::from_error(
+                eredu_nn::GroupedUnitError::Unavailable,
+            ));
+        }
         let realization = self
             .realizations
             .get(&request.bank)
             .ok_or("partition request names an unprepared bank")?
             .linear()
             .ok_or("partitioned grouped bank differs from the selected routed equation")?;
+        if realization.unit_is_replicated(request.layer) {
+            let result = self
+                .provider
+                .forward_linear_routed(resident_bank, request, context)
+                .map_err(crate::RoutedTextExecutionError::from_error);
+            return self.agree_replicated(result);
+        }
+
         let (mut input_shape, input, scores, coefficients, packing) =
             prepare_partition_route_inputs::<B, eredu_nn::GroupedLinearSpec>(
                 realization,
@@ -2806,14 +3290,16 @@ where
             self.communication_executor,
             context,
         )
-        .map_err(|error| error.to_string())?;
+        .map_err(crate::RoutedTextExecutionError::from_error)?;
         let mut forward = crate::PartitionExpertRouteExchange::new(
             &counts,
             crate::ExpertRouteExchangeDirection::Forward,
             self.communication,
             self.communication_executor,
             context,
-        );
+        )
+        .with_provider_tensor_group(self.tensor_group)
+        .with_provider_wave_group(self.wave_group);
         let mut reverse = crate::PartitionExpertRouteExchange::new(
             &counts,
             crate::ExpertRouteExchangeDirection::Reverse,
@@ -2851,15 +3337,15 @@ where
             &mut reverse,
             &mut local,
         )
-        .map_err(|error| error.to_string())?
+        .map_err(crate::RoutedTextExecutionError::from_error)?
         .reshape(&input_shape, context)
-        .map_err(|error| error.to_string())
+        .map_err(crate::RoutedTextExecutionError::from_error)
     }
 
     fn forward_relu2_routed(
         &mut self,
         resident_bank: &mut B::Relu2Groups,
-        request: eredu_runtime::RoutedExpertRequest<'_, B::Tensor>,
+        request: eredu_runtime::RoutedExpertRequest<'_, '_, B::Tensor>,
         context: &<B::Tensor as eredu_nn::Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error> {
         let realization = self
@@ -2868,6 +3354,14 @@ where
             .ok_or("partition request names an unprepared bank")?
             .relu2()
             .ok_or("partitioned ReLU2 bank differs from the selected routed equation")?;
+        if realization.unit_is_replicated(request.layer) {
+            let result = self
+                .provider
+                .forward_relu2_routed(resident_bank, request, context)
+                .map_err(crate::RoutedTextExecutionError::from_error);
+            return self.agree_replicated(result);
+        }
+
         let (input_shape, input, scores, coefficients, packing) =
             prepare_partition_route_inputs::<B, eredu_nn::GroupedRelu2Spec>(
                 realization,
@@ -2883,14 +3377,16 @@ where
             self.communication_executor,
             context,
         )
-        .map_err(|error| error.to_string())?;
+        .map_err(crate::RoutedTextExecutionError::from_error)?;
         let mut forward = crate::PartitionExpertRouteExchange::new(
             &counts,
             crate::ExpertRouteExchangeDirection::Forward,
             self.communication,
             self.communication_executor,
             context,
-        );
+        )
+        .with_provider_tensor_group(self.tensor_group)
+        .with_provider_wave_group(self.wave_group);
         let mut reverse = crate::PartitionExpertRouteExchange::new(
             &counts,
             crate::ExpertRouteExchangeDirection::Reverse,
@@ -2900,6 +3396,7 @@ where
         );
         let reduction = eredu_nn::GroupReduction::Sum;
         let mut local = LocalAddressableRelu2ExpertProvider::<B, Provider> {
+            unit_observer: request.unit_observer,
             provider: self.provider,
             resident_bank,
             partitions: self.partitions,
@@ -2925,9 +3422,9 @@ where
             &mut reverse,
             &mut local,
         )
-        .map_err(|error| error.to_string())?
+        .map_err(crate::RoutedTextExecutionError::from_error)?
         .reshape(&input_shape, context)
-        .map_err(|error| error.to_string())
+        .map_err(crate::RoutedTextExecutionError::from_error)
     }
 }
 
@@ -2936,7 +3433,8 @@ impl<B, Provider, Movement, G, R, I> eredu_runtime::TensorParallelRoutedExpertPr
 where
     B: eredu_nn::TensorParallelGroupedNeuralBackend
         + eredu_runtime::EvenGatherBackend
-        + eredu_runtime::VariableAllToAllBackend,
+        + eredu_runtime::VariableAllToAllBackend
+        + eredu_runtime::FailureAgreementBackend,
     Provider: eredu_runtime::TensorParallelRoutedExpertProvider<B>,
     Provider::Error: std::fmt::Display,
     Movement: eredu_runtime::ExpertRouteTensorMovement<B::Tensor>,
@@ -2948,7 +3446,7 @@ where
     fn forward_grouped_tensor_parallel(
         &mut self,
         resident_bank: &mut B::GatedProductGroups,
-        request: eredu_runtime::RoutedExpertRequest<'_, B::Tensor>,
+        request: eredu_runtime::RoutedExpertRequest<'_, '_, B::Tensor>,
         _partitions: usize,
         context: &<B::Tensor as eredu_nn::Tensor>::Context,
     ) -> Result<eredu_runtime::RoutedExpertTensorParallelOutput<B::Tensor>, Self::Error> {
@@ -2958,6 +3456,14 @@ where
             .ok_or("partition request names an unprepared bank")?
             .gated()
             .ok_or("partitioned grouped bank differs from the selected routed equation")?;
+        if realization.unit_is_replicated(request.layer) {
+            let result = self
+                .provider
+                .forward_grouped_tensor_parallel(resident_bank, request, self.partitions, context)
+                .map_err(crate::RoutedTextExecutionError::from_error);
+            return self.agree_replicated(result);
+        }
+
         let input_shape = request.input.shape().to_vec();
         let route_shape = request.routes.group_indices().shape().to_vec();
         let hidden = *input_shape
@@ -2980,18 +3486,18 @@ where
         let input = request
             .input
             .reshape(&[rows, hidden], context)
-            .map_err(|error| error.to_string())?;
+            .map_err(crate::RoutedTextExecutionError::from_error)?;
         let reshape_routes = |value: &B::Tensor| {
             value
                 .reshape(&[rows, routes], context)
-                .map_err(|error| error.to_string())
+                .map_err(crate::RoutedTextExecutionError::from_error)
         };
         let indices = reshape_routes(request.routes.group_indices())?;
         let scores = reshape_routes(request.routes.selected_scores())?;
         let coefficients = reshape_routes(request.routes.coefficients())?;
         let global_experts = indices
             .to_i32_vec(context)
-            .map_err(|error| error.to_string())?
+            .map_err(crate::RoutedTextExecutionError::from_error)?
             .into_iter()
             .map(|value| usize::try_from(value).map_err(|_| "negative routed expert identity"))
             .collect::<Result<Vec<_>, _>>()?;
@@ -3001,7 +3507,7 @@ where
             usize::try_from(routes).map_err(|_| "route cardinality is negative")?,
             &global_experts,
         )
-        .map_err(|error| error.to_string())?;
+        .map_err(crate::RoutedTextExecutionError::from_error)?;
         let counts = crate::agree_expert_route_counts::<B, G, R, I>(
             self.expert_group,
             realization.expert_parallel_rank(),
@@ -3010,14 +3516,16 @@ where
             self.communication_executor,
             context,
         )
-        .map_err(|error| error.to_string())?;
+        .map_err(crate::RoutedTextExecutionError::from_error)?;
         let mut forward = crate::PartitionExpertRouteExchange::new(
             &counts,
             crate::ExpertRouteExchangeDirection::Forward,
             self.communication,
             self.communication_executor,
             context,
-        );
+        )
+        .with_provider_tensor_group(self.tensor_group)
+        .with_provider_wave_group(self.wave_group);
         let mut reverse = crate::PartitionExpertRouteExchange::new(
             &counts,
             crate::ExpertRouteExchangeDirection::Reverse,
@@ -3027,6 +3535,7 @@ where
         );
         let reduction = resident_bank.spec().reduction();
         let mut local = LocalAddressableExpertProvider::<B, Provider> {
+            unit_observer: request.unit_observer,
             provider: self.provider,
             resident_bank,
             partitions: self.partitions,
@@ -3052,21 +3561,21 @@ where
             &mut reverse,
             &mut local,
         )
-        .map_err(|error| error.to_string())?;
+        .map_err(crate::RoutedTextExecutionError::from_error)?;
         match output {
             eredu_runtime::RoutedExpertTensorParallelOutput::Complete(output) => output
                 .reshape(&input_shape, context)
                 .map(eredu_runtime::RoutedExpertTensorParallelOutput::Complete)
-                .map_err(|error| error.to_string()),
+                .map_err(crate::RoutedTextExecutionError::from_error),
             eredu_runtime::RoutedExpertTensorParallelOutput::Partial(output) => {
                 let (reducible, post_reduce) = output.into_parts();
                 let reducible = reducible
                     .reshape(&input_shape, context)
-                    .map_err(|error| error.to_string())?;
+                    .map_err(crate::RoutedTextExecutionError::from_error)?;
                 let post_reduce = post_reduce
                     .map(|value| value.reshape(&input_shape, context))
                     .transpose()
-                    .map_err(|error| error.to_string())?;
+                    .map_err(crate::RoutedTextExecutionError::from_error)?;
                 Ok(eredu_runtime::RoutedExpertTensorParallelOutput::Partial(
                     eredu_nn::TensorParallelGroupedOutput::new(reducible, post_reduce),
                 ))
@@ -3077,7 +3586,7 @@ where
     fn forward_relu2_routed_tensor_parallel(
         &mut self,
         resident_bank: &mut B::Relu2Groups,
-        request: eredu_runtime::RoutedExpertRequest<'_, B::Tensor>,
+        request: eredu_runtime::RoutedExpertRequest<'_, '_, B::Tensor>,
         _partitions: usize,
         context: &<B::Tensor as eredu_nn::Tensor>::Context,
     ) -> Result<eredu_runtime::RoutedExpertTensorParallelOutput<B::Tensor>, Self::Error> {
@@ -3087,6 +3596,19 @@ where
             .ok_or("partition request names an unprepared bank")?
             .relu2()
             .ok_or("partitioned ReLU2 bank differs from the selected routed equation")?;
+        if realization.unit_is_replicated(request.layer) {
+            let result = self
+                .provider
+                .forward_relu2_routed_tensor_parallel(
+                    resident_bank,
+                    request,
+                    self.partitions,
+                    context,
+                )
+                .map_err(crate::RoutedTextExecutionError::from_error);
+            return self.agree_replicated(result);
+        }
+
         let input_shape = request.input.shape().to_vec();
         let route_shape = request.routes.group_indices().shape().to_vec();
         let hidden = *input_shape
@@ -3109,18 +3631,18 @@ where
         let input = request
             .input
             .reshape(&[rows, hidden], context)
-            .map_err(|error| error.to_string())?;
+            .map_err(crate::RoutedTextExecutionError::from_error)?;
         let reshape_routes = |value: &B::Tensor| {
             value
                 .reshape(&[rows, routes], context)
-                .map_err(|error| error.to_string())
+                .map_err(crate::RoutedTextExecutionError::from_error)
         };
         let indices = reshape_routes(request.routes.group_indices())?;
         let scores = reshape_routes(request.routes.selected_scores())?;
         let coefficients = reshape_routes(request.routes.coefficients())?;
         let global_experts = indices
             .to_i32_vec(context)
-            .map_err(|error| error.to_string())?
+            .map_err(crate::RoutedTextExecutionError::from_error)?
             .into_iter()
             .map(|value| usize::try_from(value).map_err(|_| "negative routed expert identity"))
             .collect::<Result<Vec<_>, _>>()?;
@@ -3130,7 +3652,7 @@ where
             usize::try_from(routes).map_err(|_| "route cardinality is negative")?,
             &global_experts,
         )
-        .map_err(|error| error.to_string())?;
+        .map_err(crate::RoutedTextExecutionError::from_error)?;
         let counts = crate::agree_expert_route_counts::<B, G, R, I>(
             self.expert_group,
             realization.expert_parallel_rank(),
@@ -3139,14 +3661,16 @@ where
             self.communication_executor,
             context,
         )
-        .map_err(|error| error.to_string())?;
+        .map_err(crate::RoutedTextExecutionError::from_error)?;
         let mut forward = crate::PartitionExpertRouteExchange::new(
             &counts,
             crate::ExpertRouteExchangeDirection::Forward,
             self.communication,
             self.communication_executor,
             context,
-        );
+        )
+        .with_provider_tensor_group(self.tensor_group)
+        .with_provider_wave_group(self.wave_group);
         let mut reverse = crate::PartitionExpertRouteExchange::new(
             &counts,
             crate::ExpertRouteExchangeDirection::Reverse,
@@ -3156,6 +3680,7 @@ where
         );
         let reduction = eredu_nn::GroupReduction::Sum;
         let mut local = LocalAddressableRelu2ExpertProvider::<B, Provider> {
+            unit_observer: request.unit_observer,
             provider: self.provider,
             resident_bank,
             partitions: self.partitions,
@@ -3181,21 +3706,21 @@ where
             &mut reverse,
             &mut local,
         )
-        .map_err(|error| error.to_string())?;
+        .map_err(crate::RoutedTextExecutionError::from_error)?;
         match output {
             eredu_runtime::RoutedExpertTensorParallelOutput::Complete(output) => output
                 .reshape(&input_shape, context)
                 .map(eredu_runtime::RoutedExpertTensorParallelOutput::Complete)
-                .map_err(|error| error.to_string()),
+                .map_err(crate::RoutedTextExecutionError::from_error),
             eredu_runtime::RoutedExpertTensorParallelOutput::Partial(output) => {
                 let (reducible, post_reduce) = output.into_parts();
                 let reducible = reducible
                     .reshape(&input_shape, context)
-                    .map_err(|error| error.to_string())?;
+                    .map_err(crate::RoutedTextExecutionError::from_error)?;
                 let post_reduce = post_reduce
                     .map(|value| value.reshape(&input_shape, context))
                     .transpose()
-                    .map_err(|error| error.to_string())?;
+                    .map_err(crate::RoutedTextExecutionError::from_error)?;
                 Ok(eredu_runtime::RoutedExpertTensorParallelOutput::Partial(
                     eredu_nn::TensorParallelGroupedOutput::new(reducible, post_reduce),
                 ))
@@ -3213,13 +3738,14 @@ where
         > + eredu_runtime::CommunicationBackend
         + eredu_nn::TensorParallelGroupedNeuralBackend
         + eredu_runtime::EvenGatherBackend
-        + eredu_runtime::VariableAllToAllBackend,
+        + eredu_runtime::VariableAllToAllBackend
+        + eredu_runtime::FailureAgreementBackend,
     S: eredu_runtime::RuntimeState<B>,
     A: eredu_runtime::PartitionedLayeredArchitecture<B, S, Error = eredu_nn::Error>
         + eredu_runtime::ParallelRoutedLayeredArchitecture<B, S>
         + 'static,
     P: eredu_runtime::LayerwisePolicy<B, A::Unit>,
-    P::Error: std::fmt::Display,
+    P::Error: std::error::Error + Send + Sync + 'static,
     Provider: eredu_runtime::TensorParallelRoutedExpertProvider<B>,
     Provider::Error: std::fmt::Display,
     Movement: eredu_runtime::ExpertRouteTensorMovement<B::Tensor>,
@@ -3230,6 +3756,25 @@ where
     B::ParallelContext: Sized,
 {
     type Pass<'a> = RoutedPartitionPass<'a, A, B, S>;
+
+    fn observation_hooks(&self) -> eredu_runtime::inspection::ObservationHookSupport {
+        let architecture = self.runtime.architecture();
+        if self
+            .parallel
+            .as_ref()
+            .is_some_and(|parallel| B::parallel_size(parallel) > 1)
+        {
+            architecture
+                .parallel_observation_hooks()
+                .with_units(architecture.parallel_routed_unit_observations())
+                .with_routed_units(architecture.parallel_routed_sparse_observations())
+        } else {
+            architecture
+                .observation_hooks()
+                .with_units(architecture.routed_unit_observations())
+                .with_routed_units(architecture.routed_sparse_observations())
+        }
+    }
 
     fn begin<'a>(
         &mut self,
@@ -3274,12 +3819,39 @@ where
                 "routed partition executor requires one complete input/output partition",
             ));
         }
+        if self
+            .parallel
+            .as_ref()
+            .is_some_and(|parallel| B::parallel_size(parallel) > 1)
+            && self.tensor_group.is_none()
+        {
+            return Err(eredu_nn::Error::backend(
+                "routed provider has no selected tensor agreement group",
+            ));
+        }
         let input = pass
             .input
             .take()
             .ok_or_else(|| eredu_nn::Error::backend("routed partition executed more than once"))?;
         let expert_pass = pass.expert_pass;
-        let provider = &mut self.provider;
+        let tensor_group = self.tensor_group;
+        let plain_group = self
+            .expert_group
+            .is_none()
+            .then_some(tensor_group)
+            .flatten();
+        let mut agreed_provider = eredu_runtime::expert::AgreeingRoutedExpertProvider::new(
+            &mut self.provider,
+            |success| {
+                agree_provider_tensor_work(
+                    communication,
+                    communication_executor,
+                    plain_group,
+                    success,
+                )
+            },
+        );
+        let provider = &mut agreed_provider;
         let realizations = &self.realizations;
         let expert_group = self.expert_group;
         let movement = &mut self.movement;
@@ -3293,7 +3865,7 @@ where
                 .as_ref()
                 .expect("routed tensor-parallel branch checked the selected context");
             self.runtime
-                .forward_parallel_with_unit_executor_and_context_hook(
+                .forward_parallel_with_internal_observer_and_context(
                     input,
                     state,
                     parallel,
@@ -3306,115 +3878,107 @@ where
                      state,
                      forward,
                      parallel,
-                     context| {
-                        let path = architecture.unit_path(group, index)?;
-                        let input = eredu_runtime::observe_and_intervene(
-                            observer,
-                            &format!("{path}.input"),
-                            hidden,
-                        )?;
+                     context,
+                     observer| {
                         let output = if let Some(expert_group) = expert_group {
                             let mut exchange = PartitionRoutedExpertProvider {
                                 provider,
                                 realizations,
                                 expert_group,
+                                tensor_group,
+                                wave_group: None,
                                 movement,
                                 communication,
                                 communication_executor,
                                 partitions: B::parallel_size(parallel),
                                 context,
                             };
-                            architecture.forward_unit_parallel_with_provider(
+                            architecture.forward_unit_parallel_observed_with_provider(
                                 group,
                                 index,
                                 unit,
-                                &input,
+                                hidden,
                                 state,
                                 forward,
                                 expert_pass,
                                 &mut exchange,
                                 parallel,
                                 context,
+                                observer,
                             )?
                         } else {
-                            architecture.forward_unit_parallel_with_provider(
+                            architecture.forward_unit_parallel_observed_with_provider(
                                 group,
                                 index,
                                 unit,
-                                &input,
+                                hidden,
                                 state,
                                 forward,
                                 expert_pass,
                                 provider,
                                 parallel,
                                 context,
+                                observer,
                             )?
                         };
-                        eredu_runtime::observe_and_intervene(
-                            observer,
-                            &format!("{path}.output"),
-                            &output,
-                        )
+                        Ok(output)
                     },
-                    |_, _, _| Ok(()),
+                    observer,
                 )
         } else {
-            self.runtime.forward_with_unit_executor_and_context_hook(
+            self.runtime.forward_with_internal_observer_and_context(
                 input,
                 state,
                 context,
-                |architecture, group, index, unit, hidden, state, forward, context| {
-                    let path = architecture.unit_path(group, index)?;
-                    let input = eredu_runtime::observe_and_intervene(
-                        observer,
-                        &format!("{path}.input"),
-                        hidden,
-                    )?;
+                |architecture, group, index, unit, hidden, state, forward, context, observer| {
                     let output = if let Some(expert_group) = expert_group {
                         let mut exchange = PartitionRoutedExpertProvider {
                             provider,
                             realizations,
                             expert_group,
+                            tensor_group,
+                            wave_group: None,
                             movement,
                             communication,
                             communication_executor,
                             partitions: 1,
                             context,
                         };
-                        architecture.forward_unit_with_provider(
+                        architecture.forward_unit_observed_with_provider(
                             group,
                             index,
                             unit,
-                            &input,
+                            hidden,
                             state,
                             forward,
                             expert_pass,
                             &mut exchange,
                             context,
+                            observer,
                         )?
                     } else {
-                        architecture.forward_unit_with_provider(
+                        architecture.forward_unit_observed_with_provider(
                             group,
                             index,
                             unit,
-                            &input,
+                            hidden,
                             state,
                             forward,
                             expert_pass,
                             provider,
                             context,
+                            observer,
                         )?
                     };
-                    eredu_runtime::observe_and_intervene(
-                        observer,
-                        &format!("{path}.output"),
-                        &output,
-                    )
+                    Ok(output)
                 },
-                |_, _, _| Ok(()),
+                observer,
             )
         }
-        .map_err(|error| eredu_nn::Error::backend(error.to_string()))?;
+        .map_err(|error| match error {
+            eredu_runtime::LayerwiseRuntimeError::Architecture(error) => error,
+            other => eredu_nn::Error::backend_source(other),
+        })?;
         pass.output = Some(output);
         Ok(())
     }
@@ -3501,6 +4065,8 @@ pub enum RoutedExpertWaveOperation {
     ForwardScores,
     /// Send final route coefficients to their selected owners.
     ForwardCoefficients,
+    /// Agrees local provider success before any reverse route exchange.
+    ProviderSuccessAgreement,
     /// Return the tensor-parallel reducible activation contribution.
     ReverseOutput,
     /// Return one replicated post-reduction bias contribution.
@@ -3565,12 +4131,22 @@ impl RoutedExpertUnitWave {
             RoutedExpertWaveOperation::ForwardInput,
             RoutedExpertWaveOperation::ForwardScores,
             RoutedExpertWaveOperation::ForwardCoefficients,
+            RoutedExpertWaveOperation::ProviderSuccessAgreement,
             RoutedExpertWaveOperation::ReverseOutput,
         ];
         if tensor_partitions > 1 && post_bias {
             operations.push(RoutedExpertWaveOperation::ReversePostReduceBias);
         }
         operations.push(RoutedExpertWaveOperation::ReverseRouteTags);
+        let replicated = match plan {
+            RoutedGroupedPlan::Gated(plan) => plan.unit_is_replicated(unit),
+            RoutedGroupedPlan::Relu2(plan) => plan.unit_is_replicated(unit),
+            RoutedGroupedPlan::Linear(plan) => plan.unit_is_replicated(unit),
+        };
+        if replicated {
+            operations = vec![RoutedExpertWaveOperation::ProviderSuccessAgreement];
+        }
+
         Ok(Self {
             bank: Some(bank),
             unit,
@@ -3951,6 +4527,7 @@ where
                     RoutedExpertWaveOperation::ForwardInput,
                     RoutedExpertWaveOperation::ForwardScores,
                     RoutedExpertWaveOperation::ForwardCoefficients,
+                    RoutedExpertWaveOperation::ProviderSuccessAgreement,
                     RoutedExpertWaveOperation::ReverseOutput,
                 ];
                 // The complete (non-TP) expert equation applies its down bias before
@@ -3960,6 +4537,9 @@ where
                     operations.push(RoutedExpertWaveOperation::ReversePostReduceBias);
                 }
                 operations.push(RoutedExpertWaveOperation::ReverseRouteTags);
+                if realization.unit_is_replicated(unit) {
+                    operations = vec![RoutedExpertWaveOperation::ProviderSuccessAgreement];
+                }
                 waves.push(RoutedExpertUnitWave {
                     bank: Some(eredu_runtime::RoutedBankId::new(0)),
                     output_width: hidden_width,
@@ -4026,6 +4606,7 @@ fn participate_inactive_routed_wave<B, G, R, I, F>(
     expert_group: eredu_core::CollectiveGroupId,
     collective_waves: &RoutedExpertCollectiveWaveSchedule,
     tensor_group: Option<eredu_core::CollectiveGroupId>,
+    wave_group: eredu_core::CollectiveGroupId,
     wave: usize,
     communication: &eredu_runtime::PartitionCommunication<B, G, R, I>,
     communication_executor: &B::Executor,
@@ -4044,6 +4625,7 @@ where
         + eredu_nn::TensorParallelGroupedNeuralBackend
         + eredu_runtime::EvenGatherBackend
         + eredu_runtime::VariableAllToAllBackend
+        + eredu_runtime::FailureAgreementBackend
         + eredu_runtime::SumReductionBackend
         + eredu_runtime::UnevenGatherBackend,
     F: PartitionTensorAllocator<B>,
@@ -4071,7 +4653,7 @@ where
                 communication
                     .all_reduce_sum(value, group, communication_executor)
                     .map(|_| ())
-                    .map_err(|error| eredu_nn::Error::backend(error.to_string()))?;
+                    .map_err(eredu_nn::Error::backend_source)?;
             }
         }};
     }
@@ -4094,7 +4676,7 @@ where
                         .collect::<Result<Vec<_>, _>>()?;
                     communication
                         .all_reduce_sum_wave(values, group, communication_executor)
-                        .map_err(|error| eredu_nn::Error::backend(error.to_string()))?;
+                        .map_err(eredu_nn::Error::backend_source)?;
                 }
                 None => reduce!(stage.first().map_or(0, RoutedExpertUnitWave::hidden_width)),
             }
@@ -4105,6 +4687,26 @@ where
             reduce!(unit.hidden_width());
         }
         if unit.operations().is_empty() {
+            for _ in 0..unit.tensor_reductions_after() {
+                reduce!(unit.hidden_width());
+            }
+            continue;
+        }
+        if unit.operations() == [RoutedExpertWaveOperation::ProviderSuccessAgreement] {
+            let agreed = crate::expert_residency::agree_partition_provider_work(
+                communication,
+                communication_executor,
+                tensor_group,
+                expert_group,
+                Some(wave_group),
+                true,
+            )
+            .map_err(eredu_nn::Error::backend_source)?;
+            if !agreed {
+                return Err(eredu_nn::Error::backend_source(
+                    crate::RoutedMechanismExecutionError::ProviderRejected,
+                ));
+            }
             for _ in 0..unit.tensor_reductions_after() {
                 reduce!(unit.hidden_width());
             }
@@ -4130,14 +4732,16 @@ where
             communication_executor,
             context,
         )
-        .map_err(|error| eredu_nn::Error::backend(error.to_string()))?;
+        .map_err(eredu_nn::Error::backend_source)?;
         let mut forward = crate::PartitionExpertRouteExchange::new(
             &counts,
             crate::ExpertRouteExchangeDirection::Forward,
             communication,
             communication_executor,
             context,
-        );
+        )
+        .with_provider_tensor_group(tensor_group)
+        .with_provider_wave_group(Some(wave_group));
         let mut reverse = crate::PartitionExpertRouteExchange::new(
             &counts,
             crate::ExpertRouteExchangeDirection::Reverse,
@@ -4163,7 +4767,7 @@ where
                         counts.forward(),
                         Vec::new(),
                     )
-                    .map_err(|error| eredu_nn::Error::backend(error.to_string()))?;
+                    .map_err(eredu_nn::Error::backend_source)?;
                 }
                 RoutedExpertWaveOperation::ForwardInput => {
                     let empty = allocator.tensor_placeholder(
@@ -4177,7 +4781,7 @@ where
                         counts.forward(),
                         empty,
                     )
-                    .map_err(|error| eredu_nn::Error::backend(error.to_string()))?;
+                    .map_err(eredu_nn::Error::backend_source)?;
                 }
                 RoutedExpertWaveOperation::ForwardScores
                 | RoutedExpertWaveOperation::ForwardCoefficients => {
@@ -4192,7 +4796,19 @@ where
                         counts.forward(),
                         empty,
                     )
-                    .map_err(|error| eredu_nn::Error::backend(error.to_string()))?;
+                    .map_err(eredu_nn::Error::backend_source)?;
+                }
+                RoutedExpertWaveOperation::ProviderSuccessAgreement => {
+                    if !eredu_runtime::ExpertRouteExchange::agree_provider_success(
+                        &mut forward,
+                        true,
+                    )
+                    .map_err(eredu_nn::Error::backend_source)?
+                    {
+                        return Err(eredu_nn::Error::backend_source(
+                            crate::RoutedMechanismExecutionError::ProviderRejected,
+                        ));
+                    }
                 }
                 RoutedExpertWaveOperation::ReverseOutput
                 | RoutedExpertWaveOperation::ReversePostReduceBias => {
@@ -4212,7 +4828,7 @@ where
                         counts.reverse(),
                         empty,
                     )
-                    .map_err(|error| eredu_nn::Error::backend(error.to_string()))?;
+                    .map_err(eredu_nn::Error::backend_source)?;
                 }
                 RoutedExpertWaveOperation::ReverseRouteTags => {
                     eredu_runtime::ExpertRouteExchange::exchange_indices(
@@ -4220,7 +4836,7 @@ where
                         counts.reverse(),
                         Vec::new(),
                     )
-                    .map_err(|error| eredu_nn::Error::backend(error.to_string()))?;
+                    .map_err(eredu_nn::Error::backend_source)?;
                 }
             }
         }
@@ -4250,7 +4866,7 @@ where
                     group,
                     communication_executor,
                 )
-                .map_err(|error| eredu_nn::Error::backend(error.to_string()))?;
+                .map_err(eredu_nn::Error::backend_source)?;
         }
     }
     Ok(())
@@ -4270,6 +4886,16 @@ where
     A: TextPartitionArchitecture<B, S>,
     B::ParallelContext: Sized,
 {
+    /// Whether this strategy forwards internal observation callbacks to its unit.
+    fn emits_internal_observations(&self, _architecture: &A, _tensor_parallel: bool) -> bool {
+        false
+    }
+
+    /// Sparse provider coverage of this strategy's actual unit call.
+    fn emits_routed_observations(&self, _architecture: &A, _tensor_parallel: bool) -> bool {
+        false
+    }
+
     /// Whether this strategy selects collective waves on inactive stages.
     fn has_cross_stage_collective_waves(&self) -> bool {
         false
@@ -4295,6 +4921,99 @@ where
         G: Borrow<B::CommunicationGroup>,
         R: Borrow<B::CommunicationRoute>,
         I: eredu_runtime::CommunicationTensorMetadata<B>;
+
+    /// Executes internal component boundaries through the selected unit strategy.
+    /// Strategies with specialized providers override this alongside their ordinary call.
+    #[allow(clippy::too_many_arguments)]
+    fn forward_unit_observed<G, R, I, O>(
+        &mut self,
+        architecture: &mut A,
+        address: eredu_runtime::ExecutionUnitAddress,
+        unit: &mut A::Unit,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &mut A::ForwardContext,
+        pass: eredu_runtime::ExpertPass,
+        parallel: Option<&B::ParallelContext>,
+        communication: &eredu_runtime::PartitionCommunication<B, G, R, I>,
+        communication_executor: &B::Executor,
+        context: &<B::Tensor as eredu_nn::Tensor>::Context,
+        _observer: &mut O,
+    ) -> Result<B::Tensor, A::Error>
+    where
+        G: Borrow<B::CommunicationGroup>,
+        R: Borrow<B::CommunicationRoute>,
+        I: eredu_runtime::CommunicationTensorMetadata<B>,
+        O: eredu_runtime::ActivationObserver<B::Tensor, A::Error> + ?Sized,
+    {
+        self.forward_unit(
+            architecture,
+            address,
+            unit,
+            hidden,
+            state,
+            forward,
+            pass,
+            parallel,
+            communication,
+            communication_executor,
+            context,
+        )
+    }
+
+    /// Shares provider selection between ordinary and observed strategy execution.
+    #[allow(clippy::too_many_arguments)]
+    fn forward_unit_with_optional_observer<G, R, I, O>(
+        &mut self,
+        architecture: &mut A,
+        address: eredu_runtime::ExecutionUnitAddress,
+        unit: &mut A::Unit,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &mut A::ForwardContext,
+        pass: eredu_runtime::ExpertPass,
+        parallel: Option<&B::ParallelContext>,
+        communication: &eredu_runtime::PartitionCommunication<B, G, R, I>,
+        communication_executor: &B::Executor,
+        context: &<B::Tensor as eredu_nn::Tensor>::Context,
+        observer: Option<&mut O>,
+    ) -> Result<B::Tensor, A::Error>
+    where
+        G: Borrow<B::CommunicationGroup>,
+        R: Borrow<B::CommunicationRoute>,
+        I: eredu_runtime::CommunicationTensorMetadata<B>,
+        O: eredu_runtime::ActivationObserver<B::Tensor, A::Error> + ?Sized,
+    {
+        match observer {
+            Some(observer) => self.forward_unit_observed(
+                architecture,
+                address,
+                unit,
+                hidden,
+                state,
+                forward,
+                pass,
+                parallel,
+                communication,
+                communication_executor,
+                context,
+                observer,
+            ),
+            None => self.forward_unit(
+                architecture,
+                address,
+                unit,
+                hidden,
+                state,
+                forward,
+                pass,
+                parallel,
+                communication,
+                communication_executor,
+                context,
+            ),
+        }
+    }
 
     /// Submits architecture-selected zero work for an inactive pipeline stage.
     ///
@@ -4337,6 +5056,16 @@ where
     A: TextPartitionArchitecture<B, S>,
     B::ParallelContext: Sized,
 {
+    fn emits_internal_observations(&self, _architecture: &A, _tensor_parallel: bool) -> bool {
+        true
+    }
+
+    fn emits_routed_observations(&self, architecture: &A, tensor_parallel: bool) -> bool {
+        architecture
+            .partition_observation_hooks(tensor_parallel)
+            .supports(eredu_runtime::inspection::ObservationHookSite::RoutedUnits)
+    }
+
     fn forward_unit<G, R, I>(
         &mut self,
         architecture: &mut A,
@@ -4378,6 +5107,52 @@ where
             ),
         }
     }
+
+    fn forward_unit_observed<G, R, I, O>(
+        &mut self,
+        architecture: &mut A,
+        address: eredu_runtime::ExecutionUnitAddress,
+        unit: &mut A::Unit,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &mut A::ForwardContext,
+        _pass: eredu_runtime::ExpertPass,
+        parallel: Option<&B::ParallelContext>,
+        _communication: &eredu_runtime::PartitionCommunication<B, G, R, I>,
+        _communication_executor: &B::Executor,
+        context: &<B::Tensor as eredu_nn::Tensor>::Context,
+        observer: &mut O,
+    ) -> Result<B::Tensor, A::Error>
+    where
+        G: Borrow<B::CommunicationGroup>,
+        R: Borrow<B::CommunicationRoute>,
+        I: eredu_runtime::CommunicationTensorMetadata<B>,
+        O: eredu_runtime::ActivationObserver<B::Tensor, A::Error> + ?Sized,
+    {
+        match parallel {
+            Some(parallel) => architecture.forward_unit_parallel_observed(
+                address.group(),
+                address.index(),
+                unit,
+                hidden,
+                state,
+                forward,
+                parallel,
+                context,
+                observer,
+            ),
+            None => architecture.forward_unit_observed(
+                address.group(),
+                address.index(),
+                unit,
+                hidden,
+                state,
+                forward,
+                context,
+                observer,
+            ),
+        }
+    }
 }
 
 /// Provider-backed routed per-unit pipeline execution.
@@ -4387,6 +5162,7 @@ pub struct RoutedPipelinePartitionUnitStrategy<Provider, Movement> {
     expert_group: Option<eredu_core::CollectiveGroupId>,
     movement: Movement,
     tensor_group: Option<eredu_core::CollectiveGroupId>,
+    wave_group: Option<eredu_core::CollectiveGroupId>,
     collective_waves: Option<RoutedExpertCollectiveWaveSchedule>,
 }
 
@@ -4396,6 +5172,7 @@ impl<Provider, Movement> RoutedPipelinePartitionUnitStrategy<Provider, Movement>
         provider: Provider,
         realizations: BTreeMap<eredu_runtime::RoutedBankId, crate::routed_text::RoutedGroupedPlan>,
         expert_group: Option<eredu_core::CollectiveGroupId>,
+        tensor_group: Option<eredu_core::CollectiveGroupId>,
         movement: Movement,
     ) -> Self {
         Self {
@@ -4403,7 +5180,8 @@ impl<Provider, Movement> RoutedPipelinePartitionUnitStrategy<Provider, Movement>
             realizations,
             expert_group,
             movement,
-            tensor_group: None,
+            tensor_group,
+            wave_group: None,
             collective_waves: None,
         }
     }
@@ -4415,6 +5193,7 @@ impl<Provider, Movement> RoutedPipelinePartitionUnitStrategy<Provider, Movement>
         expert_group: eredu_core::CollectiveGroupId,
         movement: Movement,
         tensor_group: Option<eredu_core::CollectiveGroupId>,
+        wave_group: eredu_core::CollectiveGroupId,
         collective_waves: RoutedExpertCollectiveWaveSchedule,
     ) -> Result<Self, String> {
         if realizations.is_empty()
@@ -4443,6 +5222,7 @@ impl<Provider, Movement> RoutedPipelinePartitionUnitStrategy<Provider, Movement>
             expert_group: Some(expert_group),
             movement,
             tensor_group,
+            wave_group: Some(wave_group),
             collective_waves: Some(collective_waves),
         })
     }
@@ -4452,6 +5232,7 @@ impl<Provider, Movement> RoutedPipelinePartitionUnitStrategy<Provider, Movement>
         provider: Provider,
         realization: crate::ExpertRealizationPlan<E>,
         expert_group: Option<eredu_core::CollectiveGroupId>,
+        tensor_group: Option<eredu_core::CollectiveGroupId>,
         movement: Movement,
     ) -> Self
     where
@@ -4461,6 +5242,7 @@ impl<Provider, Movement> RoutedPipelinePartitionUnitStrategy<Provider, Movement>
             provider,
             BTreeMap::from([(eredu_runtime::RoutedBankId::new(0), realization.into())]),
             expert_group,
+            tensor_group,
             movement,
         )
     }
@@ -4471,6 +5253,7 @@ impl<Provider, Movement> RoutedPipelinePartitionUnitStrategy<Provider, Movement>
         expert_group: eredu_core::CollectiveGroupId,
         movement: Movement,
         tensor_group: Option<eredu_core::CollectiveGroupId>,
+        wave_group: eredu_core::CollectiveGroupId,
         collective_waves: RoutedExpertCollectiveWaveSchedule,
     ) -> Result<Self, String>
     where
@@ -4482,8 +5265,114 @@ impl<Provider, Movement> RoutedPipelinePartitionUnitStrategy<Provider, Movement>
             expert_group,
             movement,
             tensor_group,
+            wave_group,
             collective_waves,
         )
+    }
+}
+
+impl<Provider, Movement> RoutedPipelinePartitionUnitStrategy<Provider, Movement> {
+    fn forward_selected_unit<A, B, S, G, R, I, O>(
+        &mut self,
+        architecture: &mut A,
+        address: eredu_runtime::ExecutionUnitAddress,
+        unit: &mut A::Unit,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &mut A::ForwardContext,
+        pass: eredu_runtime::ExpertPass,
+        parallel: Option<&B::ParallelContext>,
+        communication: &eredu_runtime::PartitionCommunication<B, G, R, I>,
+        communication_executor: &B::Executor,
+        context: &<B::Tensor as eredu_nn::Tensor>::Context,
+        observer: Option<&mut O>,
+    ) -> Result<B::Tensor, A::Error>
+    where
+        B: eredu_runtime::SubmissionBackend<
+                Executor = <<B as eredu_nn::NeuralBackend>::Tensor as eredu_nn::Tensor>::Context,
+            > + eredu_runtime::CommunicationBackend
+            + eredu_nn::TensorParallelGroupedNeuralBackend
+            + eredu_runtime::EvenGatherBackend
+            + eredu_runtime::VariableAllToAllBackend
+            + eredu_runtime::FailureAgreementBackend,
+        S: eredu_runtime::RuntimeState<B>,
+        A: eredu_runtime::ParallelRoutedLayeredArchitecture<B, S, Error = eredu_nn::Error>,
+        Provider: eredu_runtime::TensorParallelRoutedExpertProvider<B>,
+        Provider::Error: std::fmt::Display,
+        Movement: eredu_runtime::ExpertRouteTensorMovement<B::Tensor>,
+        Movement::Error: std::fmt::Display,
+        B::ParallelContext: Sized,
+        G: Borrow<B::CommunicationGroup>,
+        R: Borrow<B::CommunicationRoute>,
+        I: eredu_runtime::CommunicationTensorMetadata<B>,
+        O: eredu_runtime::ActivationObserver<B::Tensor, A::Error> + ?Sized,
+    {
+        let tensor_group = self.tensor_group;
+        let plain_group = self
+            .expert_group
+            .is_none()
+            .then_some(tensor_group)
+            .flatten();
+        let mut agreed_provider = eredu_runtime::expert::AgreeingRoutedExpertProvider::new(
+            &mut self.provider,
+            |success| {
+                agree_provider_tensor_work(
+                    communication,
+                    communication_executor,
+                    plain_group,
+                    success,
+                )
+            },
+        );
+        if self.tensor_group.is_some()
+            && !parallel.is_some_and(|parallel| B::parallel_size(parallel) > 1)
+        {
+            return Err(eredu_nn::Error::backend(
+                "routed tensor collective schedule has no active TP context",
+            ));
+        }
+        let parallel = parallel.filter(|parallel| B::parallel_size(parallel) > 1);
+        if let Some(expert_group) = self.expert_group {
+            let mut exchange = PartitionRoutedExpertProvider {
+                provider: &mut agreed_provider,
+                realizations: &self.realizations,
+                expert_group,
+                tensor_group,
+                wave_group: self.wave_group,
+                movement: &mut self.movement,
+                communication,
+                communication_executor,
+                partitions: parallel.map_or(1, B::parallel_size),
+                context,
+            };
+            architecture.forward_unit_with_provider_observation(
+                address.group(),
+                address.index(),
+                unit,
+                hidden,
+                state,
+                forward,
+                pass,
+                &mut exchange,
+                parallel,
+                context,
+                observer,
+            )
+        } else {
+            architecture.forward_unit_with_provider_observation(
+                address.group(),
+                address.index(),
+                unit,
+                hidden,
+                state,
+                forward,
+                pass,
+                &mut agreed_provider,
+                parallel,
+                context,
+                observer,
+            )
+        }
     }
 }
 
@@ -4495,7 +5384,8 @@ where
         > + eredu_runtime::CommunicationBackend
         + eredu_nn::TensorParallelGroupedNeuralBackend
         + eredu_runtime::EvenGatherBackend
-        + eredu_runtime::VariableAllToAllBackend,
+        + eredu_runtime::VariableAllToAllBackend
+        + eredu_runtime::FailureAgreementBackend,
     S: eredu_runtime::RuntimeState<B>,
     A: TextPartitionArchitecture<B, S, Error = eredu_nn::Error>
         + eredu_runtime::ParallelRoutedLayeredArchitecture<B, S>,
@@ -4507,6 +5397,22 @@ where
 {
     fn has_cross_stage_collective_waves(&self) -> bool {
         self.collective_waves.is_some()
+    }
+
+    fn emits_internal_observations(&self, architecture: &A, tensor_parallel: bool) -> bool {
+        if tensor_parallel {
+            architecture.parallel_routed_unit_observations()
+        } else {
+            architecture.routed_unit_observations()
+        }
+    }
+
+    fn emits_routed_observations(&self, architecture: &A, tensor_parallel: bool) -> bool {
+        if tensor_parallel {
+            architecture.parallel_routed_sparse_observations()
+        } else {
+            architecture.routed_sparse_observations()
+        }
     }
 
     fn forward_unit<G, R, I>(
@@ -4528,92 +5434,57 @@ where
         R: Borrow<B::CommunicationRoute>,
         I: eredu_runtime::CommunicationTensorMetadata<B>,
     {
-        if let Some(expert_group) = self.expert_group {
-            let partitions = parallel.map_or(1, B::parallel_size);
-            let mut exchange = PartitionRoutedExpertProvider {
-                provider: &mut self.provider,
-                realizations: &self.realizations,
-                expert_group,
-                movement: &mut self.movement,
-                communication,
-                communication_executor,
-                partitions,
-                context,
-            };
-            if self.tensor_group.is_some() {
-                let parallel = parallel
-                    .filter(|parallel| B::parallel_size(parallel) > 1)
-                    .ok_or_else(|| {
-                        eredu_nn::Error::backend(
-                            "routed tensor collective schedule has no active TP context",
-                        )
-                    })?;
-                architecture.forward_unit_parallel_with_provider(
-                    address.group(),
-                    address.index(),
-                    unit,
-                    hidden,
-                    state,
-                    forward,
-                    pass,
-                    &mut exchange,
-                    parallel,
-                    context,
-                )
-            } else if let Some(parallel) =
-                parallel.filter(|parallel| B::parallel_size(parallel) > 1)
-            {
-                architecture.forward_unit_parallel_with_provider(
-                    address.group(),
-                    address.index(),
-                    unit,
-                    hidden,
-                    state,
-                    forward,
-                    pass,
-                    &mut exchange,
-                    parallel,
-                    context,
-                )
-            } else {
-                architecture.forward_unit_with_provider(
-                    address.group(),
-                    address.index(),
-                    unit,
-                    hidden,
-                    state,
-                    forward,
-                    pass,
-                    &mut exchange,
-                    context,
-                )
-            }
-        } else if let Some(parallel) = parallel.filter(|parallel| B::parallel_size(parallel) > 1) {
-            architecture.forward_unit_parallel_with_provider(
-                address.group(),
-                address.index(),
-                unit,
-                hidden,
-                state,
-                forward,
-                pass,
-                &mut self.provider,
-                parallel,
-                context,
-            )
-        } else {
-            architecture.forward_unit_with_provider(
-                address.group(),
-                address.index(),
-                unit,
-                hidden,
-                state,
-                forward,
-                pass,
-                &mut self.provider,
-                context,
-            )
-        }
+        self.forward_selected_unit::<A, B, S, _, _, _, _>(
+            architecture,
+            address,
+            unit,
+            hidden,
+            state,
+            forward,
+            pass,
+            parallel,
+            communication,
+            communication_executor,
+            context,
+            None::<&mut dyn eredu_runtime::ActivationObserver<B::Tensor, A::Error>>,
+        )
+    }
+
+    fn forward_unit_observed<G, R, I, O>(
+        &mut self,
+        architecture: &mut A,
+        address: eredu_runtime::ExecutionUnitAddress,
+        unit: &mut A::Unit,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &mut A::ForwardContext,
+        pass: eredu_runtime::ExpertPass,
+        parallel: Option<&B::ParallelContext>,
+        communication: &eredu_runtime::PartitionCommunication<B, G, R, I>,
+        communication_executor: &B::Executor,
+        context: &<B::Tensor as eredu_nn::Tensor>::Context,
+        observer: &mut O,
+    ) -> Result<B::Tensor, A::Error>
+    where
+        G: Borrow<B::CommunicationGroup>,
+        R: Borrow<B::CommunicationRoute>,
+        I: eredu_runtime::CommunicationTensorMetadata<B>,
+        O: eredu_runtime::ActivationObserver<B::Tensor, A::Error> + ?Sized,
+    {
+        self.forward_selected_unit::<A, B, S, _, _, _, _>(
+            architecture,
+            address,
+            unit,
+            hidden,
+            state,
+            forward,
+            pass,
+            parallel,
+            communication,
+            communication_executor,
+            context,
+            Some(observer),
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -4649,6 +5520,9 @@ where
             expert_group,
             collective_waves,
             self.tensor_group,
+            self.wave_group.ok_or_else(|| {
+                eredu_nn::Error::backend("routed wave has no selected agreement group")
+            })?,
             wave,
             communication,
             communication_executor,
@@ -4671,7 +5545,8 @@ where
         > + eredu_runtime::CommunicationBackend
         + eredu_nn::TensorParallelGroupedNeuralBackend
         + eredu_runtime::EvenGatherBackend
-        + eredu_runtime::VariableAllToAllBackend,
+        + eredu_runtime::VariableAllToAllBackend
+        + eredu_runtime::FailureAgreementBackend,
     S: eredu_runtime::RuntimeState<B>,
     A: crate::composite_execution::CompositeArchitecture<B, S, Error = eredu_nn::Error>
         + eredu_runtime::ParallelRoutedLayeredArchitecture<B, S>,
@@ -4681,6 +5556,22 @@ where
     Movement::Error: std::fmt::Display,
     B::ParallelContext: Sized,
 {
+    fn emits_internal_observations(&self, architecture: &A, tensor_parallel: bool) -> bool {
+        if tensor_parallel {
+            architecture.parallel_routed_unit_observations()
+        } else {
+            architecture.routed_unit_observations()
+        }
+    }
+
+    fn emits_routed_observations(&self, architecture: &A, tensor_parallel: bool) -> bool {
+        if tensor_parallel {
+            architecture.parallel_routed_sparse_observations()
+        } else {
+            architecture.routed_sparse_observations()
+        }
+    }
+
     fn forward_unit<G, R, I>(
         &mut self,
         architecture: &mut A,
@@ -4700,92 +5591,57 @@ where
         R: Borrow<B::CommunicationRoute>,
         I: eredu_runtime::CommunicationTensorMetadata<B>,
     {
-        if let Some(expert_group) = self.expert_group {
-            let partitions = parallel.map_or(1, B::parallel_size);
-            let mut exchange = PartitionRoutedExpertProvider {
-                provider: &mut self.provider,
-                realizations: &self.realizations,
-                expert_group,
-                movement: &mut self.movement,
-                communication,
-                communication_executor,
-                partitions,
-                context,
-            };
-            if self.tensor_group.is_some() {
-                let parallel = parallel
-                    .filter(|parallel| B::parallel_size(parallel) > 1)
-                    .ok_or_else(|| {
-                        eredu_nn::Error::backend(
-                            "routed tensor collective schedule has no active TP context",
-                        )
-                    })?;
-                architecture.forward_unit_parallel_with_provider(
-                    address.group(),
-                    address.index(),
-                    unit,
-                    hidden,
-                    state,
-                    forward,
-                    pass,
-                    &mut exchange,
-                    parallel,
-                    context,
-                )
-            } else if let Some(parallel) =
-                parallel.filter(|parallel| B::parallel_size(parallel) > 1)
-            {
-                architecture.forward_unit_parallel_with_provider(
-                    address.group(),
-                    address.index(),
-                    unit,
-                    hidden,
-                    state,
-                    forward,
-                    pass,
-                    &mut exchange,
-                    parallel,
-                    context,
-                )
-            } else {
-                architecture.forward_unit_with_provider(
-                    address.group(),
-                    address.index(),
-                    unit,
-                    hidden,
-                    state,
-                    forward,
-                    pass,
-                    &mut exchange,
-                    context,
-                )
-            }
-        } else if let Some(parallel) = parallel.filter(|parallel| B::parallel_size(parallel) > 1) {
-            architecture.forward_unit_parallel_with_provider(
-                address.group(),
-                address.index(),
-                unit,
-                hidden,
-                state,
-                forward,
-                pass,
-                &mut self.provider,
-                parallel,
-                context,
-            )
-        } else {
-            architecture.forward_unit_with_provider(
-                address.group(),
-                address.index(),
-                unit,
-                hidden,
-                state,
-                forward,
-                pass,
-                &mut self.provider,
-                context,
-            )
-        }
+        self.forward_selected_unit::<A, B, S, _, _, _, _>(
+            architecture,
+            address,
+            unit,
+            hidden,
+            state,
+            forward,
+            pass,
+            parallel,
+            communication,
+            communication_executor,
+            context,
+            None::<&mut dyn eredu_runtime::ActivationObserver<B::Tensor, A::Error>>,
+        )
+    }
+
+    fn forward_unit_observed<G, R, I, O>(
+        &mut self,
+        architecture: &mut A,
+        address: eredu_runtime::ExecutionUnitAddress,
+        unit: &mut A::Unit,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &mut A::ForwardContext,
+        pass: eredu_runtime::ExpertPass,
+        parallel: Option<&B::ParallelContext>,
+        communication: &eredu_runtime::PartitionCommunication<B, G, R, I>,
+        communication_executor: &B::Executor,
+        context: &<B::Tensor as eredu_nn::Tensor>::Context,
+        observer: &mut O,
+    ) -> Result<B::Tensor, A::Error>
+    where
+        G: Borrow<B::CommunicationGroup>,
+        R: Borrow<B::CommunicationRoute>,
+        I: eredu_runtime::CommunicationTensorMetadata<B>,
+        O: eredu_runtime::ActivationObserver<B::Tensor, A::Error> + ?Sized,
+    {
+        self.forward_selected_unit::<A, B, S, _, _, _, _>(
+            architecture,
+            address,
+            unit,
+            hidden,
+            state,
+            forward,
+            pass,
+            parallel,
+            communication,
+            communication_executor,
+            context,
+            Some(observer),
+        )
     }
 }
 
@@ -4927,7 +5783,7 @@ where
     S: eredu_runtime::RuntimeState<B>,
     A: TextPartitionArchitecture<B, S, Error = eredu_nn::Error> + 'static,
     P: eredu_runtime::LayerwisePolicy<B, A::Unit>,
-    P::Error: std::fmt::Display,
+    P::Error: std::error::Error + Send + Sync + 'static,
     F: PartitionTensorAllocator<B>,
     G: Borrow<B::CommunicationGroup>,
     R: Borrow<B::CommunicationRoute>,
@@ -4936,6 +5792,23 @@ where
     B::ParallelContext: Sized,
 {
     type Pass<'a> = ResidentPipelinePartitionPass<'a, A, B, S>;
+
+    fn observation_hooks(&self) -> eredu_runtime::inspection::ObservationHookSupport {
+        let hooks = self
+            .architecture
+            .partition_observation_hooks(self.parallel.is_some());
+        hooks
+            .with_units(
+                hooks.supports(eredu_runtime::inspection::ObservationHookSite::Unit)
+                    && self
+                        .unit_strategy
+                        .emits_internal_observations(&self.architecture, self.parallel.is_some()),
+            )
+            .with_routed_units(
+                self.unit_strategy
+                    .emits_routed_observations(&self.architecture, self.parallel.is_some()),
+            )
+    }
 
     fn begin<'a>(
         &mut self,
@@ -5051,24 +5924,25 @@ where
         };
         let input = driver
             .input(input)
-            .map_err(|error| eredu_nn::Error::backend(error.to_string()))?;
+            .map_err(eredu_nn::Error::backend_source)?;
         let mut forward = driver
-            .begin(
+            .begin_observed(
                 &mut self.architecture,
                 input,
                 pass.mask,
                 state,
                 self.parallel.as_ref(),
                 context,
+                observer,
             )
-            .map_err(|error| eredu_nn::Error::backend(error.to_string()))?;
+            .map_err(eredu_nn::Error::backend_source)?;
         if self.unit_strategy.has_cross_stage_collective_waves() {
             communication
                 .complete_execution_dependencies(
                     std::iter::once(&forward.hidden),
                     communication_executor,
                 )
-                .map_err(|error| eredu_nn::Error::backend(error.to_string()))?;
+                .map_err(eredu_nn::Error::backend_source)?;
         }
         let architecture = &mut self.architecture;
         let mut policy = eredu_runtime::LayerwisePolicyForward::begin(
@@ -5076,7 +5950,7 @@ where
             &forward.hidden,
             context,
         )
-        .map_err(|error| eredu_nn::Error::backend(error.to_string()))?;
+        .map_err(eredu_nn::Error::backend_source)?;
 
         for (ordinal, address) in self.addresses.iter().copied().enumerate() {
             let lease = policy
@@ -5086,20 +5960,26 @@ where
                 .map_err(|error| match error {
                     eredu_runtime::LayerwiseAcquireError::Architecture(error) => error,
                     eredu_runtime::LayerwiseAcquireError::Policy(error) => {
-                        eredu_nn::Error::backend(error.to_string())
+                        eredu_nn::Error::backend_source(error)
                     }
                 })?;
             let path = architecture.unit_path(address.group(), address.index())?;
-            let unit_input = eredu_runtime::observe_and_intervene(
-                observer,
-                &format!("{path}.input"),
-                &forward.hidden,
-            )?;
-            let unit_output = self.unit_strategy.forward_unit(
+            let unit_boundaries =
+                architecture.observes_unit_boundaries(address.group(), address.index());
+            let unit_input = if unit_boundaries {
+                None
+            } else {
+                Some(eredu_runtime::observe_and_intervene(
+                    observer,
+                    &format!("{path}.input"),
+                    &forward.hidden,
+                )?)
+            };
+            let unit_output = self.unit_strategy.forward_unit_observed(
                 architecture,
                 address,
                 lease,
-                &unit_input,
+                unit_input.as_ref().unwrap_or(&forward.hidden),
                 state,
                 &mut forward.context,
                 pass.expert_pass,
@@ -5107,6 +5987,7 @@ where
                 communication,
                 communication_executor,
                 context,
+                observer,
             );
             let unit_output = unit_output?;
             if self.unit_strategy.has_cross_stage_collective_waves() {
@@ -5115,16 +5996,20 @@ where
                         std::iter::once(&unit_output),
                         communication_executor,
                     )
-                    .map_err(|error| eredu_nn::Error::backend(error.to_string()))?;
+                    .map_err(eredu_nn::Error::backend_source)?;
             }
-            forward.hidden = eredu_runtime::observe_and_intervene(
-                observer,
-                &format!("{path}.output"),
-                &unit_output,
-            )?;
+            forward.hidden = if unit_boundaries {
+                unit_output
+            } else {
+                eredu_runtime::observe_and_intervene(
+                    observer,
+                    &format!("{path}.output"),
+                    &unit_output,
+                )?
+            };
             let state_values = state
                 .retained_values(ordinal, address.with_index(ordinal))
-                .map_err(|error| eredu_nn::Error::backend(error.to_string()))?;
+                .map_err(eredu_nn::Error::backend_source)?;
             let context_values = architecture.retained_context_values(
                 &forward.context,
                 address.group(),
@@ -5132,16 +6017,17 @@ where
             );
             policy
                 .complete(&forward.hidden, state_values.into_iter(), context_values)
-                .map_err(|error| eredu_nn::Error::backend(error.to_string()))?;
+                .map_err(eredu_nn::Error::backend_source)?;
         }
 
-        let result = driver.finish(
+        let result = driver.finish_observed(
             architecture,
             &forward.hidden,
             state,
             &mut forward.context,
             self.parallel.as_ref(),
             context,
+            observer,
         )?;
         let result = result;
         let completed = match &result {
@@ -5151,11 +6037,11 @@ where
         if self.unit_strategy.has_cross_stage_collective_waves() {
             communication
                 .complete_execution_dependencies(std::iter::once(completed), communication_executor)
-                .map_err(|error| eredu_nn::Error::backend(error.to_string()))?;
+                .map_err(eredu_nn::Error::backend_source)?;
         }
         policy
             .finish(completed)
-            .map_err(|error| eredu_nn::Error::backend(error.to_string()))?;
+            .map_err(eredu_nn::Error::backend_source)?;
         pass.result = Some(result);
         pass.forward = Some(forward.context);
         Ok(())
@@ -5182,7 +6068,7 @@ where
                     let boundary = self.architecture.boundary_schema()?;
                     let auxiliary = boundary
                         .encode::<B::Tensor>(auxiliary)
-                        .map_err(|error| eredu_nn::Error::backend(error.to_string()))?;
+                        .map_err(eredu_nn::Error::backend_source)?;
                     if auxiliary.len() != schema.auxiliary().len() {
                         return Err(eredu_nn::Error::backend(
                             "architecture boundary encoded a different tensor count than its schema",
@@ -5199,7 +6085,7 @@ where
                                 context,
                             )?,
                         )
-                        .map_err(|error| eredu_nn::Error::backend(error.to_string()))?,
+                        .map_err(eredu_nn::Error::backend_source)?,
                     );
                     for (value, spec) in auxiliary.into_iter().zip(schema.auxiliary()) {
                         let (role, tensor) = value.into_parts();
@@ -5219,7 +6105,7 @@ where
                                     context,
                                 )?,
                             )
-                            .map_err(|error| eredu_nn::Error::backend(error.to_string()))?,
+                            .map_err(eredu_nn::Error::backend_source)?,
                         );
                     }
                     Ok(values)
@@ -5245,7 +6131,7 @@ where
                         context,
                     )?;
                     eredu_runtime::ArchitectureBoundaryValue::new(spec.role(), tensor)
-                        .map_err(|error| eredu_nn::Error::backend(error.to_string()))
+                        .map_err(eredu_nn::Error::backend_source)
                 })
                 .collect()
         }
@@ -5267,7 +6153,7 @@ where
             .boundary_schema()?
             .wire_schema()
             .and_then(|schema| schema.resolve(pass.tokens.dim(0), pass.tokens.dim(1)))
-            .map_err(|error| eredu_nn::Error::backend(error.to_string()))
+            .map_err(eredu_nn::Error::backend_source)
     }
 
     fn accept_boundary(
@@ -5291,7 +6177,7 @@ where
             .architecture
             .boundary_schema()?
             .decode(values)
-            .map_err(|error| eredu_nn::Error::backend(error.to_string()))?;
+            .map_err(eredu_nn::Error::backend_source)?;
         pass.incoming_hidden = Some(hidden);
         pass.incoming_auxiliary = Some(auxiliary);
         Ok(())
@@ -5415,6 +6301,7 @@ pub struct PartitionedAdmission<R> {
     topology: ParallelRankTopology,
     groups: Vec<PartitionedGroupRequirements>,
     ownership: PartitionOwnership,
+    publication_owner: usize,
     state: Option<PartitionState>,
     logical_parameter_targets: Vec<String>,
     activation_dtype: PipelineActivationDtype,
@@ -5486,6 +6373,12 @@ impl<R> PartitionedAdmission<R> {
     /// Input, output, and static-role ownership for this rank.
     pub const fn ownership(&self) -> &PartitionOwnership {
         &self.ownership
+    }
+
+    /// Authoritative final-output world rank in this data-parallel cohort.
+    /// Selected from the output group's semantic merge ownership before binding.
+    pub const fn publication_owner(&self) -> usize {
+        self.publication_owner
     }
 
     /// Exact rank-local mutable-state slice, if this rank owns state.
@@ -5676,32 +6569,6 @@ where
         architecture_capabilities(inspection).map_err(PartitionedAdmissionError::Unsupported)?;
     let class = crate::replicated_text::replicated_text_execution_class(inspection)
         .map_err(|error| PartitionedAdmissionError::Unsupported(error.to_string()))?;
-    if matches!(&class, ReplicatedTextExecutionClass::Replicated(_))
-        && matches!(
-            (
-                inspection
-                    .architecture_plan()
-                    .safetensors_architecture()
-                    .map(|plan| plan.model()),
-                inspection
-                    .architecture_plan()
-                    .gguf_plan()
-                    .map(|plan| plan.model()),
-            ),
-            (
-                Some(crate::configuration::SafetensorsModelConfig::DeepSeekV3(_)),
-                None
-            ) | (
-                None,
-                Some(crate::configuration::GgufModelConfig::DeepSeekV3(_))
-            )
-        )
-    {
-        return Err(PartitionedAdmissionError::Unsupported(
-            "dense DeepSeek-V3 has no exact neutral partition constructor; use replicated topology"
-                .into(),
-        ));
-    }
     let routed = matches!(&class, ReplicatedTextExecutionClass::Routed(_))
         || matches!(
             &class,
@@ -5804,6 +6671,32 @@ where
         ReplicatedTextExecutionClass::Composite(execution) => {
             let state_layout = composite_partitioned_state_layout(inspection, rank)
                 .map_err(PartitionedAdmissionError::Unsupported)?;
+            let execution =
+                match crate::replicated_text::composite_config(inspection.architecture_plan())
+                    .map_err(|error| PartitionedAdmissionError::Unsupported(error.to_string()))?
+                {
+                    Some(crate::replicated_text::CompositeConfig::Gemma4(args)) => {
+                        let units = args
+                            .text
+                            .pipeline_layer_ranges(rank.pipeline_parallel_size())
+                            .map_err(|error| {
+                                PartitionedAdmissionError::Unsupported(error.to_string())
+                            })?[rank.pipeline_parallel_rank()]
+                        .clone();
+                        let declared = crate::gemma4::pipeline::partition_state_layout(
+                            &args.text,
+                            execution.state_layout(),
+                            units,
+                        )
+                        .map_err(|error| {
+                            PartitionedAdmissionError::Unsupported(error.to_string())
+                        })?;
+                        execution.with_state_layout(declared).map_err(|error| {
+                            PartitionedAdmissionError::Unsupported(error.to_string())
+                        })?
+                    }
+                    _ => execution,
+                };
             let (communication, boundary_routes, session_group, tensor_group, expert_group) =
                 communication_manifest(
                     execution.execution(),
@@ -5867,26 +6760,14 @@ fn composite_partitioned_state_layout(
         .ok_or_else(|| "composite artifact has no normalized family configuration".to_owned())?;
     match config {
         crate::replicated_text::CompositeConfig::Gemma4(args) => {
-            let mut text = args.text.clone();
-            let layers = text
-                .layer_schedule
-                .iter()
-                .copied()
-                .map(|mut policy| {
-                    let global = i32::try_from(policy.num_key_value_heads.get())
-                        .map_err(|_| "Gemma 4 state head count exceeds i32".to_owned())?;
-                    let local = local_partition_head_count(global, rank)?;
-                    policy.num_key_value_heads = std::num::NonZeroU32::new(
-                        u32::try_from(local)
-                            .map_err(|_| "Gemma 4 local state heads exceed u32".to_owned())?,
-                    )
-                    .ok_or_else(|| "Gemma 4 local state head count is zero".to_owned())?;
-                    Ok(policy)
-                })
-                .collect::<Result<Vec<_>, String>>()?;
-            text.layer_schedule = eredu_core::LayerSchedule::new(layers.len(), layers)
-                .map_err(|error| error.to_string())?;
-            crate::gemma4::state_layout(&text).map_err(|error| error.to_string())
+            let base = crate::gemma4::pipeline::tensor_state_layout(&args.text, rank)?;
+            let units = args
+                .text
+                .pipeline_layer_ranges(rank.pipeline_parallel_size())
+                .map_err(|error| error.to_string())?[rank.pipeline_parallel_rank()]
+            .clone();
+            crate::gemma4::pipeline::partition_state_layout(&args.text, &base, units)
+                .map_err(|error| error.to_string())
         }
         crate::replicated_text::CompositeConfig::Muse(args) => {
             let mut local = args.clone();
@@ -5901,41 +6782,7 @@ fn composite_partitioned_state_layout(
                 .map_err(|error| error.to_string())
         }
         crate::replicated_text::CompositeConfig::QwenHybrid(args) => {
-            use crate::qwen::hybrid::{HybridLayerPolicy, HybridStateGeometry};
-
-            let text = &args.text;
-            let attention_heads = local_partition_head_count(text.num_key_value_heads, rank)?;
-            let key_heads = local_partition_head_count(text.linear_num_key_heads, rank)?;
-            let value_heads = text
-                .linear_num_value_heads
-                .checked_mul(key_heads)
-                .and_then(|value| value.checked_div(text.linear_num_key_heads))
-                .ok_or_else(|| {
-                    "Qwen hybrid recurrent state heads do not partition proportionally".to_owned()
-                })?;
-            if value_heads.checked_mul(text.linear_num_key_heads)
-                != text.linear_num_value_heads.checked_mul(key_heads)
-            {
-                return Err(
-                    "Qwen hybrid recurrent value heads split the selected key-head partition"
-                        .into(),
-                );
-            }
-            let geometry = text
-                .layer_schedule
-                .iter()
-                .map(|policy| match policy {
-                    HybridLayerPolicy::SelfAttention(_) => HybridStateGeometry::FullAttention {
-                        key_value_heads: attention_heads,
-                    },
-                    HybridLayerPolicy::LinearAttention => HybridStateGeometry::LinearAttention {
-                        key_heads,
-                        value_heads,
-                    },
-                })
-                .collect::<Vec<_>>();
-            crate::qwen::hybrid::state_layout_with_geometry(text, &geometry)
-                .map_err(|error| error.to_string())
+            qwen_hybrid_partitioned_state_layout(&args.text, rank)
         }
         crate::replicated_text::CompositeConfig::Inkling(args) => {
             let mut local = args.clone();
@@ -5950,6 +6797,45 @@ fn composite_partitioned_state_layout(
             crate::inkling::composite_state_layout(&target, None).map_err(|error| error.to_string())
         }
     }
+}
+
+fn qwen_hybrid_partitioned_state_layout(
+    text: &crate::qwen::hybrid::HybridConfig,
+    rank: eredu_core::ParallelRankTopology,
+) -> Result<eredu_runtime::StateLayout, String> {
+    use crate::qwen::hybrid::{HybridLayerPolicy, HybridStateGeometry};
+
+    let attention_heads = local_partition_head_count(text.num_key_value_heads, rank)?;
+    let key_heads = local_partition_head_count(text.linear_num_key_heads, rank)?;
+    let value_heads = text
+        .linear_num_value_heads
+        .checked_mul(key_heads)
+        .and_then(|value| value.checked_div(text.linear_num_key_heads))
+        .ok_or_else(|| {
+            "Qwen hybrid recurrent state heads do not partition proportionally".to_owned()
+        })?;
+    if value_heads.checked_mul(text.linear_num_key_heads)
+        != text.linear_num_value_heads.checked_mul(key_heads)
+    {
+        return Err(
+            "Qwen hybrid recurrent value heads split the selected key-head partition".into(),
+        );
+    }
+    let geometry = text
+        .layer_schedule
+        .iter()
+        .map(|policy| match policy {
+            HybridLayerPolicy::SelfAttention(_) => HybridStateGeometry::FullAttention {
+                key_value_heads: attention_heads,
+            },
+            HybridLayerPolicy::LinearAttention => HybridStateGeometry::LinearAttention {
+                key_heads,
+                value_heads,
+            },
+        })
+        .collect::<Vec<_>>();
+    crate::qwen::hybrid::state_layout_with_geometry(text, &geometry)
+        .map_err(|error| error.to_string())
 }
 
 fn direct_partitioned_state_layout(
@@ -6021,6 +6907,12 @@ fn direct_partitioned_state_layout(
                 .map(|geometry| Some(geometry.state_layout().clone()))
                 .map_err(|error| error.to_string())
         }
+        (Some(crate::configuration::SafetensorsModelConfig::QwenHybrid(args)), None)
+        | (None, Some(crate::configuration::GgufModelConfig::QwenHybrid(args)))
+            if args.vision.is_none() && args.text.mtp_num_hidden_layers == 0 =>
+        {
+            qwen_hybrid_partitioned_state_layout(&args.text, rank).map(Some)
+        }
         (Some(crate::configuration::SafetensorsModelConfig::Lfm2(args)), None)
         | (None, Some(crate::configuration::GgufModelConfig::Lfm2(args))) => {
             crate::lfm2::partitioned_state_layout(
@@ -6064,23 +6956,23 @@ fn routed_decoder_partitioned_state_layout<C>(
 where
     C: crate::decoder::Config,
 {
-    let global = usize::try_from(args.num_key_value_heads())
-        .map_err(|_| "routed decoder key/value head count is not positive".to_owned())?;
-    let local = eredu_core::balanced_contiguous_range(
-        global,
-        rank.tensor_parallel_size(),
-        rank.tensor_parallel_rank(),
-        false,
-    )
-    .map_err(|error| error.to_string())?
-    .len();
-    let local = i32::try_from(local)
-        .map_err(|_| "routed decoder local key/value heads exceed i32".to_owned())?;
     let layers = usize::try_from(args.num_hidden_layers())
         .map_err(|_| "routed decoder layer count exceeds usize".to_owned())?;
-    let cache =
-        crate::decoder::cache_layout_with_key_value_heads(args, std::iter::repeat_n(local, layers))
-            .map_err(|error| error.to_string())?;
+    let heads = (0..layers)
+        .map(|layer| {
+            crate::decoder::attention_partition::AttentionPartition::new(args, layer)
+                .and_then(|partition| {
+                    partition.head_range(rank.tensor_parallel_size(), rank.tensor_parallel_rank())
+                })
+                .map_err(|error| error.to_string())
+                .and_then(|range| {
+                    i32::try_from(range.len())
+                        .map_err(|_| "routed decoder local head count exceeds i32".to_owned())
+                })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let cache = crate::decoder::cache_layout_with_key_value_heads(args, heads)
+        .map_err(|error| error.to_string())?;
     eredu_runtime::StateLayout::new(cache).map_err(|error| error.to_string())
 }
 
@@ -6234,7 +7126,14 @@ fn communication_manifest(
             true,
         )
         .map_err(|error| error.to_string())?;
-        let mut requirements = vec![reduce, gather];
+        // Hooks reached only by this pipeline stage must agree local failure
+        // before the next tensor collective. Selecting this payload-free
+        // mechanism allocates no observation tensors on the ordinary path.
+        let mut requirements = vec![
+            reduce,
+            gather,
+            partitioned_session_failure_agreement_requirement(),
+        ];
         if topology.pipeline() == 1 {
             let publication_rank = prediction_capture_limits.map_or(3, |(rank, _)| rank.max(3));
             let publication_elements = prediction_capture_limits
@@ -6255,7 +7154,6 @@ fn communication_manifest(
             )
             .map_err(|error| error.to_string())?;
             requirements.push(publication);
-            requirements.push(partitioned_session_failure_agreement_requirement());
         }
         plan = plan.with_tensor_groups(
             CommunicationGroupRequirements::new(requirements).map_err(|error| error.to_string())?,
@@ -6307,14 +7205,28 @@ fn communication_manifest(
             true,
         )
         .map_err(|error| error.to_string())?;
-        let requirements = CommunicationGroupRequirements::new([counts, exchange])
-            .map_err(|error| error.to_string())?;
+        let requirements = CommunicationGroupRequirements::new([
+            counts,
+            exchange,
+            partitioned_session_failure_agreement_requirement(),
+        ])
+        .map_err(|error| error.to_string())?;
         plan = plan.with_expert_groups(requirements.clone());
         Some(requirements)
     } else {
         None
     };
 
+    // Component callbacks execute on every tensor/expert replica in this stage.
+    // An expert-axis group or a tensor-axis group alone cannot certify them all.
+    if topology.pipeline() > 1 && topology.expert() > 1 {
+        plan = plan.with_pipeline_stage_groups(
+            CommunicationGroupRequirements::new([
+                partitioned_session_failure_agreement_requirement(),
+            ])
+            .map_err(|error| error.to_string())?,
+        );
+    }
     let projected = eredu_runtime::project_communication_manifest(topology, rank, &plan)
         .map_err(|error| error.to_string())?;
     let (routes, selected_boundary_routes) = pipeline_routes(
@@ -6588,6 +7500,7 @@ fn pipeline_routes(
                         semantic.source_group,
                         semantic.source_pipeline,
                         pp_size,
+                        boundary.primary().shape()[1],
                     )?
                     .ok_or_else(|| {
                         "composite pipeline continuation has no architecture-fixed hidden width"
@@ -6779,6 +7692,7 @@ where
         topology,
         groups: rank.groups,
         ownership: rank.ownership,
+        publication_owner: rank.publication_owner,
         state: rank.state,
         logical_parameter_targets: rank.parameter_targets,
         activation_dtype,
@@ -6794,6 +7708,7 @@ where
 struct RankRequirements {
     groups: Vec<PartitionedGroupRequirements>,
     ownership: PartitionOwnership,
+    publication_owner: usize,
     state: Option<PartitionState>,
     parameter_targets: Vec<String>,
 }
@@ -6803,6 +7718,15 @@ fn rank_requirements(
     state_layout: Option<&eredu_runtime::StateLayout>,
     topology: ParallelRankTopology,
 ) -> Result<RankRequirements, String> {
+    rank_requirements_inner(execution, state_layout, topology, true)
+}
+
+fn rank_requirements_inner(
+    execution: &eredu_runtime::ReplicatedTextRequirements,
+    state_layout: Option<&eredu_runtime::StateLayout>,
+    topology: ParallelRankTopology,
+    include_parameter_targets: bool,
+) -> Result<RankRequirements, String> {
     let pp_size = topology.pipeline_parallel_size();
     let pp_rank = topology.pipeline_parallel_rank();
     let mut groups = Vec::new();
@@ -6810,6 +7734,7 @@ fn rank_requirements(
     let mut owns_input = false;
     let output_group = execution.execution_graph().output();
     let mut owns_output = false;
+    let mut output_pipeline = None;
     let mut decoder_state_offset = 0usize;
     let mut local_state_ranges = Vec::new();
 
@@ -6842,8 +7767,9 @@ fn rank_requirements(
         {
             owns_input = true;
         }
-        if group_index == output_group && merge_owner == pp_rank {
-            owns_output = true;
+        if group_index == output_group {
+            output_pipeline = Some(merge_owner);
+            owns_output = merge_owner == pp_rank;
         }
         let first_role_start = static_roles.len();
         if first_owner == pp_rank {
@@ -6908,13 +7834,29 @@ fn rank_requirements(
             None
         };
     let ownership = PartitionOwnership::new(owns_input, owns_output, static_roles)
+        .and_then(|ownership| {
+            ownership
+                .with_replicated_static_roles(execution.replicated_static_roles().iter().cloned())
+        })
         .map_err(|error| error.to_string())?;
     let parameter_targets = execution
         .parameters()
         .iter()
+        .filter(|_| include_parameter_targets)
         .filter(|parameter| match parameter.owner() {
             eredu_runtime::ReplicatedTextParameterOwner::StaticRole(role) => {
-                ownership.owns_static_role(role)
+                ownership.stores_static_role(role)
+            }
+            eredu_runtime::ReplicatedTextParameterOwner::StaticUnitConsumers {
+                role,
+                consumers,
+            } => {
+                ownership.replicated_static_roles().contains(role)
+                    || consumers.iter().any(|(group, unit)| {
+                        groups.iter().any(|owned| {
+                            owned.group.as_str() == group && owned.units.contains(unit)
+                        })
+                    })
             }
             eredu_runtime::ReplicatedTextParameterOwner::ExecutionUnit { group, unit } => groups
                 .iter()
@@ -6926,6 +7868,15 @@ fn rank_requirements(
     Ok(RankRequirements {
         groups,
         ownership,
+        publication_owner: topology
+            .global_rank_for(eredu_core::ParallelCoordinates::new(
+                0,
+                output_pipeline
+                    .ok_or_else(|| "output group has no publication ownership".to_owned())?,
+                0,
+                topology.data_parallel_rank(),
+            ))
+            .map_err(|error| error.to_string())?,
         state,
         parameter_targets,
     })
@@ -7346,14 +8297,7 @@ impl<R, Q, G, W> BoundPartitionedAdmission<R, Q, G, W> {
                 "direct partition publication group differs from selected tensor group".into(),
             );
         }
-        let owner_rank = topology
-            .global_rank_for(eredu_core::ParallelCoordinates::new(
-                0,
-                0,
-                0,
-                topology.data_parallel_rank(),
-            ))
-            .map_err(|error| error.to_string())?;
+        let owner_rank = self.selected.requirements.publication_owner();
         let graph = self.partition.graph().clone();
         let mut contracts = vec![(ArchitectureGroupKind::Decoder, false); graph.groups().len()];
         contracts[group] = (ArchitectureGroupKind::Decoder, false);
@@ -7400,14 +8344,7 @@ impl<R, Q, G, W> BoundPartitionedAdmission<R, Q, G, W> {
         let session = self.session_group().ok_or_else(|| {
             "routed partition admission has no selected publication group".to_owned()
         })?;
-        let owner_rank = topology
-            .global_rank_for(eredu_core::ParallelCoordinates::new(
-                0,
-                0,
-                0,
-                topology.data_parallel_rank(),
-            ))
-            .map_err(|error| error.to_string())?;
+        let owner_rank = self.selected.requirements.publication_owner();
         let graph = self.partition.graph().clone();
         let mut contracts = vec![(ArchitectureGroupKind::Decoder, false); graph.groups().len()];
         contracts[group] = (ArchitectureGroupKind::Decoder, false);
@@ -7458,15 +8395,7 @@ impl<R, Q, G, W> BoundPartitionedAdmission<R, Q, G, W> {
         let session = self.session_group().ok_or_else(|| {
             "pipeline partition admission has no selected session publication group".to_owned()
         })?;
-        let coordinates = eredu_core::ParallelCoordinates::new(
-            0,
-            topology.pipeline_parallel_size() - 1,
-            0,
-            topology.data_parallel_rank(),
-        );
-        let owner_rank = topology
-            .global_rank_for(coordinates)
-            .map_err(|error| error.to_string())?;
+        let owner_rank = self.selected.requirements.publication_owner();
         let publication = eredu_runtime::PartitionOutputPublication {
             group: session,
             owner_rank,
@@ -7549,14 +8478,7 @@ impl<R, G, W> BoundPartitionedAdmission<R, CompositeTextRequirements, G, W> {
         let session = self.session_group().ok_or_else(|| {
             "composite partition admission has no selected publication group".to_owned()
         })?;
-        let owner_rank = topology
-            .global_rank_for(eredu_core::ParallelCoordinates::new(
-                0,
-                topology.pipeline_parallel_size() - 1,
-                0,
-                topology.data_parallel_rank(),
-            ))
-            .map_err(|error| error.to_string())?;
+        let owner_rank = self.selected.requirements.publication_owner();
         eredu_runtime::PartitionedExecutionPlan::new(
             graph,
             contracts,
@@ -7699,6 +8621,319 @@ pub(crate) trait TextRequirements {
     fn text(&self) -> &eredu_runtime::ReplicatedTextRequirements;
 }
 
+/// Parameter coordinates use the same group layout and pipeline ownership
+/// compiler as construction. Only the requested atomic parameter group is lowered.
+
+struct ResolvedParameterMember<'a> {
+    task: &'a eredu_runtime::ReplicatedTextMaterializationTask,
+    companion: Option<&'a eredu_runtime::ReplicatedTextOutputCompanion>,
+    group: &'a eredu_runtime::OwnedParameterGroupSpec,
+    member: &'a eredu_runtime::ParameterMemberSpec,
+}
+
+fn resolve_parameter_member<'a>(
+    tasks: &'a [eredu_runtime::ReplicatedTextMaterializationTask],
+    parameters: &'a eredu_runtime::ArchitectureParameterDescription,
+    parameter: &str,
+    index: Option<&crate::parameter_partition::ParameterMemberIndex>,
+) -> Result<ResolvedParameterMember<'a>, eredu_core::parameters::ParameterError> {
+    use crate::parameter_partition::invalid;
+    use eredu_core::parameters::ParameterError;
+    let (task, companion) = if let Some(index) = index {
+        index.output(tasks, parameter)?
+    } else {
+        let mut matching = tasks
+            .iter()
+            .flat_map(|task| {
+                std::iter::once((task, None)).chain(
+                    task.output_companions()
+                        .iter()
+                        .map(move |companion| (task, Some(companion))),
+                )
+            })
+            .filter(|(task, companion)| match companion {
+                Some(companion) => companion.name() == parameter,
+                None => {
+                    task.name() == parameter
+                        || task.aliases().iter().any(|alias| alias == parameter)
+                }
+            });
+        let (task, companion) = matching
+            .next()
+            .ok_or_else(|| ParameterError::Missing(parameter.into()))?;
+        if matching.next().is_some() {
+            return Err(invalid(
+                "parameter identity resolves to multiple selected tasks",
+            ));
+        }
+        (task, companion)
+    };
+    let logical = companion.map_or_else(
+        || task.logical_shape(),
+        |companion| companion.logical_shape(),
+    );
+    if logical.len() > 32 || logical.contains(&0) {
+        return Err(invalid("selected effective parameter geometry is invalid"));
+    }
+    let (group, member) = if let Some(index) = index {
+        index.member(parameters, task, companion, parameter)?
+    } else {
+        let mut matching = parameters
+            .groups()
+            .iter()
+            .flat_map(|group| group.members().iter().map(move |member| (group, member)))
+            .filter(|(_, member)| match companion {
+                Some(companion) => member.target() == companion.name(),
+                None => {
+                    member.target() == task.name()
+                        || task.aliases().iter().any(|alias| alias == member.target())
+                }
+            });
+        let (group, member) = matching
+            .next()
+            .ok_or_else(|| ParameterError::Missing(parameter.into()))?;
+        if matching.next().is_some() {
+            return Err(invalid(
+                "selected parameter aliases resolve to multiple module slots",
+            ));
+        }
+        (group, member)
+    };
+    Ok(ResolvedParameterMember {
+        task,
+        companion,
+        group,
+        member,
+    })
+}
+
+fn parameter_member_layout(
+    resolved: ResolvedParameterMember<'_>,
+    topology: ParallelRankTopology,
+    placement: ParallelRankTopology,
+    owns: bool,
+    reservation: &mut impl eredu_core::capture::CaptureReservation,
+) -> Result<
+    crate::parameter_partition::ParameterPartitionLayout,
+    eredu_core::parameters::ParameterError,
+> {
+    use crate::parameter_partition::{
+        charge, derive_companion_coordinates, derive_parameter_coordinates, invalid,
+        ParameterPartitionLayout,
+    };
+    use eredu_core::parameters::ParameterError;
+    let ResolvedParameterMember {
+        task,
+        companion,
+        group,
+        member,
+    } = resolved;
+    let logical = companion.map_or_else(
+        || task.logical_shape(),
+        |companion| companion.logical_shape(),
+    );
+    let global_rank = topology.global_rank();
+    charge(
+        reservation,
+        256u64
+            .checked_add(member.target().len() as u64)
+            .and_then(|n| n.checked_add((logical.len() as u64).checked_mul(8)?))
+            .ok_or(ParameterError::Overflow)?,
+    )?;
+    let coordinates = if owns {
+        let mut bytes = 256u64;
+        for member in group.members() {
+            bytes = bytes
+                .checked_add(512)
+                .and_then(|n| n.checked_add(member.target().len() as u64))
+                .and_then(|n| n.checked_add(group.group().logical_name().len() as u64))
+                .and_then(|n| n.checked_add((member.global_shape().len() as u64).checked_mul(64)?))
+                .ok_or(ParameterError::Overflow)?;
+            if let eredu_runtime::MemberSharding::Segmented { axis, .. }
+            | eredu_runtime::MemberSharding::PartitionedSegments { axis, .. }
+            | eredu_runtime::MemberSharding::PartitionedChunkSegments { axis, .. } =
+                member.sharding()
+            {
+                let extent = member
+                    .global_shape()
+                    .get(*axis)
+                    .ok_or_else(|| invalid("segmented parameter axis is absent"))?;
+                bytes = bytes
+                    .checked_add(
+                        (*extent as u64)
+                            .checked_mul(32)
+                            .ok_or(ParameterError::Overflow)?,
+                    )
+                    .ok_or(ParameterError::Overflow)?;
+            }
+        }
+        charge(reservation, bytes)?;
+        let layout = local_layout_groups(
+            std::iter::once(group),
+            placement.tensor_parallel_rank(),
+            placement.tensor_parallel_size(),
+            placement.expert_parallel_rank(),
+            placement.expert_parallel_size(),
+        )
+        .map_err(|error| invalid(&error))?;
+        let tensor = layout
+            .tensor(member.target())
+            .ok_or_else(|| invalid("selected parameter layout is absent"))?;
+        if companion.is_some() {
+            derive_companion_coordinates(logical, tensor, global_rank, reservation)?
+        } else {
+            derive_parameter_coordinates(task, tensor, global_rank, reservation)?
+        }
+    } else {
+        None
+    };
+    Ok(ParameterPartitionLayout {
+        topology,
+        target: member.target().into(),
+        global_shape: logical.iter().map(|n| *n as u64).collect(),
+        coordinates,
+    })
+}
+
+/// Prediction modules retain their own TP placement and are physically replicated
+/// over the other execution axes. Use the same single-group compiler as preparation,
+/// while preserving the global rank in public coordinate ownership.
+pub(crate) fn prediction_parameter_layout_for_rank(
+    prepared: &crate::prediction_extension::PreparedPredictionPlacement,
+    tasks: &[eredu_runtime::ReplicatedTextMaterializationTask],
+    parameter: &str,
+    global_rank: usize,
+    reservation: &mut impl eredu_core::capture::CaptureReservation,
+) -> Result<
+    crate::parameter_partition::ParameterPartitionLayout,
+    eredu_core::parameters::ParameterError,
+> {
+    use crate::parameter_partition::invalid;
+    use eredu_core::parameters::ParameterError;
+    let topology = ParallelRankTopology::new(prepared.topology().topology(), global_rank)
+        .map_err(|error| invalid(&error.to_string()))?;
+    let parameters = prepared.parameters().ok_or_else(|| {
+        ParameterError::Unsupported(
+            "prepared prediction has no parameter placement compiler".into(),
+        )
+    })?;
+    let resolved = resolve_parameter_member(tasks, parameters, parameter, None)?;
+    let tensor = eredu_core::ParallelTopology::new(topology.tensor_parallel_size(), 1, 1, 1)
+        .map_err(|error| invalid(&error.to_string()))?;
+    let placement = ParallelRankTopology::new(tensor, topology.tensor_parallel_rank())
+        .map_err(|error| invalid(&error.to_string()))?;
+    parameter_member_layout(resolved, topology, placement, true, reservation)
+}
+
+pub(crate) fn selected_parameter_layout_for_rank<R: TextRequirements>(
+    admission: &PartitionedAdmission<R>,
+    tasks: &[eredu_runtime::ReplicatedTextMaterializationTask],
+    parameters: &eredu_runtime::ArchitectureParameterDescription,
+    parameter: &str,
+    global_rank: usize,
+    index: Option<&crate::parameter_partition::ParameterMemberIndex>,
+    reservation: &mut impl eredu_core::capture::CaptureReservation,
+) -> Result<
+    crate::parameter_partition::ParameterPartitionLayout,
+    eredu_core::parameters::ParameterError,
+> {
+    use crate::parameter_partition::{charge, invalid};
+    use eredu_core::parameters::ParameterError;
+    let topology = ParallelRankTopology::new(admission.topology().topology(), global_rank)
+        .map_err(|error| invalid(&error.to_string()))?;
+    if parameters.graph() != admission.execution.text().execution_graph()
+        || parameters.unit_layout() != admission.execution.text().execution_units()
+    {
+        return Err(invalid(
+            "parameter declaration differs from retained execution",
+        ));
+    }
+    let resolved = resolve_parameter_member(tasks, parameters, parameter, index)?;
+    let group = resolved.group;
+    let member = resolved.member;
+    let text = admission.execution.text();
+    // Prepay rank metadata, including transient ownership ranges and role strings.
+    // Parameter target strings are deliberately excluded from this projection.
+    let mut bytes = 1024u64
+        .checked_add(member.target().len() as u64)
+        .ok_or(ParameterError::Overflow)?;
+    for group in text.execution_graph().groups() {
+        bytes = bytes
+            .checked_add(group.id().len() as u64)
+            .ok_or(ParameterError::Overflow)?;
+    }
+    for transport in text.group_transports() {
+        bytes = bytes
+            .checked_add(512)
+            .and_then(|n| {
+                n.checked_add((topology.pipeline_parallel_size() as u64).checked_mul(64)?)
+            })
+            .ok_or(ParameterError::Overflow)?;
+        for role in transport
+            .first_owner_static_roles
+            .iter()
+            .chain(&transport.last_owner_static_roles)
+        {
+            bytes = bytes
+                .checked_add(128)
+                .and_then(|n| n.checked_add((role.len() as u64).checked_mul(4)?))
+                .ok_or(ParameterError::Overflow)?;
+        }
+    }
+    for role in text.replicated_static_roles() {
+        bytes = bytes
+            .checked_add(128)
+            .and_then(|bytes| bytes.checked_add((role.len() as u64).checked_mul(4)?))
+            .ok_or(ParameterError::Overflow)?;
+    }
+    charge(reservation, bytes)?;
+    let rank =
+        rank_requirements_inner(text, None, topology, false).map_err(|error| invalid(&error))?;
+    let owns = group.owner().is_stored_by(&rank.ownership, |id, unit| {
+        rank.groups
+            .iter()
+            .any(|owned| owned.group() == id && owned.units().contains(&unit))
+    });
+    parameter_member_layout(resolved, topology, topology, owns, reservation)
+}
+
+/// Projects another rank from the same retained global requirements. This uses
+/// exactly the ownership compiler used by admission, without state allocation,
+/// source resolution, communication realization or execution-class reselection.
+pub(crate) fn selected_component_layout_for_rank<R: TextRequirements>(
+    admission: &PartitionedAdmission<R>,
+    descriptor: &eredu_core::ArchitectureDescriptor,
+    parameters: &eredu_runtime::ArchitectureParameterDescription,
+    global_rank: usize,
+    routed: Option<&crate::SelectedRoutedTextRealization>,
+) -> Result<
+    crate::component_partition::ComponentPartitionLayout,
+    crate::component_partition::ComponentPartitionError,
+> {
+    use crate::component_partition::{ComponentPartitionError, ComponentPartitionLayout};
+    let topology = ParallelRankTopology::new(admission.topology().topology(), global_rank)
+        .map_err(|error| ComponentPartitionError::ParameterLayout(error.to_string()))?;
+    let layout = derive_partitioned_local_layout(parameters, topology)
+        .map_err(ComponentPartitionError::ParameterLayout)?;
+    if topology == admission.topology() {
+        return ComponentPartitionLayout::from_admission(
+            descriptor, parameters, &layout, admission, routed,
+        );
+    }
+    let rank = rank_requirements(admission.execution.text(), None, topology)
+        .map_err(ComponentPartitionError::ParameterLayout)?;
+    ComponentPartitionLayout::from_ownership(
+        descriptor,
+        parameters,
+        &layout,
+        topology,
+        &rank.ownership,
+        &rank.groups,
+        rank.publication_owner,
+        routed,
+    )
+}
+
 impl TextRequirements for eredu_runtime::ReplicatedTextRequirements {
     fn text(&self) -> &eredu_runtime::ReplicatedTextRequirements {
         self
@@ -7736,8 +8971,39 @@ pub fn derive_partitioned_local_layout(
     )
 }
 
+/// Retains the target's semantic ownership while constructing source-format
+/// modules for pointwise conversion of the same canonical parameters.
+pub(crate) fn derive_partitioned_transform_source_layout(
+    source: &eredu_runtime::ArchitectureParameterDescription,
+    target: &eredu_runtime::ArchitectureParameterDescription,
+    topology: eredu_core::ParallelRankTopology,
+) -> Result<eredu_runtime::LocalModelLayout, String> {
+    validate_transform_parameter_space(source, target)?;
+    eredu_runtime::derive_transform_source_layout(
+        &derive_partitioned_local_layout(source, topology)?,
+        &derive_partitioned_local_layout(target, topology)?,
+    )
+    .map_err(|error| error.to_string())
+}
+
 fn local_layout(
     description: &eredu_runtime::ArchitectureParameterDescription,
+    tensor_rank: usize,
+    tensor_parts: usize,
+    expert_rank: usize,
+    expert_parts: usize,
+) -> Result<eredu_runtime::LocalModelLayout, String> {
+    local_layout_groups(
+        description.groups().iter(),
+        tensor_rank,
+        tensor_parts,
+        expert_rank,
+        expert_parts,
+    )
+}
+
+fn local_layout_groups<'a>(
+    groups: impl IntoIterator<Item = &'a eredu_runtime::OwnedParameterGroupSpec>,
     tensor_rank: usize,
     tensor_parts: usize,
     expert_rank: usize,
@@ -7749,7 +9015,7 @@ fn local_layout(
         ));
     }
     let mut layout = eredu_runtime::LocalModelLayout::default();
-    for owned in description.groups() {
+    for owned in groups {
         let group = owned.group();
         // A routed expert bank is packed when at least one member carries the
         // leading expert dimension in addition to its matrix dimensions.  The
@@ -7842,7 +9108,14 @@ fn local_layout(
                 group.partition_units(),
                 logical_range.clone(),
                 false,
-            );
+            )
+            .with_partition_chunk_size(match member.sharding() {
+                eredu_runtime::MemberSharding::PartitionedChunks { chunk_size, .. }
+                | eredu_runtime::MemberSharding::PartitionedChunkSegments { chunk_size, .. } => {
+                    Some(*chunk_size)
+                }
+                _ => None,
+            });
             if tensor_parts > 1 {
                 if let Some(range) = &packed_expert_range {
                     tensor =
@@ -7925,6 +9198,47 @@ fn resolve_member(
                 .map_err(|error| error.to_string())?;
             let width = dimension / units;
             Ok(ranged(*axis, logical.start * width..logical.end * width))
+        }
+        MemberSharding::PartitionedChunks { axis, chunk_size } => {
+            let units = partition_units
+                .ok_or_else(|| format!("tensor {:?} has no logical partition", member.target()))?;
+            let dimension = member_axis(member, *axis)?;
+            if *chunk_size == 0 || dimension.div_ceil(*chunk_size) != units {
+                return Err(format!(
+                    "tensor {:?} chunks do not match {units} logical units",
+                    member.target()
+                ));
+            }
+            let logical = eredu_core::balanced_contiguous_range(units, parts, rank, false)
+                .map_err(|error| error.to_string())?;
+            let range = eredu_runtime::partition_chunk_range(dimension, *chunk_size, logical)
+                .map_err(|error| error.to_string())?;
+            Ok(ranged(*axis, range))
+        }
+        MemberSharding::PartitionedChunkSegments {
+            axis,
+            segments,
+            chunk_size,
+        } => {
+            let units = partition_units
+                .ok_or_else(|| format!("tensor {:?} has no logical partition", member.target()))?;
+            let logical = eredu_core::balanced_contiguous_range(units, parts, rank, false)
+                .map_err(|error| error.to_string())?;
+            let indices = segmented_indices(member, *axis, segments, |segment| {
+                if *chunk_size == 0 || segment.len().div_ceil(*chunk_size) != units {
+                    return Err(format!(
+                        "segment {segment:?} chunks do not match {units} logical units"
+                    ));
+                }
+                let local = eredu_runtime::partition_chunk_range(
+                    segment.len(),
+                    *chunk_size,
+                    logical.clone(),
+                )
+                .map_err(|error| error.to_string())?;
+                Ok(segment.start + local.start..segment.start + local.end)
+            })?;
+            indexed(member, *axis, indices)
         }
         MemberSharding::PartitionedSegments { axis, segments } => {
             let units = partition_units
@@ -8162,9 +9476,12 @@ where
                     "selected transform source changed the execution-unit address space".into(),
                 ));
             }
-            let derived_source_layout =
-                derive_partitioned_local_layout(&source_parameters, topology_rank)
-                    .map_err(eredu_runtime::PartitionedSessionPreparationError::Contract)?;
+            let derived_source_layout = derive_partitioned_transform_source_layout(
+                &source_parameters,
+                &parameters,
+                topology_rank,
+            )
+            .map_err(eredu_runtime::PartitionedSessionPreparationError::Contract)?;
             if &derived_source_layout != source_layout {
                 return Err(eredu_runtime::PartitionedSessionPreparationError::Contract(
                     "precomputed transform source layout differs from its architecture".into(),
@@ -8321,6 +9638,10 @@ where
             .gguf_plan()
             .map(|plan| plan.model()),
     ) {
+        (Some(crate::configuration::SafetensorsModelConfig::DeepSeekV3(args)), None)
+        | (None, Some(crate::configuration::GgufModelConfig::DeepSeekV3(args))) => {
+            deepseek_dense::prepare::<B, S, V>(args, selected, store, context, visitor)
+        }
         (Some(crate::configuration::SafetensorsModelConfig::Nanbeige(args)), None)
         | (None, Some(crate::configuration::GgufModelConfig::Nanbeige(args))) => {
             let source_args = selected
@@ -8527,6 +9848,30 @@ where
         .gguf_plan()
         .map(|plan| plan.model());
     if let Some(args) = match (safetensors, gguf) {
+        (Some(crate::configuration::SafetensorsModelConfig::QwenHybrid(args)), None)
+        | (None, Some(crate::configuration::GgufModelConfig::QwenHybrid(args)))
+            if args.vision.is_none()
+                && !args.text.is_moe()
+                && args.text.mtp_num_hidden_layers == 0 =>
+        {
+            Some(&args.text)
+        }
+        _ => None,
+    } {
+        let expected =
+            crate::replicated_text::replicated_text_requirements(inspection).map_err(|error| {
+                DenseDecoderPartitionedDispatchError::Architecture(error.to_string())
+            })?;
+        if &expected != selected.requirements().execution() {
+            return Err(DenseDecoderPartitionedDispatchError::Architecture(
+                "partitioned admission belongs to a different architecture or artifact".into(),
+            ));
+        }
+        crate::replicated_text::validate_store_handoff(&expected, store.as_ref())
+            .map_err(DenseDecoderPartitionedDispatchError::Architecture)?;
+        return qwen_hybrid::prepare::<B, S, V>(args, selected, store, context, visitor);
+    }
+    if let Some(args) = match (safetensors, gguf) {
         (Some(crate::configuration::SafetensorsModelConfig::NemotronH(args)), None)
         | (None, Some(crate::configuration::GgufModelConfig::NemotronH(args))) => Some(args),
         _ => None,
@@ -8695,6 +10040,40 @@ where
     M: crate::prediction_extension::PredictionExtensionMaterializer<B>,
     V: PartitionedPredictionTargetVisitor<B, S, M>,
 {
+    if let Some(args) = match (
+        inspection
+            .architecture_plan()
+            .safetensors_architecture()
+            .map(|plan| plan.model()),
+        inspection
+            .architecture_plan()
+            .gguf_plan()
+            .map(|plan| plan.model()),
+    ) {
+        (Some(crate::configuration::SafetensorsModelConfig::QwenHybrid(args)), None)
+        | (None, Some(crate::configuration::GgufModelConfig::QwenHybrid(args)))
+            if args.vision.is_none() =>
+        {
+            Some(&args.text)
+        }
+        _ => None,
+    } {
+        let expected =
+            crate::replicated_text::replicated_text_requirements(inspection).map_err(|error| {
+                DenseDecoderPartitionedDispatchError::Architecture(error.to_string())
+            })?;
+        if &expected != selected.requirements().execution() {
+            return Err(DenseDecoderPartitionedDispatchError::Architecture(
+                "Qwen prediction target admission belongs to another artifact".into(),
+            ));
+        }
+        crate::replicated_text::validate_store_handoff(&expected, store.as_ref())
+            .map_err(DenseDecoderPartitionedDispatchError::Architecture)?;
+        return qwen_hybrid::prepare_prediction::<B, S, M, V>(
+            args, selected, extension, store, context, visitor,
+        );
+    }
+
     let extension = <crate::nemotron_h::PartitionedLayeredModel<B> as crate::prediction_extension::MaterializedPredictionTarget<B>>::pair_prediction_extension(extension)
         .map_err(|error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()))?;
     let args = match (
@@ -8933,8 +10312,9 @@ where
             .map_err(|error| {
                 DenseDecoderPartitionedDispatchError::Architecture(error.to_string())
             })?;
-            let source_layout = derive_partitioned_local_layout(&source_parameters, rank)
-                .map_err(DenseDecoderPartitionedDispatchError::Architecture)?;
+            let source_layout =
+                derive_partitioned_transform_source_layout(&source_parameters, &parameters, rank)
+                    .map_err(DenseDecoderPartitionedDispatchError::Architecture)?;
             validate_transform_parameter_space(&source_parameters, &parameters)
                 .map_err(DenseDecoderPartitionedDispatchError::Architecture)?;
             let source_geometry = crate::nemotron_h::partition_local_geometry(
@@ -9085,6 +10465,11 @@ where
     .map_err(|error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()))?;
     let source_architecture = source_args
         .map(|source_args| {
+            let source_args = crate::kimi_linear::with_checkpoint_formats(
+                &source_args,
+                crate::replicated_text::requirement_formats(selected.base().requirements()),
+            )
+            .map_err(DenseDecoderPartitionedDispatchError::Architecture)?;
             let source_model =
                 crate::kimi_linear::LayeredModel::<B>::new(source_args.clone(), context).map_err(
                     |error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()),
@@ -9096,8 +10481,9 @@ where
             .map_err(|error| {
                 DenseDecoderPartitionedDispatchError::Architecture(error.to_string())
             })?;
-            let source_layout = derive_partitioned_local_layout(&source_parameters, rank)
-                .map_err(DenseDecoderPartitionedDispatchError::Architecture)?;
+            let source_layout =
+                derive_partitioned_transform_source_layout(&source_parameters, &parameters, rank)
+                    .map_err(DenseDecoderPartitionedDispatchError::Architecture)?;
             validate_transform_parameter_space(&source_parameters, &parameters)
                 .map_err(DenseDecoderPartitionedDispatchError::Architecture)?;
             let source_geometry = crate::kimi_linear::partition_local_geometry(
@@ -9229,12 +10615,18 @@ where
     .map_err(|error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()))?;
     let source_architecture = source_args
         .map(|source_args| {
+            let source_args = crate::lfm2::with_checkpoint_formats(
+                &source_args,
+                crate::replicated_text::requirement_formats(selected.base().requirements()),
+            )
+            .map_err(DenseDecoderPartitionedDispatchError::Architecture)?;
             let source_parameters = crate::lfm2::dense_parameter_description(&source_args)
                 .map_err(|error| {
                     DenseDecoderPartitionedDispatchError::Architecture(error.to_string())
                 })?;
-            let source_layout = derive_partitioned_local_layout(&source_parameters, rank)
-                .map_err(DenseDecoderPartitionedDispatchError::Architecture)?;
+            let source_layout =
+                derive_partitioned_transform_source_layout(&source_parameters, &parameters, rank)
+                    .map_err(DenseDecoderPartitionedDispatchError::Architecture)?;
             validate_transform_parameter_space(&source_parameters, &parameters)
                 .map_err(DenseDecoderPartitionedDispatchError::Architecture)?;
             let source_geometry =
@@ -9368,8 +10760,9 @@ where
                 .map_err(|error| {
                     DenseDecoderPartitionedDispatchError::Architecture(error.to_string())
                 })?;
-            let source_layout = derive_partitioned_local_layout(&source_parameters, rank)
-                .map_err(DenseDecoderPartitionedDispatchError::Architecture)?;
+            let source_layout =
+                derive_partitioned_transform_source_layout(&source_parameters, &parameters, rank)
+                    .map_err(DenseDecoderPartitionedDispatchError::Architecture)?;
             validate_transform_parameter_space(&source_parameters, &parameters)
                 .map_err(DenseDecoderPartitionedDispatchError::Architecture)?;
             let source_geometry = crate::decoder::partition_local_geometry(
@@ -9526,6 +10919,14 @@ pub fn is_supported_dense_decoder_partition(plan: &ArtifactArchitecturePlan) -> 
         | (None, Some(crate::configuration::GgufModelConfig::NemotronH(args))) => {
             !args.has_sparse_moe_layers() && args.num_nextn_predict_layers == 0
         }
+        (Some(crate::configuration::SafetensorsModelConfig::DeepSeekV3(args)), None)
+        | (None, Some(crate::configuration::GgufModelConfig::DeepSeekV3(args))) => {
+            !args.has_sparse_moe_layers() && args.num_nextn_predict_layers == 0
+        }
+        (Some(crate::configuration::SafetensorsModelConfig::QwenHybrid(args)), None)
+        | (None, Some(crate::configuration::GgufModelConfig::QwenHybrid(args))) => {
+            args.vision.is_none() && !args.text.is_moe() && args.text.mtp_num_hidden_layers == 0
+        }
         _ => false,
     }
 }
@@ -9557,6 +10958,10 @@ pub fn is_supported_routed_decoder_partition(plan: &ArtifactArchitecturePlan) ->
         (Some(crate::configuration::SafetensorsModelConfig::NemotronH(args)), None)
         | (None, Some(crate::configuration::GgufModelConfig::NemotronH(args))) => {
             args.has_sparse_moe_layers() && args.num_nextn_predict_layers == 0
+        }
+        (Some(crate::configuration::SafetensorsModelConfig::QwenHybrid(args)), None)
+        | (None, Some(crate::configuration::GgufModelConfig::QwenHybrid(args))) => {
+            args.vision.is_none() && args.text.is_moe() && args.text.mtp_num_hidden_layers == 0
         }
         (Some(crate::configuration::SafetensorsModelConfig::DeepSeekV4(args)), None) => {
             args.num_nextn_predict_layers == 0 && plan.prediction_extension().is_none()
@@ -9716,6 +11121,20 @@ where
             .gguf_plan()
             .map(|plan| plan.model()),
     ) {
+        (Some(crate::configuration::SafetensorsModelConfig::QwenHybrid(args)), None)
+        | (None, Some(crate::configuration::GgufModelConfig::QwenHybrid(args)))
+            if args.vision.is_none()
+                && args.text.is_moe()
+                && args.text.mtp_num_hidden_layers == 0 =>
+        {
+            qwen_hybrid::prepare_routed::<B, S, _>(
+                &args.text,
+                selected,
+                store,
+                context,
+                OrdinaryFamilyRoutedPartitionVisitor(visitor),
+            )
+        }
         (Some(crate::configuration::SafetensorsModelConfig::K2Horizon(args)), None)
         | (None, Some(crate::configuration::GgufModelConfig::K2Horizon(args)))
             if args.is_moe() =>
@@ -9786,6 +11205,7 @@ where
             prepare_lfm2_routed_partition::<B, S, V>(
                 selected_args.model_type.clone(),
                 selected_args,
+                args.clone(),
                 selected,
                 store,
                 context,
@@ -9806,6 +11226,7 @@ where
             prepare_kimi_linear_routed_partition::<B, S, V>(
                 selected_args.model_type.clone(),
                 selected_args,
+                args.clone(),
                 selected,
                 store,
                 context,
@@ -9968,11 +11389,56 @@ where
         + eredu_nn::BlockwiseAttentionBackend
         + eredu_nn::HyperNeuralBackend,
     S: eredu_runtime::LayerRuntimeState<B>,
-    S::LayerState:
-        eredu_nn::CompressedAttentionCache<B::Tensor> + eredu_runtime::RuntimeStateComponents<B>,
+    S::LayerState: eredu_nn::AttentionCache<B::Tensor>
+        + eredu_nn::CompressedAttentionCache<B::Tensor>
+        + eredu_runtime::RuntimeStateComponents<B>,
     M: crate::prediction_extension::PredictionExtensionMaterializer<B>,
     V: RoutedPartitionedPredictionTargetProductionVisitor<B, S, M>,
 {
+    if let Some(args) = match (
+        inspection
+            .architecture_plan()
+            .safetensors_architecture()
+            .map(|plan| plan.model()),
+        inspection
+            .architecture_plan()
+            .gguf_plan()
+            .map(|plan| plan.model()),
+    ) {
+        (Some(crate::configuration::SafetensorsModelConfig::QwenHybrid(args)), None)
+        | (None, Some(crate::configuration::GgufModelConfig::QwenHybrid(args)))
+            if args.vision.is_none() =>
+        {
+            Some(&args.text)
+        }
+        _ => None,
+    } {
+        let expected =
+            crate::routed_text::routed_text_requirements(inspection).map_err(|error| {
+                DenseDecoderPartitionedDispatchError::Architecture(error.to_string())
+            })?;
+        if &expected != selected.requirements().execution() {
+            return Err(DenseDecoderPartitionedDispatchError::Architecture(
+                "Qwen prediction target admission belongs to another artifact".into(),
+            ));
+        }
+        crate::replicated_text::validate_store_handoff(expected.text(), store.as_ref())
+            .map_err(DenseDecoderPartitionedDispatchError::Architecture)?;
+        let extension = <crate::qwen::hybrid::LayeredModel<B> as crate::prediction_extension::MaterializedPredictionTarget<B>>::pair_prediction_extension(extension)
+            .map_err(|error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()))?;
+        return qwen_hybrid::prepare_routed::<B, S, _>(
+            args,
+            selected,
+            store,
+            context,
+            PredictionFamilyRoutedPartitionVisitor::<B, crate::qwen::hybrid::LayeredModel<B>, M, _> {
+                extension,
+                visitor,
+                marker: PhantomData,
+            },
+        );
+    }
+
     let extension = <crate::deepseek::v3::Model<B> as crate::prediction_extension::MaterializedPredictionTarget<B>>::pair_prediction_extension(extension)
         .map_err(|error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()))?;
     let expected = crate::routed_text::routed_text_requirements(inspection)
@@ -10092,6 +11558,7 @@ where
     prepare_nemotron_h_routed_partition::<B, S, _>(
         selected_args.model_type.clone(),
         selected_args,
+        args.clone(),
         selected,
         store,
         context,
@@ -10148,9 +11615,11 @@ where
             ));
         }
     };
-    if args.num_nextn_predict_layers == 0 || !args.has_sparse_moe_layers() {
+    // The retained target inspection excludes prediction units; the paired
+    // extension above owns their depth, parameters and mutable state.
+    if !args.has_sparse_moe_layers() {
         return Err(DenseDecoderPartitionedDispatchError::Architecture(
-            "ReLU-squared routed prediction requires sparse prediction-bearing Nemotron-H".into(),
+            "ReLU-squared routed prediction requires a sparse Nemotron-H target".into(),
         ));
     }
     let selected_args =
@@ -10161,6 +11630,7 @@ where
     prepare_nemotron_h_routed_partition::<B, S, _>(
         selected_args.model_type.clone(),
         selected_args,
+        args.clone(),
         selected,
         store,
         context,
@@ -10281,7 +11751,11 @@ where
             .collect();
         banks.insert(
             id,
-            selected_bank.with_partition_geometry(plan, selected_bank.catalog().clone(), members),
+            selected_bank
+                .with_partition_geometry(plan, selected_bank.catalog().clone(), members, &layout)
+                .map_err(|error| {
+                    DenseDecoderPartitionedDispatchError::Architecture(error.to_string())
+                })?,
         );
     }
     let bank_residency = selected.base().bank_residency();
@@ -10310,6 +11784,7 @@ where
         .visit(
             PreparedRoutedPartitionedArchitecture {
                 prepared,
+                source_architecture: None,
                 layout,
                 tasks,
                 capability_estimate,
@@ -10328,6 +11803,7 @@ where
 fn prepare_lfm2_routed_partition<B, S, V>(
     effective_model_type: String,
     selected_args: crate::lfm2::ModelArgs,
+    source_args: crate::lfm2::ModelArgs,
     selected: SelectedPartitionedAdmission<SelectedRoutedTextRealization, RoutedTextRequirements>,
     store: eredu_checkpoint::store::SharedCheckpointSource,
     context: &<B::Tensor as eredu_nn::Tensor>::Context,
@@ -10395,6 +11871,83 @@ where
         eredu_runtime::NoAuxiliaryBoundarySchema::new(selected_args.hidden_size),
     )
     .map_err(|error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()))?;
+    let source_architecture = if selected.base().text().parameters().iter().any(|parameter| {
+        matches!(
+            parameter.lowering(),
+            eredu_runtime::WeightLoweringKind::Transform
+                | eredu_runtime::WeightLoweringKind::DerivedTransform
+        )
+    }) {
+        let error = |error: String| DenseDecoderPartitionedDispatchError::Architecture(error);
+        let source_args = crate::lfm2::with_checkpoint_formats(
+            &source_args,
+            crate::replicated_text::requirement_formats(selected.base().text().requirements()),
+        )
+        .map_err(error)?;
+        let source_description = crate::lfm2::LayeredModel::<B>::new(source_args.clone(), context)
+            .map_err(|e| error(e.to_string()))?;
+        let source_parameters = eredu_runtime::ArchitectureParameters::parameter_description(
+            &source_description,
+            context,
+        )
+        .map_err(|e| error(e.to_string()))?;
+        validate_transform_parameter_space(&source_parameters, &parameters).map_err(error)?;
+        let source_layout =
+            derive_partitioned_transform_source_layout(&source_parameters, &parameters, rank)
+                .map_err(error)?;
+        let source_local = crate::lfm2::local_geometry(&source_args, &source_layout)
+            .map_err(|e| error(e.to_string()))?;
+        if source_local.state_layout() != &complete_state {
+            return Err(error(
+                "routed LFM2 transform source changed local state geometry".into(),
+            ));
+        }
+        let source_plan_model = crate::lfm2::LayeredModel::<B>::new_parallel(
+            source_args.clone(),
+            source_local,
+            context,
+        )
+        .map_err(|e| error(e.to_string()))?;
+        let source_plan = crate::lfm2::expert_realization_plan(&source_plan_model, rank)
+            .map_err(|e| error(e.to_string()))?
+            .ok_or_else(|| {
+                error("routed LFM2 transform source has no expert realization".into())
+            })?;
+        let source_geometry = crate::lfm2::partition_local_routed_geometry(
+            &source_args,
+            &source_layout,
+            owned.units(),
+            rank,
+            &source_plan,
+        )
+        .map_err(|e| error(e.to_string()))?;
+        let source_partition = ArchitecturePartition::from_description(
+            &source_parameters,
+            [(owned.group().as_str(), owned.units())],
+            selected.requirements().ownership().clone(),
+            &complete_state,
+            &state_plan,
+            source_geometry,
+            eredu_runtime::NoAuxiliaryBoundarySchema::new(source_args.hidden_size),
+        )
+        .map_err(|e| error(e.to_string()))?;
+        validate_partitioned_binding(selected.requirements(), &source_partition).map_err(error)?;
+        if source_partition.units().ne(partition.units()) {
+            return Err(error(
+                "routed LFM2 transform source changed local unit addresses".into(),
+            ));
+        }
+        let source = crate::lfm2::PartitionedLayeredModel::<B>::from_partition(
+            source_args,
+            &source_parameters,
+            &source_partition,
+            context,
+        )
+        .map_err(|e| error(e.to_string()))?;
+        Some((source, source_layout))
+    } else {
+        None
+    };
     prepare_family_routed_partition::<B, S, _, _, _, _>(
         crate::lfm2::PartitionedLayeredModel::<B>::from_partition(
             selected_args,
@@ -10403,6 +11956,7 @@ where
             context,
         )
         .map_err(|error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()))?,
+        source_architecture,
         selected,
         partition,
         parameters,
@@ -10419,6 +11973,7 @@ where
 fn prepare_kimi_linear_routed_partition<B, S, V>(
     effective_model_type: String,
     selected_args: crate::kimi_linear::ModelArgs,
+    source_args: crate::kimi_linear::ModelArgs,
     selected: SelectedPartitionedAdmission<SelectedRoutedTextRealization, RoutedTextRequirements>,
     store: eredu_checkpoint::store::SharedCheckpointSource,
     context: &<B::Tensor as eredu_nn::Tensor>::Context,
@@ -10491,6 +12046,84 @@ where
         eredu_runtime::NoAuxiliaryBoundarySchema::new(selected_args.hidden_size),
     )
     .map_err(|error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()))?;
+    let source_architecture = if selected.base().text().parameters().iter().any(|parameter| {
+        matches!(
+            parameter.lowering(),
+            eredu_runtime::WeightLoweringKind::Transform
+                | eredu_runtime::WeightLoweringKind::DerivedTransform
+        )
+    }) {
+        let error = |error: String| DenseDecoderPartitionedDispatchError::Architecture(error);
+        let source_args = crate::kimi_linear::with_checkpoint_formats(
+            &source_args,
+            crate::replicated_text::requirement_formats(selected.base().text().requirements()),
+        )
+        .map_err(error)?;
+        let source_description =
+            crate::kimi_linear::LayeredModel::<B>::new(source_args.clone(), context)
+                .map_err(|e| error(e.to_string()))?;
+        let source_parameters = eredu_runtime::ArchitectureParameters::parameter_description(
+            &source_description,
+            context,
+        )
+        .map_err(|e| error(e.to_string()))?;
+        validate_transform_parameter_space(&source_parameters, &parameters).map_err(error)?;
+        let source_layout =
+            derive_partitioned_transform_source_layout(&source_parameters, &parameters, rank)
+                .map_err(error)?;
+        let source_local = crate::kimi_linear::local_geometry(&source_args, &source_layout)
+            .map_err(|e| error(e.to_string()))?;
+        if source_local.state_layout() != &complete_state {
+            return Err(error(
+                "routed Kimi Linear transform source changed local state geometry".into(),
+            ));
+        }
+        let source_plan_model = crate::kimi_linear::LayeredModel::<B>::new_parallel(
+            source_args.clone(),
+            source_local,
+            context,
+        )
+        .map_err(|e| error(e.to_string()))?;
+        let source_plan = crate::kimi_linear::expert_realization_plan(&source_plan_model, rank)
+            .map_err(|e| error(e.to_string()))?
+            .ok_or_else(|| {
+                error("routed Kimi Linear transform source has no expert realization".into())
+            })?;
+        let source_geometry = crate::kimi_linear::partition_local_routed_geometry(
+            &source_args,
+            &source_layout,
+            owned.units(),
+            rank,
+            &source_plan,
+        )
+        .map_err(|e| error(e.to_string()))?;
+        let source_partition = ArchitecturePartition::from_description(
+            &source_parameters,
+            [(owned.group().as_str(), owned.units())],
+            selected.requirements().ownership().clone(),
+            &complete_state,
+            &state_plan,
+            source_geometry,
+            eredu_runtime::NoAuxiliaryBoundarySchema::new(source_args.hidden_size),
+        )
+        .map_err(|e| error(e.to_string()))?;
+        validate_partitioned_binding(selected.requirements(), &source_partition).map_err(error)?;
+        if source_partition.units().ne(partition.units()) {
+            return Err(error(
+                "routed Kimi Linear transform source changed local unit addresses".into(),
+            ));
+        }
+        let source = crate::kimi_linear::PartitionedLayeredModel::<B>::from_partition(
+            source_args,
+            &source_parameters,
+            &source_partition,
+            context,
+        )
+        .map_err(|e| error(e.to_string()))?;
+        Some((source, source_layout))
+    } else {
+        None
+    };
     prepare_family_routed_partition::<B, S, _, _, _, _>(
         crate::kimi_linear::PartitionedLayeredModel::<B>::from_partition(
             selected_args,
@@ -10499,6 +12132,7 @@ where
             context,
         )
         .map_err(|error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()))?,
+        source_architecture,
         selected,
         partition,
         parameters,
@@ -10515,6 +12149,7 @@ where
 fn prepare_nemotron_h_routed_partition<B, S, V>(
     effective_model_type: String,
     selected_args: crate::nemotron_h::ModelArgs,
+    source_args: crate::nemotron_h::ModelArgs,
     selected: SelectedPartitionedAdmission<SelectedRoutedTextRealization, RoutedTextRequirements>,
     store: eredu_checkpoint::store::SharedCheckpointSource,
     context: &<B::Tensor as eredu_nn::Tensor>::Context,
@@ -10584,6 +12219,79 @@ where
         crate::nemotron_h::TargetBoundarySchema::from_args(&selected_args),
     )
     .map_err(|error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()))?;
+    let source_architecture = if selected.base().text().parameters().iter().any(|parameter| {
+        matches!(
+            parameter.lowering(),
+            eredu_runtime::WeightLoweringKind::Transform
+                | eredu_runtime::WeightLoweringKind::DerivedTransform
+        )
+    }) {
+        let error = |error: String| DenseDecoderPartitionedDispatchError::Architecture(error);
+        let source_description =
+            crate::nemotron_h::LayeredModel::<B>::new(source_args.clone(), context)
+                .map_err(|e| error(e.to_string()))?;
+        let source_parameters = eredu_runtime::ArchitectureParameters::parameter_description(
+            &source_description,
+            context,
+        )
+        .map_err(|e| error(e.to_string()))?;
+        validate_transform_parameter_space(&source_parameters, &parameters).map_err(error)?;
+        let source_layout =
+            derive_partitioned_transform_source_layout(&source_parameters, &parameters, rank)
+                .map_err(error)?;
+        let source_local = crate::nemotron_h::local_geometry(&source_args, &source_layout)
+            .map_err(|e| error(e.to_string()))?;
+        if source_local.state_layout() != &complete_state {
+            return Err(error(
+                "routed Nemotron transform source changed local state geometry".into(),
+            ));
+        }
+        let source_plan_model = crate::nemotron_h::LayeredModel::<B>::new_parallel(
+            source_args.clone(),
+            source_local,
+            context,
+        )
+        .map_err(|e| error(e.to_string()))?;
+        let source_plan = crate::nemotron_h::expert_realization_plan(&source_plan_model, rank)
+            .map_err(|e| error(e.to_string()))?
+            .ok_or_else(|| {
+                error("routed Nemotron transform source has no expert realization".into())
+            })?;
+        let source_geometry = crate::nemotron_h::partition_local_routed_geometry(
+            &source_args,
+            &source_layout,
+            owned.units(),
+            rank,
+            &source_plan,
+        )
+        .map_err(|e| error(e.to_string()))?;
+        let source_partition = ArchitecturePartition::from_description(
+            &source_parameters,
+            [(owned.group().as_str(), owned.units())],
+            selected.requirements().ownership().clone(),
+            &complete_state,
+            &state_plan,
+            source_geometry,
+            crate::nemotron_h::TargetBoundarySchema::from_args(&source_args),
+        )
+        .map_err(|e| error(e.to_string()))?;
+        validate_partitioned_binding(selected.requirements(), &source_partition).map_err(error)?;
+        if source_partition.units().ne(partition.units()) {
+            return Err(error(
+                "routed Nemotron transform source changed local unit addresses".into(),
+            ));
+        }
+        let source = crate::nemotron_h::PartitionedLayeredModel::<B>::from_partition(
+            source_args,
+            &source_parameters,
+            &source_partition,
+            context,
+        )
+        .map_err(|e| error(e.to_string()))?;
+        Some((source, source_layout))
+    } else {
+        None
+    };
     prepare_family_routed_partition::<B, S, _, _, _, _>(
         crate::nemotron_h::PartitionedLayeredModel::<B>::from_partition(
             selected_args,
@@ -10592,6 +12300,7 @@ where
             context,
         )
         .map_err(|error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()))?,
+        source_architecture,
         selected,
         partition,
         parameters,
@@ -10682,6 +12391,76 @@ where
     .map_err(|error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()))?;
     crate::deepseek::V3PartitionLocalFoundation::from_partition(&selected_args, &partition)
         .map_err(|error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()))?;
+    let source_architecture = if selected.base().text().parameters().iter().any(|parameter| {
+        matches!(
+            parameter.lowering(),
+            eredu_runtime::WeightLoweringKind::Transform
+                | eredu_runtime::WeightLoweringKind::DerivedTransform
+        )
+    }) {
+        let error = |error: String| DenseDecoderPartitionedDispatchError::Architecture(error);
+        let source_args =
+            crate::replicated_text::source_deepseek_v3_args(&selected_args, selected.base().text())
+                .map_err(error)?;
+        let source_parameters = crate::deepseek::parallel::v3_parameter_description(&source_args)
+            .map_err(|e| error(e.to_string()))?;
+        validate_transform_parameter_space(&source_parameters, &parameters).map_err(error)?;
+        let source_layout =
+            derive_partitioned_transform_source_layout(&source_parameters, &parameters, rank)
+                .map_err(error)?;
+        let source_local =
+            crate::deepseek::parallel::v3_local_geometry(&source_args, &source_layout)
+                .map_err(|e| error(e.to_string()))?;
+        if source_local.state_layout() != &complete_state {
+            return Err(error(
+                "routed V3 transform source changed local state geometry".into(),
+            ));
+        }
+        let source_plan = crate::deepseek::v3_partition_expert_realization_plan(
+            &source_args,
+            &source_local,
+            rank,
+        )
+        .map_err(|e| error(e.to_string()))?;
+        let source_geometry = crate::deepseek::v3_partition_local_geometry(
+            &source_args,
+            &source_layout,
+            [(owned.group().as_str(), owned.units())],
+            selected.requirements().ownership(),
+            rank,
+            &source_plan,
+        )
+        .map_err(|e| error(e.to_string()))?;
+        let source_partition = ArchitecturePartition::from_description(
+            &source_parameters,
+            [(owned.group().as_str(), owned.units())],
+            selected.requirements().ownership().clone(),
+            &complete_state,
+            &state_plan,
+            source_geometry,
+            crate::deepseek::v3::TargetBoundarySchema::from_args(&source_args),
+        )
+        .map_err(|e| error(e.to_string()))?;
+        validate_partitioned_binding(selected.requirements(), &source_partition).map_err(error)?;
+        crate::deepseek::V3PartitionLocalFoundation::from_partition(
+            &source_args,
+            &source_partition,
+        )
+        .map_err(|e| error(e.to_string()))?;
+        if source_partition.units().ne(partition.units()) {
+            return Err(error(
+                "routed V3 transform source changed local unit addresses".into(),
+            ));
+        }
+        let mut source =
+            crate::deepseek::v3::Model::<B>::new_parallel(source_args, source_local, context)
+                .map_err(|e| error(e.to_string()))?;
+        source.set_partition_target_start(owned.units().start);
+        source.install_expert_realization(source_plan);
+        Some((source, source_layout))
+    } else {
+        None
+    };
     let mut architecture =
         crate::deepseek::v3::Model::<B>::new_parallel(selected_args, local, context).map_err(
             |error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()),
@@ -10690,6 +12469,7 @@ where
     architecture.install_expert_realization(plan.clone());
     prepare_family_routed_partition::<B, S, _, _, _, _>(
         architecture,
+        source_architecture,
         selected,
         partition,
         parameters,
@@ -10781,6 +12561,77 @@ where
     .map_err(|error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()))?;
     crate::deepseek::V4PartitionLocalFoundation::from_partition(&selected_args, &partition)
         .map_err(|error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()))?;
+    let source_architecture = if selected.base().text().parameters().iter().any(|parameter| {
+        matches!(
+            parameter.lowering(),
+            eredu_runtime::WeightLoweringKind::Transform
+                | eredu_runtime::WeightLoweringKind::DerivedTransform
+        )
+    }) {
+        let error = |error: String| DenseDecoderPartitionedDispatchError::Architecture(error);
+        let source_args =
+            crate::replicated_text::source_deepseek_v4_args(&selected_args, selected.base().text())
+                .map_err(error)?;
+        let source_parameters = crate::deepseek::parallel::v4_parameter_description(&source_args)
+            .map_err(|e| error(e.to_string()))?;
+        validate_transform_parameter_space(&source_parameters, &parameters).map_err(error)?;
+        let source_layout =
+            derive_partitioned_transform_source_layout(&source_parameters, &parameters, rank)
+                .map_err(error)?;
+        let source_local =
+            crate::deepseek::parallel::v4_local_geometry(&source_args, &source_layout)
+                .map_err(|e| error(e.to_string()))?;
+        if source_local.state_layout() != &complete_state {
+            return Err(error(
+                "routed V4 transform source changed local state geometry".into(),
+            ));
+        }
+        let source_plan = crate::deepseek::v4_partition_expert_realization_plan(
+            &source_args,
+            &source_local,
+            rank,
+        )
+        .map_err(|e| error(e.to_string()))?;
+        let source_geometry = crate::deepseek::v4_partition_local_geometry(
+            &source_args,
+            &source_layout,
+            [(owned.group().as_str(), owned.units())],
+            selected.requirements().ownership(),
+            rank,
+            &source_plan,
+        )
+        .map_err(|e| error(e.to_string()))?;
+        let source_partition = ArchitecturePartition::from_description(
+            &source_parameters,
+            [(owned.group().as_str(), owned.units())],
+            selected.requirements().ownership().clone(),
+            &complete_state,
+            &state_plan,
+            source_geometry,
+            crate::deepseek::v4::TargetBoundarySchema::from_args(&source_args)
+                .map_err(|e| error(e.to_string()))?,
+        )
+        .map_err(|e| error(e.to_string()))?;
+        validate_partitioned_binding(selected.requirements(), &source_partition).map_err(error)?;
+        crate::deepseek::V4PartitionLocalFoundation::from_partition(
+            &source_args,
+            &source_partition,
+        )
+        .map_err(|e| error(e.to_string()))?;
+        if source_partition.units().ne(partition.units()) {
+            return Err(error(
+                "routed V4 transform source changed local unit addresses".into(),
+            ));
+        }
+        let mut source =
+            crate::deepseek::v4::Model::<B>::new_parallel(source_args, source_local, context)
+                .map_err(|e| error(e.to_string()))?;
+        source.set_partition_target_start(owned.units().start);
+        source.install_expert_realization(source_plan);
+        Some((source, source_layout))
+    } else {
+        None
+    };
     let mut architecture =
         crate::deepseek::v4::Model::<B>::new_parallel(selected_args, local, context).map_err(
             |error| DenseDecoderPartitionedDispatchError::Architecture(error.to_string()),
@@ -10789,6 +12640,7 @@ where
     architecture.install_expert_realization(plan.clone());
     prepare_family_routed_partition::<B, S, _, _, _, _>(
         architecture,
+        source_architecture,
         selected,
         partition,
         parameters,
@@ -10804,6 +12656,7 @@ where
 #[allow(clippy::too_many_arguments)]
 fn prepare_family_routed_partition<B, S, A, G, E, V>(
     architecture: A,
+    source_architecture: Option<(A, eredu_runtime::LocalModelLayout)>,
     selected: SelectedPartitionedAdmission<SelectedRoutedTextRealization, RoutedTextRequirements>,
     partition: ArchitecturePartition<G, A::Boundary>,
     parameters: eredu_runtime::ArchitectureParameterDescription,
@@ -10900,7 +12753,11 @@ where
                 E::into_routed_grouped_plan(plan),
                 catalog,
                 addressable_members,
-            ),
+                &layout,
+            )
+            .map_err(|error| {
+                DenseDecoderPartitionedDispatchError::Architecture(error.to_string())
+            })?,
     )]);
     let execution = PreparedRoutedExecutionHandoff::prepare::<B, S, _, _, _>(&prepared, &banks)
         .map_err(DenseDecoderPartitionedDispatchError::Architecture)?;
@@ -10908,6 +12765,7 @@ where
         .visit(
             PreparedRoutedPartitionedArchitecture {
                 prepared,
+                source_architecture,
                 layout,
                 tasks,
                 capability_estimate,
@@ -11217,6 +13075,16 @@ pub fn dense_decoder_partitioned_production_route(
         models,
         (None, Some(crate::configuration::GgufModelConfig::NemotronH(args)))
             if !args.has_sparse_moe_layers() && args.num_nextn_predict_layers == 0
+    ) || matches!(
+        models,
+        (Some(crate::configuration::SafetensorsModelConfig::DeepSeekV3(args)), None)
+            | (None, Some(crate::configuration::GgufModelConfig::DeepSeekV3(args)))
+            if !args.has_sparse_moe_layers() && args.num_nextn_predict_layers == 0
+    ) || matches!(
+        models,
+        (Some(crate::configuration::SafetensorsModelConfig::QwenHybrid(args)), None)
+            | (None, Some(crate::configuration::GgufModelConfig::QwenHybrid(args)))
+            if args.vision.is_none() && !args.text.is_moe() && args.text.mtp_num_hidden_layers == 0
     );
     let support = if llama_compatible || qwen_compatible {
         DenseDecoderProductionSupport::COMPLETE_DENSE
@@ -11402,6 +13270,7 @@ where
         G,
         W,
     >,
+    source_architecture: Option<(A, eredu_runtime::LocalModelLayout)>,
     layout: eredu_runtime::LocalModelLayout,
     tasks: Vec<eredu_runtime::ReplicatedTextMaterializationTask>,
     capability_estimate: crate::capability::CapabilityEstimate,
@@ -11650,7 +13519,7 @@ impl PreparedRoutedExecutionHandoff {
         let PreparedRoutedUnitStrategy::Local {
             realizations,
             expert_group,
-            ..
+            tensor_group,
         } = &self.strategy
         else {
             return Err("pipeline routed recipe cannot construct a local executor".into());
@@ -11661,6 +13530,7 @@ impl PreparedRoutedExecutionHandoff {
             provider,
             realizations.clone(),
             *expert_group,
+            *tensor_group,
             movement,
         ))
     }
@@ -11689,6 +13559,9 @@ impl PreparedRoutedExecutionHandoff {
                     *expert_group,
                     movement,
                     *tensor_group,
+                    self.execution_plan
+                        .commit_barrier()
+                        .ok_or("routed wave has no selected agreement group")?,
                     collective_waves.clone(),
                 )
             }
@@ -11696,6 +13569,7 @@ impl PreparedRoutedExecutionHandoff {
                 provider,
                 realizations.clone(),
                 None,
+                *tensor_group,
                 movement,
             )),
             _ => Err("routed pipeline collective wave handoff is inconsistent".into()),
@@ -11742,6 +13616,7 @@ where
         A::Error: std::fmt::Display,
         F: FnOnce(
             eredu_runtime::PartitionedSessionFactoryInput<A, G, W>,
+            Option<(A, eredu_runtime::LocalModelLayout)>,
             eredu_runtime::LocalModelLayout,
             &eredu_runtime::SelectedReplicatedTextRealization,
             PreparedRoutedExecutionHandoff,
@@ -11750,6 +13625,7 @@ where
     {
         let Self {
             prepared,
+            source_architecture,
             layout,
             tasks,
             capability_estimate: _,
@@ -11774,6 +13650,25 @@ where
             return Err(eredu_runtime::PartitionedSessionPreparationError::Contract(
                 "precomputed routed local layout differs from consumed partition authority".into(),
             ));
+        }
+        if let Some((source, source_layout)) = source_architecture.as_ref() {
+            let source_parameters = source.parameter_description(context).map_err(|error| {
+                eredu_runtime::PartitionedSessionPreparationError::Contract(error.to_string())
+            })?;
+            validate_transform_parameter_space(&source_parameters, &parameters)
+                .map_err(eredu_runtime::PartitionedSessionPreparationError::Contract)?;
+            let derived_source_layout = derive_partitioned_transform_source_layout(
+                &source_parameters,
+                &parameters,
+                topology_rank,
+            )
+            .map_err(eredu_runtime::PartitionedSessionPreparationError::Contract)?;
+            if &derived_source_layout != source_layout {
+                return Err(eredu_runtime::PartitionedSessionPreparationError::Contract(
+                    "precomputed routed transform source layout differs from its architecture"
+                        .into(),
+                ));
+            }
         }
         let excluded = if matches!(
             bank_residency,
@@ -11810,7 +13705,16 @@ where
             topology,
             eredu_runtime::ReplicatedTextOutputSelection::LastSequencePosition,
             context,
-            move |input, selected, context| factory(input, layout, selected, execution, context),
+            move |input, selected, context| {
+                factory(
+                    input,
+                    source_architecture,
+                    layout,
+                    selected,
+                    execution,
+                    context,
+                )
+            },
         )
     }
 
@@ -11873,10 +13777,16 @@ where
             G,
             W,
         >,
+        Option<(A, eredu_runtime::LocalModelLayout)>,
         eredu_runtime::LocalModelLayout,
         Vec<eredu_runtime::ReplicatedTextMaterializationTask>,
     ) {
-        (self.prepared, self.layout, self.tasks)
+        (
+            self.prepared,
+            self.source_architecture,
+            self.layout,
+            self.tasks,
+        )
     }
 }
 
@@ -12272,6 +14182,69 @@ where
 mod tests {
     use super::*;
 
+    #[test]
+    fn physical_chunk_placement_covers_short_tail_and_matching_scales() {
+        use eredu_runtime::{MemberSharding, ParameterMemberSpec, TensorPlacement};
+        for (shape, axis, chunk, expected) in [
+            ([259, 130], 0, 128, [0..256, 256..259]),
+            ([130, 259], 1, 128, [0..256, 256..259]),
+            ([3, 2], 0, 1, [0..2, 2..3]),
+            ([2, 3], 1, 1, [0..2, 2..3]),
+        ] {
+            let member = ParameterMemberSpec::new(
+                "opaque",
+                shape,
+                MemberSharding::PartitionedChunks {
+                    axis,
+                    chunk_size: chunk,
+                },
+            );
+            for (rank, range) in expected.into_iter().enumerate() {
+                let (placement, local) = resolve_member(&member, Some(3), rank, 2).unwrap();
+                assert_eq!(
+                    placement,
+                    TensorPlacement::Range {
+                        axis,
+                        start: range.start,
+                        end: range.end
+                    }
+                );
+                assert_eq!(local[axis], range.len());
+                assert_eq!(local[1 - axis], shape[1 - axis]);
+            }
+            assert!(resolve_member(&member, Some(2), 0, 2).is_err());
+            assert!(resolve_member(&member, Some(3), 0, 4).is_err());
+        }
+    }
+
+    #[test]
+    fn physical_chunk_segments_preserve_each_fused_half_tail() {
+        use eredu_runtime::{MemberSharding, ParameterMemberSpec, TensorPlacement};
+        let member = ParameterMemberSpec::new(
+            "fused",
+            [518, 130],
+            MemberSharding::PartitionedChunkSegments {
+                axis: 0,
+                segments: vec![0..259, 259..518],
+                chunk_size: 128,
+            },
+        );
+        for (rank, expected) in [
+            (0, (0..256).chain(259..515).collect::<Vec<_>>()),
+            (1, vec![256, 257, 258, 515, 516, 517]),
+        ] {
+            let (placement, shape) = resolve_member(&member, Some(3), rank, 2).unwrap();
+            assert_eq!(shape, [expected.len(), 130]);
+            assert_eq!(
+                placement,
+                TensorPlacement::Indices {
+                    axis: 0,
+                    indices: expected
+                }
+            );
+        }
+    }
+
     #[derive(Debug, Clone, Copy, Eq, PartialEq)]
     struct TraceSpec;
 
@@ -12603,6 +14576,7 @@ mod tests {
             topology: rank,
             groups: Vec::new(),
             ownership: PartitionOwnership::new(false, false, Vec::<String>::new()).unwrap(),
+            publication_owner: 0,
             state: None,
             logical_parameter_targets: Vec::new(),
             activation_dtype: PipelineActivationDtype::Float32,

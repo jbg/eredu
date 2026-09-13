@@ -375,6 +375,13 @@ fn add_safetensors_layer(
         head,
         "key/value projection width",
     )?;
+    for (projection, _, width) in attention_biases(args, policy, hidden, query, key_value) {
+        common.push(safe_alias(
+            format!("{released}.self_attn.{projection}.bias"),
+            format!("{canonical}.self_attn.{projection}.bias"),
+            vec![width],
+        ));
+    }
     for local in [
         "input_layernorm.weight",
         "post_attention_layernorm.weight",
@@ -852,6 +859,31 @@ fn checked_mul(left: usize, right: usize, name: &str) -> Result<usize, String> {
         .ok_or_else(|| format!("Gemma 4 {name} geometry overflows"))
 }
 
+// Bias ownership follows the same projection schedule as the executable.
+// Shared-KV consumers project only Q/O; reused values have no separate V bias.
+fn attention_biases(
+    args: &ModelArgs,
+    policy: super::LayerPolicy,
+    hidden: usize,
+    query: usize,
+    key_value: usize,
+) -> Vec<(&'static str, &'static str, usize)> {
+    if !args.attention_bias {
+        return Vec::new();
+    }
+    let mut biases = vec![
+        ("q_proj", "attn_q", query),
+        ("o_proj", "attn_output", hidden),
+    ];
+    if policy.key_value.owns_state() {
+        biases.push(("k_proj", "attn_k", key_value));
+        if policy.key_value.value() != Some(AttentionValueSource::ReuseKey) {
+            biases.push(("v_proj", "attn_v", key_value));
+        }
+    }
+    biases
+}
+
 /// Builds the strict text GGUF catalog, including shared-KV omissions and
 /// split/fused routed-expert alternatives.
 pub fn gguf_plan(args: &ModelArgs) -> Result<GgufCheckpointPlan, String> {
@@ -914,6 +946,13 @@ pub fn gguf_plan(args: &ModelArgs) -> Result<GgufCheckpointPlan, String> {
             head,
             "key/value projection width",
         )?;
+        for (_, projection, width) in attention_biases(args, policy, hidden, query, key_value) {
+            common.push(gguf(
+                format!("{root}.{projection}.bias"),
+                vec![width],
+                TensorOperation::Vector,
+            ));
+        }
         for local in [
             "attn_norm.weight",
             "post_attention_norm.weight",
@@ -1119,6 +1158,15 @@ pub fn translate_gguf_weight_name(name: &str) -> String {
     let Some((layer, parameter)) = rest.split_once('.') else {
         return name.into();
     };
+    let scalar = match parameter {
+        "layer_output_scale.weight" => Some("layer_scalar"),
+        "ffn_gate_inp.scale" => Some("router.scale"),
+        "ffn_down_exps.scale" => Some("router.per_expert_scale"),
+        _ => None,
+    };
+    if let Some(scalar) = scalar {
+        return format!("model.layers.{layer}.{scalar}");
+    }
     for (source, target) in [
         ("attn_q", "self_attn.q_proj"),
         ("attn_k", "self_attn.k_proj"),
@@ -1154,6 +1202,16 @@ pub fn translate_gguf_weight_name(name: &str) -> String {
         }
     }
     name.into()
+}
+
+/// Translates a text GGUF parameter into the complete family's parameter tree.
+/// Standalone text and assistant construction retain `translate_gguf_weight_name`.
+pub fn translate_family_gguf_weight_name(name: &str) -> String {
+    let name = translate_gguf_weight_name(name);
+    match name.strip_prefix("model.") {
+        Some(local) => format!("model.language_model.{local}"),
+        None => name,
+    }
 }
 
 /// Resolves the released separate gate/up or already-fused sparse bank into

@@ -6,6 +6,7 @@ pub struct SpeculativeExecutionStreams<'a> {
     target: &'a Stream,
     draft: &'a Stream,
     topology: SpeculativeExecutionTopology,
+    capture: Option<&'a super::super::session::SpeculativePartitionBinding>,
 }
 
 impl<'a> SpeculativeExecutionStreams<'a> {
@@ -38,6 +39,7 @@ impl<'a> SpeculativeExecutionStreams<'a> {
             target,
             draft,
             topology,
+            capture: None,
         })
     }
 
@@ -59,6 +61,61 @@ impl<'a> SpeculativeExecutionStreams<'a> {
             target: stream,
             draft: stream,
             topology: SpeculativeExecutionTopology::Single,
+            capture: None,
+        }
+    }
+
+    pub(in crate::composition::mlx) fn with_capture_binding(
+        mut self,
+        binding: Option<&'a super::super::session::SpeculativePartitionBinding>,
+    ) -> Self {
+        self.capture = binding;
+        self
+    }
+    pub(in crate::composition::mlx) fn capture_binding(
+        self,
+    ) -> Option<&'a super::super::session::SpeculativePartitionBinding> {
+        self.capture
+    }
+
+    pub(in crate::composition::mlx) fn coordinate_speculative_step(
+        self,
+        local: Vec<eredu_core::SpeculativeScheduleState>,
+    ) -> Result<Vec<eredu_core::SpeculativeScheduleState>, eredu_core::BackendFailure> {
+        match self.capture {
+            Some(binding) => binding.coordinate_speculative_step(local),
+            None => Ok(local),
+        }
+    }
+
+    pub(in crate::composition::mlx) fn agree_text_preparation(
+        self,
+        stage: eredu_core::run_preparation::TextPreparationStage,
+        status: eredu_core::run_preparation::TextPreparationStatus,
+    ) -> Result<eredu_core::run_preparation::TextPreparationOutcome, eredu_core::BackendFailure>
+    {
+        use eredu_core::run_preparation::{
+            TextPreparationOutcome as O, TextPreparationStatus as S,
+        };
+        match self.capture {
+            Some(binding) => binding.agree_text_preparation(stage, status),
+            None => Ok(match status {
+                S::Ready => O::Ready,
+                S::Cancelled => O::Cancelled,
+                S::Failed => O::Rejected { rank: 0 },
+            }),
+        }
+    }
+
+    pub(in crate::composition::mlx) fn finish_preparation<T, E>(
+        self,
+        stage: eredu_core::run_preparation::TextPreparationStage,
+        local: Result<T, E>,
+        map_backend: impl FnOnce(eredu_core::BackendFailure) -> E,
+    ) -> Result<T, E> {
+        match self.capture {
+            Some(binding) => binding.finish_preparation(stage, local, map_backend),
+            None => local,
         }
     }
 

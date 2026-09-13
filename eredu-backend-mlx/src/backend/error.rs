@@ -4,9 +4,10 @@ use safemlx::error::Exception;
 /// The payload has no public constructor; native completion must still be
 /// proven independently before a session can accept another operation.
 #[derive(Debug, thiserror::Error)]
-#[error("architecture model error: {message}")]
+#[error("architecture model error: {source}")]
 pub struct ModelStatePreservedError {
-    message: String,
+    #[source]
+    source: Box<dyn std::error::Error + Send + Sync>,
 }
 
 fn format_keys(keys: &[String]) -> String {
@@ -29,6 +30,28 @@ fn format_keys(keys: &[String]) -> String {
 /// Error type used by MLX model loading and execution.
 #[non_exhaustive]
 pub enum Error {
+    /// Cold text-run agreement or its selected transport failed.
+    #[error("text run preparation failed: {0}")]
+    RunPreparation(#[from] eredu_runtime::run_preparation::TextPreparationAgreementError),
+
+    /// Initial manifest agreement failed with its original transport cause.
+    #[error("parallel placement error: communication manifest consensus failed: {0}")]
+    CommunicationManifestConsensus(
+        #[source] Box<eredu_runtime::CommunicationManifestConsensusError<Error>>,
+    ),
+
+    /// Rank-local materialization or policy construction failed with its cause.
+    #[error("architecture model error: {0}")]
+    PartitionedRuntimeConstruction(
+        #[source] Box<eredu_runtime::PartitionedRuntimeConstructionError<eredu_nn::Error, Error>>,
+    ),
+
+    /// The prepared partition factory failed with its exact handoff error.
+    #[error("architecture model error: {0}")]
+    PartitionedSessionPreparation(
+        #[source] Box<eredu_runtime::PartitionedSessionPreparationError<Error>>,
+    ),
+
     /// Backend capability discovery, preparation, execution, or completion failed.
     #[error(transparent)]
     Backend(#[from] eredu_core::BackendError),
@@ -174,8 +197,12 @@ pub enum Error {
         unused: Vec<String>,
     },
 
+    /// Observation policy, coordination, or collection failed with a retained cause.
+    #[error("observation failed: {0}")]
+    Observation(#[source] Box<dyn std::error::Error + Send + Sync>),
+
     /// Error reported by the underlying MLX bindings.
-    #[error(transparent)]
+    #[error("{0}")]
     Exception(#[from] Exception),
 
     /// Filesystem I/O error.
@@ -190,32 +217,74 @@ pub enum Error {
     #[error(transparent)]
     LoadWeights(#[from] safemlx::error::IoError),
 
-    /// Boxed error used for third-party loader failures.
-    #[error(transparent)]
+    /// Boxed failure retaining the original error, including source-less leaves.
+    #[error("{0}")]
     Other(#[from] Box<dyn std::error::Error + Send + Sync>),
 }
 
 impl Error {
-    pub(crate) fn before_model_mutation(error: impl std::fmt::Display) -> Self {
+    pub(crate) fn observation(error: impl std::error::Error + Send + Sync + 'static) -> Self {
+        Self::Observation(Box::new(error))
+    }
+
+    pub(crate) fn before_model_mutation(
+        error: impl Into<Box<dyn std::error::Error + Send + Sync>>,
+    ) -> Self {
         Self::ModelStatePreserved(ModelStatePreservedError {
-            message: error.to_string(),
+            source: error.into(),
         })
     }
 
     pub(crate) fn after_model_call(
-        error: impl std::fmt::Display,
+        error: impl Into<Box<dyn std::error::Error + Send + Sync>>,
         before: Option<u64>,
         after: Option<u64>,
     ) -> Self {
         if matches!((before, after), (Some(before), Some(after)) if after > before) {
             Self::before_model_mutation(error)
         } else {
-            Self::ArchitectureModel(error.to_string())
+            Self::Other(error.into())
+        }
+    }
+
+    /// The shared runtime alone establishes whether admission preceded mutable
+    /// state access. A rejection witness never substitutes for native completion.
+    pub(crate) fn after_replicated_model_call<A, P, M>(
+        error: eredu_runtime::ReplicatedTextSessionError<A, P, M>,
+        before: Option<u64>,
+        after: Option<u64>,
+    ) -> Self
+    where
+        A: std::error::Error + Send + Sync + 'static,
+        P: std::error::Error + Send + Sync + 'static,
+        M: std::error::Error + Send + Sync + 'static,
+    {
+        if matches!(
+            error,
+            eredu_runtime::ReplicatedTextSessionError::BeforeStateMutation(_)
+        ) {
+            Self::before_model_mutation(error)
+        } else {
+            Self::after_model_call(error, before, after)
         }
     }
 
     pub(crate) const fn model_state_preserved(&self) -> bool {
         matches!(self, Self::ModelStatePreserved(_))
+    }
+}
+
+impl From<eredu_runtime::PartitionedRuntimeConstructionError<eredu_nn::Error, Error>> for Error {
+    fn from(
+        error: eredu_runtime::PartitionedRuntimeConstructionError<eredu_nn::Error, Error>,
+    ) -> Self {
+        Self::PartitionedRuntimeConstruction(Box::new(error))
+    }
+}
+
+impl From<eredu_runtime::PartitionedSessionPreparationError<Error>> for Error {
+    fn from(error: eredu_runtime::PartitionedSessionPreparationError<Error>) -> Self {
+        Self::PartitionedSessionPreparation(Box::new(error))
     }
 }
 

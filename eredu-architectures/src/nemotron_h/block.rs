@@ -115,10 +115,41 @@ impl<B: NeuralBackend> ReplicatedBlock<B> {
     where
         S: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
     {
+        self.forward_instrumented(
+            hidden,
+            mask,
+            state,
+            context,
+            &mut crate::decoder::ComponentInstrumentation::disabled(),
+        )
+    }
+
+    pub(crate) fn forward_instrumented<S>(
+        &mut self,
+        hidden: &B::Tensor,
+        mask: Option<&B::Tensor>,
+        state: &mut S,
+        context: &<B::Tensor as Tensor>::Context,
+        instrumentation: &mut crate::decoder::ComponentInstrumentation<'_, B::Tensor>,
+    ) -> Result<B::Tensor, Error>
+    where
+        S: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
+    {
+        let boundary = match &self.operator {
+            ReplicatedOperator::Attention(_) => Some("attention"),
+            ReplicatedOperator::Dense(_) => Some("feed_forward"),
+            ReplicatedOperator::Mamba(_) => Some("mixer"),
+        };
         let normalized = self.norm.forward(hidden, context)?;
+        let normalized = match boundary {
+            Some("attention") => instrumentation.apply("attention.input", normalized)?,
+            Some("mixer") => instrumentation.apply("mixer.input", normalized)?,
+            Some(_) => instrumentation.apply("feed_forward.input", normalized)?,
+            None => normalized,
+        };
         let output = match &mut self.operator {
             ReplicatedOperator::Mamba(mamba) => mamba.forward(&normalized, state, context)?,
-            ReplicatedOperator::Attention(attention) => attention.forward(
+            ReplicatedOperator::Attention(attention) => attention.forward_instrumented(
                 AttentionInput {
                     hidden: &normalized,
                     mask,
@@ -126,11 +157,22 @@ impl<B: NeuralBackend> ReplicatedBlock<B> {
                     allow_sliding_prefill: true,
                     rotary_position: None,
                 },
+                None,
                 context,
+                instrumentation,
             )?,
-            ReplicatedOperator::Dense(mlp) => mlp.forward(&normalized, context)?,
+            ReplicatedOperator::Dense(mlp) => {
+                mlp.forward_instrumented(&normalized, None, context, instrumentation)?
+            }
         };
-        B::add_residual(hidden, &output, self.residual_in_fp32, context)
+        finish_component_residual::<B>(
+            hidden,
+            output,
+            boundary,
+            self.residual_in_fp32,
+            context,
+            instrumentation,
+        )
     }
 }
 
@@ -347,32 +389,16 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> Block<B> {
         P: RoutedExpertProvider<B>,
         P::Error: std::fmt::Display,
     {
-        let normalized = self.norm.forward(hidden, context)?;
-        let output = match &mut self.operator {
-            Operator::Mamba(mamba) => mamba.forward(&normalized, state, context)?,
-            Operator::Attention(attention) => attention.forward(
-                AttentionInput {
-                    hidden: &normalized,
-                    mask,
-                    cache: Some(state),
-                    allow_sliding_prefill: true,
-                    rotary_position: None,
-                },
-                context,
-            )?,
-            Operator::Dense(mlp) => mlp.forward(&normalized, context)?,
-            Operator::Sparse(moe) => moe.forward_with_provider(
-                &normalized,
-                if hidden.dim(1) > 1 {
-                    eredu_runtime::ExpertPass::Prefill
-                } else {
-                    eredu_runtime::ExpertPass::Decode
-                },
-                context,
-                provider,
-            )?,
-        };
-        B::add_residual(hidden, &output, self.residual_in_fp32, context)
+        self.forward_instrumented_with_provider(
+            "",
+            0,
+            hidden,
+            mask,
+            state,
+            context,
+            provider,
+            &mut crate::decoder::ComponentInstrumentation::disabled(),
+        )
     }
 
     /// Executes one physical unit and reports sparse routing through the neutral observer.
@@ -394,7 +420,48 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> Block<B> {
         P: RoutedExpertProvider<B>,
         P::Error: std::fmt::Display,
     {
+        let mut borrowed = eredu_runtime::BorrowedActivationObserver(observer);
+        self.forward_instrumented_with_provider(
+            path,
+            expert_count,
+            hidden,
+            mask,
+            state,
+            context,
+            provider,
+            &mut crate::decoder::ComponentInstrumentation::new(path, &mut borrowed),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn forward_instrumented_with_provider<S, P>(
+        &mut self,
+        path: &str,
+        expert_count: i32,
+        hidden: &B::Tensor,
+        mask: Option<&B::Tensor>,
+        state: &mut S,
+        context: &<B::Tensor as Tensor>::Context,
+        provider: &mut P,
+        instrumentation: &mut crate::decoder::ComponentInstrumentation<'_, B::Tensor>,
+    ) -> Result<B::Tensor, Error>
+    where
+        S: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
+        P: RoutedExpertProvider<B>,
+        P::Error: std::fmt::Display,
+    {
+        let boundary = match &self.operator {
+            Operator::Attention(_) => Some("attention"),
+            Operator::Dense(_) | Operator::Sparse(_) => Some("feed_forward"),
+            Operator::Mamba(_) => Some("mixer"),
+        };
         let normalized = self.norm.forward(hidden, context)?;
+        let normalized = match boundary {
+            Some("attention") => instrumentation.apply("attention.input", normalized)?,
+            Some("mixer") => instrumentation.apply("mixer.input", normalized)?,
+            Some(_) => instrumentation.apply("feed_forward.input", normalized)?,
+            None => normalized,
+        };
         let pass = if hidden.dim(1) > 1 {
             eredu_runtime::ExpertPass::Prefill
         } else {
@@ -402,7 +469,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> Block<B> {
         };
         let output = match &mut self.operator {
             Operator::Mamba(mamba) => mamba.forward(&normalized, state, context)?,
-            Operator::Attention(attention) => attention.forward(
+            Operator::Attention(attention) => attention.forward_instrumented(
                 AttentionInput {
                     hidden: &normalized,
                     mask,
@@ -410,20 +477,68 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> Block<B> {
                     allow_sliding_prefill: true,
                     rotary_position: None,
                 },
+                None,
                 context,
+                instrumentation,
             )?,
-            Operator::Dense(mlp) => mlp.forward(&normalized, context)?,
-            Operator::Sparse(moe) => moe.forward_observed_with_provider(
-                &format!("{path}.routing"),
-                expert_count,
-                &normalized,
-                pass,
-                context,
-                observer,
-                provider,
-            )?,
+            Operator::Dense(mlp) => {
+                mlp.forward_instrumented(&normalized, None, context, instrumentation)?
+            }
+            Operator::Sparse(moe) => match instrumentation.observer() {
+                Some(observer) => moe.forward_observed_with_provider(
+                    &format!("{path}.routing"),
+                    expert_count,
+                    &normalized,
+                    pass,
+                    context,
+                    observer,
+                    provider,
+                )?,
+                None => moe.forward_with_provider(&normalized, pass, context, provider)?,
+            },
         };
-        B::add_residual(hidden, &output, self.residual_in_fp32, context)
+        finish_component_residual::<B>(
+            hidden,
+            output,
+            boundary,
+            self.residual_in_fp32,
+            context,
+            instrumentation,
+        )
+    }
+
+    /// Emits the actual component and routed-unit boundaries of a TP unit.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_parallel_observed_with_provider<S, O, P>(
+        &mut self,
+        path: &str,
+        expert_count: i32,
+        hidden: &B::Tensor,
+        mask: Option<&B::Tensor>,
+        state: &mut S,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+        observer: &mut O,
+        provider: &mut P,
+    ) -> Result<B::Tensor, Error>
+    where
+        S: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
+        O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
+        P: eredu_runtime::TensorParallelRoutedExpertProvider<B>,
+        P::Error: std::fmt::Display,
+    {
+        let mut borrowed = eredu_runtime::BorrowedActivationObserver(observer);
+        self.forward_parallel_instrumented_with_provider(
+            path,
+            expert_count,
+            hidden,
+            mask,
+            state,
+            parallel,
+            context,
+            provider,
+            &mut crate::decoder::ComponentInstrumentation::new(path, &mut borrowed),
+        )
     }
 
     /// Executes one placement-resolved unit with tensor collectives.
@@ -441,12 +556,59 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> Block<B> {
         P: eredu_runtime::TensorParallelRoutedExpertProvider<B>,
         P::Error: std::fmt::Display,
     {
+        self.forward_parallel_instrumented_with_provider(
+            "",
+            0,
+            hidden,
+            mask,
+            state,
+            parallel,
+            context,
+            provider,
+            &mut crate::decoder::ComponentInstrumentation::disabled(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn forward_parallel_instrumented_with_provider<S, P>(
+        &mut self,
+        path: &str,
+        expert_count: i32,
+        hidden: &B::Tensor,
+        mask: Option<&B::Tensor>,
+        state: &mut S,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+        provider: &mut P,
+        instrumentation: &mut crate::decoder::ComponentInstrumentation<'_, B::Tensor>,
+    ) -> Result<B::Tensor, Error>
+    where
+        S: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
+        P: eredu_runtime::TensorParallelRoutedExpertProvider<B>,
+        P::Error: std::fmt::Display,
+    {
+        let boundary = match &self.operator {
+            Operator::Attention(_) => Some("attention"),
+            Operator::Dense(_) | Operator::Sparse(_) => Some("feed_forward"),
+            Operator::Mamba(_) => Some("mixer"),
+        };
         let normalized = self.norm.forward(hidden, context)?;
+        let normalized = match boundary {
+            Some("attention") => instrumentation.apply("attention.input", normalized)?,
+            Some("mixer") => instrumentation.apply("mixer.input", normalized)?,
+            Some(_) => instrumentation.apply("feed_forward.input", normalized)?,
+            None => normalized,
+        };
+        let pass = if hidden.dim(1) > 1 {
+            eredu_runtime::ExpertPass::Prefill
+        } else {
+            eredu_runtime::ExpertPass::Decode
+        };
         let output = match &mut self.operator {
             Operator::Mamba(mamba) => {
                 mamba.forward_parallel(&normalized, state, parallel, context)?
             }
-            Operator::Attention(attention) => attention.forward_parallel(
+            Operator::Attention(attention) => attention.forward_instrumented(
                 AttentionInput {
                     hidden: &normalized,
                     mask,
@@ -454,22 +616,72 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> Block<B> {
                     allow_sliding_prefill: true,
                     rotary_position: None,
                 },
-                parallel,
+                Some(parallel),
                 context,
+                instrumentation,
             )?,
-            Operator::Dense(mlp) => mlp.forward_parallel(&normalized, parallel, context)?,
-            Operator::Sparse(moe) => moe.forward_parallel_with_provider(
-                &normalized,
-                if hidden.dim(1) > 1 {
-                    eredu_runtime::ExpertPass::Prefill
-                } else {
-                    eredu_runtime::ExpertPass::Decode
-                },
-                parallel,
-                context,
-                provider,
-            )?,
+            Operator::Dense(mlp) => {
+                mlp.forward_instrumented(&normalized, Some(parallel), context, instrumentation)?
+            }
+            Operator::Sparse(moe) => match instrumentation.observer() {
+                Some(observer) => moe.forward_parallel_observed_with_provider(
+                    &format!("{path}.routing"),
+                    expert_count,
+                    &normalized,
+                    pass,
+                    parallel,
+                    context,
+                    observer,
+                    provider,
+                )?,
+                None => moe.forward_parallel_with_provider(
+                    &normalized,
+                    pass,
+                    parallel,
+                    context,
+                    provider,
+                )?,
+            },
         };
-        B::add_residual(hidden, &output, self.residual_in_fp32, context)
+        finish_component_residual::<B>(
+            hidden,
+            output,
+            boundary,
+            self.residual_in_fp32,
+            context,
+            instrumentation,
+        )
+    }
+}
+
+fn finish_component_residual<B: NeuralBackend>(
+    hidden: &B::Tensor,
+    output: B::Tensor,
+    boundary: Option<&str>,
+    residual_in_fp32: bool,
+    context: &<B::Tensor as Tensor>::Context,
+    instrumentation: &mut crate::decoder::ComponentInstrumentation<'_, B::Tensor>,
+) -> Result<B::Tensor, Error> {
+    let output = match boundary {
+        Some("attention") => {
+            let output = instrumentation.apply("attention.write", output)?;
+            instrumentation.apply("attention.output", output)?
+        }
+        Some("mixer") => {
+            let output = instrumentation.apply("mixer.write", output)?;
+            instrumentation.apply("mixer.output", output)?
+        }
+        Some(_) => {
+            let output = instrumentation.apply("feed_forward.write", output)?;
+            instrumentation.apply("feed_forward.output", output)?
+        }
+        None => output,
+    };
+    let residual = B::add_residual(hidden, &output, residual_in_fp32, context)?;
+    match boundary {
+        Some("attention") => instrumentation.apply("attention.residual", residual),
+        Some("mixer") => instrumentation.apply("mixer.residual", residual),
+        Some(_) => instrumentation.apply("feed_forward.residual", residual),
+        None => Ok(residual),
     }
 }

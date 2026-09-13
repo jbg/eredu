@@ -71,6 +71,8 @@ mod control;
 mod controlled_speculative;
 #[path = "backend_conformance/observed_mock.rs"]
 mod observed_mock;
+#[path = "backend_conformance/preparation.rs"]
+mod preparation;
 #[path = "backend_conformance/templates.rs"]
 mod templates;
 #[path = "backend_conformance/text.rs"]
@@ -125,7 +127,7 @@ enum MockError {
     #[error("synthetic token extraction failure for token {0}")]
     Token(u32),
     #[error("synthetic speculative failure: {0}")]
-    Speculative(String),
+    Speculative(#[source] Box<dyn std::error::Error + Send + Sync>),
 }
 
 impl TokenOutput for MockToken {
@@ -389,6 +391,14 @@ impl DistributedBackend for MockBackend {
 }
 
 impl TextGenerationBackend for MockBackend {
+    fn agree_text_preparation(
+        _: &ModelRuntime<Self>,
+        stage: eredu_core::run_preparation::TextPreparationStage,
+        status: eredu_core::run_preparation::TextPreparationStatus,
+    ) -> Result<eredu_core::run_preparation::TextPreparationOutcome, eredu_core::BackendFailure>
+    {
+        Ok(preparation::agreement(stage, status))
+    }
     fn reset_session(
         _: &Self,
         session: &mut Self::Session,
@@ -472,6 +482,8 @@ impl TextGenerationBackend for MockBackend {
         state: &mut Self::TextGenerationState,
         plan: eredu_core::capture::AdmittedCapturePlan,
     ) -> Result<(), eredu_core::capture::CaptureError> {
+        preparation::native(eredu_core::run_preparation::TextPreparationStage::Instrumentation)
+            .map_err(|error| eredu_core::capture::CaptureError::Invalid(error.to_string()))?;
         observed_mock::validate(&plan)?;
         eredu_runtime::intervention::install_session(&mut state.capture, plan, None)
     }
@@ -488,6 +500,7 @@ impl TextGenerationBackend for MockBackend {
         _: &Self,
         config: TextGenerationConfig,
     ) -> Result<Self::TextGenerationState, Self::Error> {
+        preparation::native(eredu_core::run_preparation::TextPreparationStage::Sampling)?;
         Ok(observed_mock::State {
             sampling: observed_mock::Sampling {
                 temperature: config.sampling().temperature,
@@ -502,6 +515,7 @@ impl TextGenerationBackend for MockBackend {
         _: &Self,
         prompt_token_ids: Vec<u32>,
     ) -> Result<Self::Prompt, Self::Error> {
+        preparation::native(eredu_core::run_preparation::TextPreparationStage::Prompt)?;
         Ok(prompt_token_ids)
     }
 
@@ -511,6 +525,7 @@ impl TextGenerationBackend for MockBackend {
         filter: &TokenFilter,
         state: &mut Self::TextGenerationState,
     ) -> Result<Submission<Self::Token, Self::TextCompletion>, Self::Error> {
+        preparation::forward();
         let sequence = prompt.len();
         let submission = runtime.prefill(prompt)?;
         let output = state.observe(
@@ -534,6 +549,7 @@ impl TextGenerationBackend for MockBackend {
         filter: &TokenFilter,
         state: &mut Self::TextGenerationState,
     ) -> Result<Submission<Self::Token, Self::TextCompletion>, Self::Error> {
+        preparation::forward();
         let submission = runtime.decode(token.0)?;
         let output = state.observe(
             eredu_core::capture::CapturePhase::Decode,
@@ -870,10 +886,61 @@ struct MockDrafter;
 
 struct MockSpeculativeExecutor {
     reject_second: bool,
+    activations: Option<observed_mock::InternalCapture>,
 }
 const CONTROL_REJECTION_PROMPT_TOKEN: u32 = u32::MAX - 32;
 
 impl SpeculativeExecutor for MockSpeculativeExecutor {
+    fn coordinate_speculative_step<'a>(
+        &mut self,
+        states: Vec<eredu_core::SpeculativeScheduleState>,
+        _: (),
+    ) -> Result<Vec<eredu_core::SpeculativeScheduleState>, eredu_core::BackendFailure> {
+        Ok(preparation::coordinate(states))
+    }
+    fn agree_text_preparation<'a>(
+        &mut self,
+        stage: eredu_core::run_preparation::TextPreparationStage,
+        status: eredu_core::run_preparation::TextPreparationStatus,
+        _: (),
+    ) -> Result<eredu_core::run_preparation::TextPreparationOutcome, eredu_core::BackendFailure>
+    {
+        Ok(preparation::agreement(stage, status))
+    }
+
+    fn configure_activation_capture<'a>(
+        &mut self,
+        plan: eredu_core::speculative::AdmittedSpeculativeActivations,
+        request: eredu_core::SpeculativeRequestId,
+        _: (),
+    ) -> Result<(), eredu_core::speculative::SpeculativeControlError> {
+        preparation::native(eredu_core::run_preparation::TextPreparationStage::Instrumentation)
+            .map_err(eredu_core::speculative::SpeculativeControlError::backend)?;
+        assert!(self.activations.is_none());
+        self.activations = observed_mock::InternalCapture::new(&plan, request)?;
+        Ok(())
+    }
+    fn requires_activation_origin(&self) -> bool {
+        self.activations.is_some()
+    }
+    fn set_activation_origin(
+        &mut self,
+        origin: Option<eredu_core::speculative::SpeculativeActivationOrigin>,
+    ) {
+        if let Some(observer) = &mut self.activations {
+            observer.origin(origin);
+        }
+    }
+    fn take_activation_capture(
+        &mut self,
+    ) -> Option<eredu_core::speculative::SpeculativeActivationCapture> {
+        self.activations.as_mut().and_then(|o| o.take())
+    }
+    fn take_activation_error(
+        &mut self,
+    ) -> Option<eredu_core::speculative::SpeculativeControlError> {
+        self.activations.as_mut().and_then(|o| o.error())
+    }
     fn control_snapshot_estimate(
         &self,
         _: &usize,
@@ -889,7 +956,7 @@ impl SpeculativeExecutor for MockSpeculativeExecutor {
         cache: &usize,
         _: &(),
         _: (),
-    ) -> Result<Option<(usize, ())>, MockError> {
+    ) -> Result<Option<(usize, ())>, eredu_core::speculative::SpeculativeControlError> {
         Ok(Some((*cache, ())))
     }
     fn restore_control_snapshot<'a>(
@@ -898,7 +965,7 @@ impl SpeculativeExecutor for MockSpeculativeExecutor {
         saved: &usize,
         _: &(),
         _: (),
-    ) -> Result<Option<()>, MockError> {
+    ) -> Result<Option<()>, eredu_core::speculative::SpeculativeControlError> {
         *cache = *saved;
         Ok(Some(()))
     }
@@ -929,8 +996,25 @@ impl SpeculativeExecutor for MockSpeculativeExecutor {
         cache: &mut Self::Cache,
         _: Self::Context<'a>,
     ) -> Result<SpeculativePrefill<Self::TargetState, Self::Logits>, Self::Error> {
+        preparation::forward();
+        preparation::action("prefill");
         *cache = input.len();
-        Ok(SpeculativePrefill::new(7, (), input.len()))
+        let scale = self
+            .activations
+            .as_mut()
+            .map(|o| {
+                o.run(
+                    eredu_core::speculative::SpeculativeActivationPhase::TargetPrefill,
+                    input.len(),
+                )
+            })
+            .transpose()?
+            .unwrap_or(1.0);
+        Ok(SpeculativePrefill::new(
+            (7.0 * scale) as u32,
+            (),
+            input.len(),
+        ))
     }
 
     fn begin_proposal<'a>(
@@ -940,6 +1024,7 @@ impl SpeculativeExecutor for MockSpeculativeExecutor {
         _: usize,
         _: Self::Context<'a>,
     ) -> Result<Self::DraftState, Self::Error> {
+        preparation::action("begin_proposal");
         Ok(())
     }
 
@@ -949,7 +1034,19 @@ impl SpeculativeExecutor for MockSpeculativeExecutor {
         _: u32,
         _: Self::Context<'a>,
     ) -> Result<Self::Logits, Self::Error> {
-        Ok(11)
+        preparation::action("proposal_logits");
+        let scale = self
+            .activations
+            .as_mut()
+            .map(|o| {
+                o.run(
+                    eredu_core::speculative::SpeculativeActivationPhase::Proposal { depth: 0 },
+                    1,
+                )
+            })
+            .transpose()?
+            .unwrap_or(1.0);
+        Ok((11.0 * scale) as u32)
     }
 
     fn checkpoint(&self, cache: &Self::Cache) -> Result<Self::CacheCheckpoint, Self::Error> {
@@ -962,6 +1059,7 @@ impl SpeculativeExecutor for MockSpeculativeExecutor {
         checkpoint: &Self::CacheCheckpoint,
         _: Self::Context<'a>,
     ) -> Result<(), Self::Error> {
+        preparation::action("restore");
         *cache = *checkpoint;
         Ok(())
     }
@@ -972,13 +1070,28 @@ impl SpeculativeExecutor for MockSpeculativeExecutor {
         cache: &mut Self::Cache,
         _: Self::Context<'a>,
     ) -> Result<Submission<Self::Verification, Self::Completion>, Self::Error> {
+        preparation::action("verification");
         *cache += input_tokens.len();
+        let scale = self
+            .activations
+            .as_mut()
+            .map(|o| {
+                o.run(
+                    eredu_core::speculative::SpeculativeActivationPhase::Verification,
+                    input_tokens.len(),
+                )
+            })
+            .transpose()?
+            .unwrap_or(1.0);
         Ok(Submission {
             output: if self.reject_second {
                 vec![11, 12, 17, 17]
             } else {
                 vec![11, 17]
-            },
+            }
+            .into_iter()
+            .map(|v| (v as f32 * scale) as u32)
+            .collect(),
             completion: Done,
         })
     }
@@ -1001,6 +1114,7 @@ impl SpeculativeExecutor for MockSpeculativeExecutor {
         verified_inputs: usize,
         _: Self::Context<'a>,
     ) -> Result<SpeculativeCommit<Self::TargetState>, Self::Error> {
+        preparation::action("commit");
         *cache = *checkpoint + verified_inputs;
         Ok(SpeculativeCommit::new((), 0))
     }
@@ -1114,12 +1228,13 @@ impl SpeculativeSampling for MockSpeculativeSampling {
         logits: &Self::Logits,
         _: f32,
         history: &[u32],
-        _: SamplingPlacement,
+        placement: SamplingPlacement,
         _: Self::Context<'a>,
     ) -> Result<Self::Distribution, Self::Error>
     where
         Self: 'a,
     {
+        preparation::sampling(placement)?;
         Ok(self
             .forced
             .filter(|p| p.1 == history.len())
@@ -1195,6 +1310,24 @@ impl SpeculativeSampling for MockSpeculativeSampling {
 impl SpeculativeGenerationBackend for MockBackend {
     type Drafter = MockDrafter;
 
+    fn speculative_activation_discovery(
+        runtime: &ModelRuntime<Self>,
+    ) -> Result<
+        eredu_core::speculative::SpeculativeActivationDiscovery,
+        eredu_core::capture::CaptureError,
+    > {
+        Ok(eredu_core::speculative::SpeculativeActivationDiscovery {
+            schema_version: eredu_core::speculative::SPECULATIVE_ACTIVATION_SCHEMA_VERSION,
+            execution_identity: "mock-speculative".into(),
+            captures: observed_mock::discovery(),
+            interventions: Self::intervention_discovery(runtime)?,
+            bindings: vec![eredu_core::speculative::SpeculativeCaptureBinding {
+                node_id: "output".into(),
+                scope: eredu_core::speculative::SpeculativeCaptureScope::Target,
+            }],
+        })
+    }
+
     fn speculative_capability(_: &ModelRuntime<Self>) -> SpeculativeCapability {
         SpeculativeCapability::Ready {
             draft_source: SpeculativeDraftSource::Embedded,
@@ -1249,6 +1382,7 @@ impl SpeculativeGenerationBackend for MockBackend {
             .run(
                 &mut MockSpeculativeExecutor {
                     reject_second: result_cardinality == Some(CONTROL_REJECTION_PROMPT_TOKEN),
+                    activations: None,
                 },
                 prepared,
                 eredu_core::SpeculativeExecutionTopology::Single,
@@ -1256,7 +1390,7 @@ impl SpeculativeGenerationBackend for MockBackend {
                 false,
                 (),
             )
-            .map_err(|error| MockError::Speculative(error.to_string()))?;
+            .map_err(|error| MockError::Speculative(Box::new(error)))?;
         match result_cardinality {
             Some(NO_SPECULATIVE_RESULTS_PROMPT_TOKEN) => output.clear_requests(),
             Some(MULTIPLE_SPECULATIVE_RESULTS_PROMPT_TOKEN) => {

@@ -9,6 +9,7 @@ use eredu_nn::{
 use eredu_runtime::RuntimeStateComponents;
 
 use super::{HybridConfig, HybridVariant};
+use crate::decoder::ComponentInstrumentation;
 
 /// One recurrent gated-delta attention operator.
 #[derive(Debug, Clone, eredu_nn::Parameterized)]
@@ -147,25 +148,38 @@ impl<B: NeuralBackend> LinearAttention<B> {
     where
         S: RuntimeStateComponents<B>,
     {
-        self.forward_inner(input, state, context, |projection, value, context| {
-            projection.forward(value, context)
-        })
+        self.forward_instrumented(
+            input,
+            state,
+            context,
+            &mut ComponentInstrumentation::disabled(),
+        )
     }
 
-    fn forward_inner<S, F>(
+    /// Executes the same recurrence with component hooks on consumed channels.
+    pub fn forward_instrumented<S>(
         &mut self,
         input: &B::Tensor,
         state: &mut S,
         context: &<B::Tensor as Tensor>::Context,
-        project: F,
+        instrumentation: &mut ComponentInstrumentation<'_, B::Tensor>,
     ) -> Result<B::Tensor, Error>
     where
         S: RuntimeStateComponents<B>,
-        F: FnOnce(
-            &mut B::Linear,
-            &B::Tensor,
-            &<B::Tensor as Tensor>::Context,
-        ) -> Result<B::Tensor, Error>,
+    {
+        self.forward_inner(input, state, context, instrumentation, None)
+    }
+
+    fn forward_inner<S>(
+        &mut self,
+        input: &B::Tensor,
+        state: &mut S,
+        context: &<B::Tensor as Tensor>::Context,
+        instrumentation: &mut ComponentInstrumentation<'_, B::Tensor>,
+        parallel: Option<&B::ParallelContext>,
+    ) -> Result<B::Tensor, Error>
+    where
+        S: RuntimeStateComponents<B>,
     {
         let shape = input.shape();
         if shape.len() != 3 || shape[0] <= 0 || shape[1] <= 0 {
@@ -175,6 +189,7 @@ impl<B: NeuralBackend> LinearAttention<B> {
         }
         let (batch, sequence) = (shape[0], shape[1]);
         let projected = self.input_qkv.forward(input, context)?;
+        instrumentation.observe("mixer.qkv.projected", &projected)?;
         let projected = {
             let history = state
                 .fixed_component(StateTensorRole::Convolution { slot: 0 })
@@ -185,6 +200,7 @@ impl<B: NeuralBackend> LinearAttention<B> {
             *history = output.history;
             output.output
         };
+        instrumentation.observe("mixer.qkv.convolved", &projected)?;
         let query = projected
             .index(
                 &[
@@ -235,15 +251,21 @@ impl<B: NeuralBackend> LinearAttention<B> {
         let query = B::expand_heads(&B::l2_normalize(&query, 1e-6, context)?, expansion, context)?
             .multiply_scalar((self.key_head_dim as f32).sqrt().recip(), context)?;
         let key = B::expand_heads(&B::l2_normalize(&key, 1e-6, context)?, expansion, context)?;
-        let beta = B::sigmoid(self.input_beta.forward(input, context)?, context)?;
+        let beta = {
+            let projected = self.input_beta.forward(input, context)?;
+            instrumentation.observe("mixer.update.projected", &projected)?;
+            B::sigmoid(projected, context)?
+        };
         let decay_bias = self
             .decay_bias
             .as_ref()
             .reshape(&[1, 1, self.value_heads], context)?;
         let decay = B::softplus(
-            self.input_decay
-                .forward(input, context)?
-                .add(&decay_bias, context)?,
+            {
+                let projected = self.input_decay.forward(input, context)?;
+                instrumentation.observe("mixer.decay.projected", &projected)?;
+                projected.add(&decay_bias, context)?
+            },
             1.0,
             context,
         )?
@@ -272,10 +294,14 @@ impl<B: NeuralBackend> LinearAttention<B> {
             .fixed_component(StateTensorRole::Recurrent)
             .map_err(Error::backend)? = Some(scan.state);
         state.advance_fixed(sequence).map_err(Error::backend)?;
-        let gate = self.input_gate.forward(input, context)?.reshape(
-            &[batch, sequence, self.value_heads, self.value_head_dim],
-            context,
-        )?;
+        let gate = {
+            let projected = self.input_gate.forward(input, context)?;
+            instrumentation.observe("mixer.gate.projected", &projected)?;
+            projected.reshape(
+                &[batch, sequence, self.value_heads, self.value_head_dim],
+                context,
+            )?
+        };
         let normalized = B::silu_gated_group_rms_norm(
             &scan.output,
             &gate,
@@ -285,7 +311,14 @@ impl<B: NeuralBackend> LinearAttention<B> {
             context,
         )?
         .reshape(&[batch, sequence, self.value_width], context)?;
-        project(&mut self.output, &normalized, context)
+        let channels = instrumentation.apply("mixer.channels", normalized)?;
+        instrumentation.project::<B>(
+            "mixer.write_input",
+            &mut self.output,
+            &channels,
+            parallel,
+            context,
+        )
     }
 }
 
@@ -301,8 +334,27 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> LinearAttention<B> {
     where
         S: RuntimeStateComponents<B>,
     {
-        self.forward_inner(input, state, context, |projection, value, context| {
-            B::row_parallel_linear(projection, value, parallel, context)
-        })
+        self.forward_parallel_instrumented(
+            input,
+            state,
+            parallel,
+            context,
+            &mut ComponentInstrumentation::disabled(),
+        )
+    }
+
+    /// Executes observed recurrent channels with one row-parallel reduction.
+    pub fn forward_parallel_instrumented<S>(
+        &mut self,
+        input: &B::Tensor,
+        state: &mut S,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+        instrumentation: &mut ComponentInstrumentation<'_, B::Tensor>,
+    ) -> Result<B::Tensor, Error>
+    where
+        S: RuntimeStateComponents<B>,
+    {
+        self.forward_inner(input, state, context, instrumentation, Some(parallel))
     }
 }

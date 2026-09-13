@@ -84,12 +84,69 @@ impl<U> MlxResidentPolicy<U> {
     }
 }
 
-impl<U> LayerwisePolicy<MlxNeuralBackend, U> for MlxResidentPolicy<U> {
+impl<U: Parameterized<MlxTensor>> LayerwisePolicy<MlxNeuralBackend, U> for MlxResidentPolicy<U> {
     type Lease = MlxResidentUnit<U>;
     type Error = Error;
 
+    fn publish_parameter_replacements(
+        &mut self,
+        values: &std::collections::BTreeMap<String, MlxTensor>,
+        _active: bool,
+    ) -> Result<bool, Error> {
+        if !self.resident_parameters_available() {
+            return Ok(false);
+        }
+        self.visit_resident_units(&mut |unit| {
+            unit.visit_parameters_mut(&mut ParameterPublisher(values))
+        });
+        Ok(true)
+    }
+
+    fn resident_parameters_available(&self) -> bool {
+        self.units.iter().all(Option::is_some)
+    }
+
+    fn visit_resident_units(&mut self, visitor: &mut impl FnMut(&mut U)) -> bool {
+        if !self.resident_parameters_available() {
+            return false;
+        }
+        for unit in &mut self.units {
+            visitor(&mut unit.as_mut().expect("idle resident unit").inner);
+        }
+        true
+    }
+
     fn begin(&mut self, _initial: &MlxTensor, _stream: &Stream) -> Result<(), Self::Error> {
         Ok(())
+    }
+
+    fn inspect_unit<E, F, V>(
+        &mut self,
+        ordinal: usize,
+        address: ExecutionUnitAddress,
+        _build: F,
+        operation: V,
+        _stream: &Stream,
+    ) -> Result<bool, LayerwiseAcquireError<E, Self::Error>>
+    where
+        F: FnOnce(&Stream) -> Result<U, E>,
+        V: FnOnce(&mut U) -> Result<(), Self::Error>,
+    {
+        if self.layout.address(ordinal) != Some(address) {
+            return Err(LayerwiseAcquireError::Policy(Error::Parallel(
+                "parameter unit address differs from the selected layout".into(),
+            )));
+        }
+        let unit = self
+            .units
+            .get_mut(ordinal)
+            .and_then(Option::as_mut)
+            .ok_or_else(|| {
+                LayerwiseAcquireError::Policy(Error::Parallel("parameter unit is not idle".into()))
+            })?;
+        operation(&mut unit.inner).map_err(LayerwiseAcquireError::Policy)?;
+        // Resident ownership remains in the outer session's completion scope.
+        Ok(true)
     }
 
     fn abort(

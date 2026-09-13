@@ -353,6 +353,40 @@ pub trait LayeredTraversalHook<B, C, E>
 where
     B: NeuralBackend,
 {
+    /// Whether architecture-owned input, internal unit and readout observation is enabled.
+    fn observes_activations(&self) -> bool {
+        false
+    }
+
+    /// Borrows an activation at an architecture-owned boundary.
+    fn observe_activation(&mut self, _path: &str, _value: &B::Tensor) -> Result<(), E> {
+        Ok(())
+    }
+
+    /// Defers additional diagnostic work to the observing owner's reservation.
+    fn observe_generated_activation(
+        &mut self,
+        path: &str,
+        _prototype: &B::Tensor,
+        _source: &eredu_core::capture::GeneratedCaptureSource,
+        generate: &mut dyn FnMut() -> Result<B::Tensor, E>,
+    ) -> Result<(), E> {
+        if self.observes_activations() {
+            self.observe_activation(path, &generate()?)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Returns an admitted replacement at an architecture-owned boundary.
+    fn intervene_activation(
+        &mut self,
+        _path: &str,
+        _value: &B::Tensor,
+    ) -> Result<Option<B::Tensor>, E> {
+        Ok(None)
+    }
+
     /// Chooses whether to execute the next unit.
     fn before_unit(
         &mut self,
@@ -429,6 +463,36 @@ where
     L: LayeredTraversalHook<B, C, E>,
     R: LayeredTraversalHook<B, C, E>,
 {
+    fn observes_activations(&self) -> bool {
+        self.left.observes_activations() || self.right.observes_activations()
+    }
+    fn observe_activation(&mut self, path: &str, value: &B::Tensor) -> Result<(), E> {
+        self.left.observe_activation(path, value)?;
+        self.right.observe_activation(path, value)
+    }
+    fn observe_generated_activation(
+        &mut self,
+        path: &str,
+        prototype: &B::Tensor,
+        source: &eredu_core::capture::GeneratedCaptureSource,
+        generate: &mut dyn FnMut() -> Result<B::Tensor, E>,
+    ) -> Result<(), E> {
+        self.left
+            .observe_generated_activation(path, prototype, source, generate)?;
+        self.right
+            .observe_generated_activation(path, prototype, source, generate)
+    }
+    fn intervene_activation(
+        &mut self,
+        path: &str,
+        value: &B::Tensor,
+    ) -> Result<Option<B::Tensor>, E> {
+        let left = self.left.intervene_activation(path, value)?;
+        let right = self
+            .right
+            .intervene_activation(path, left.as_ref().unwrap_or(value))?;
+        Ok(right.or(left))
+    }
     fn before_unit(
         &mut self,
         group: usize,
@@ -494,11 +558,38 @@ where
 
 struct NoopLayeredTraversalHook;
 
+struct TraversalActivationObserver<'a, H: ?Sized, B, C, E> {
+    hook: &'a mut H,
+    types: std::marker::PhantomData<fn() -> (B, C, E)>,
+}
+impl<B, C, E, H> ActivationObserver<B::Tensor, E> for TraversalActivationObserver<'_, H, B, C, E>
+where
+    B: NeuralBackend,
+    H: LayeredTraversalHook<B, C, E> + ?Sized,
+{
+    fn observe(&mut self, path: &str, value: &B::Tensor) -> Result<(), E> {
+        self.hook.observe_activation(path, value)
+    }
+    fn observe_generated(
+        &mut self,
+        path: &str,
+        prototype: &B::Tensor,
+        source: &eredu_core::capture::GeneratedCaptureSource,
+        generate: &mut dyn FnMut() -> Result<B::Tensor, E>,
+    ) -> Result<(), E> {
+        self.hook
+            .observe_generated_activation(path, prototype, source, generate)
+    }
+    fn intervene(&mut self, path: &str, value: &B::Tensor) -> Result<Option<B::Tensor>, E> {
+        self.hook.intervene_activation(path, value)
+    }
+}
+
 impl<B, C, E> LayeredTraversalHook<B, C, E> for NoopLayeredTraversalHook where B: NeuralBackend {}
 
 struct ActivationObserverTraversalHook<'a, O: ?Sized> {
     observer: std::rc::Rc<std::cell::RefCell<&'a mut O>>,
-    units: Vec<Vec<String>>,
+    units: Vec<Vec<Option<String>>>,
     group_inputs: Vec<Option<String>>,
     group_outputs: Vec<Option<String>>,
 }
@@ -508,6 +599,30 @@ where
     B: NeuralBackend,
     O: ActivationObserver<B::Tensor, E> + ?Sized,
 {
+    fn observes_activations(&self) -> bool {
+        true
+    }
+    fn observe_activation(&mut self, path: &str, value: &B::Tensor) -> Result<(), E> {
+        self.observer.borrow_mut().observe(path, value)
+    }
+    fn observe_generated_activation(
+        &mut self,
+        path: &str,
+        prototype: &B::Tensor,
+        source: &eredu_core::capture::GeneratedCaptureSource,
+        generate: &mut dyn FnMut() -> Result<B::Tensor, E>,
+    ) -> Result<(), E> {
+        self.observer
+            .borrow_mut()
+            .observe_generated(path, prototype, source, generate)
+    }
+    fn intervene_activation(
+        &mut self,
+        path: &str,
+        value: &B::Tensor,
+    ) -> Result<Option<B::Tensor>, E> {
+        self.observer.borrow_mut().intervene(path, value)
+    }
     fn before_unit(
         &mut self,
         group: usize,
@@ -517,7 +632,10 @@ where
         _forward: &mut C,
         _context: &<B::Tensor as eredu_nn::Tensor>::Context,
     ) -> Result<LayeredUnitAction, E> {
-        let path = eredu_core::UnitObservation::Input.path(&self.units[group][index]);
+        let Some(unit) = &self.units[group][index] else {
+            return Ok(LayeredUnitAction::Execute);
+        };
+        let path = eredu_core::UnitObservation::Input.path(unit);
         let mut observer = self.observer.borrow_mut();
         *value = observe_and_intervene(&mut **observer, &path, value)?;
         Ok(LayeredUnitAction::Execute)
@@ -531,7 +649,10 @@ where
         _forward: &mut C,
         _context: &<B::Tensor as eredu_nn::Tensor>::Context,
     ) -> Result<(), E> {
-        let path = eredu_core::UnitObservation::Output.path(&self.units[group][index]);
+        let Some(unit) = &self.units[group][index] else {
+            return Ok(());
+        };
+        let path = eredu_core::UnitObservation::Output.path(unit);
         let mut observer = self.observer.borrow_mut();
         *value = observe_and_intervene(&mut **observer, &path, value)?;
         Ok(())
@@ -619,6 +740,12 @@ where
     B: NeuralBackend,
     S: RuntimeState<B>,
 {
+    /// Internal hooks emitted by the ordinary begin/unit/finish observed methods.
+    /// Overriding an execution method does not implicitly declare hook coverage.
+    fn observation_hooks(&self) -> crate::inspection::ObservationHookSupport {
+        Default::default()
+    }
+
     /// Borrowed prepared model input.
     type Input<'a>
     where
@@ -635,7 +762,7 @@ where
         Self: 'a,
         B::Tensor: 'a;
     /// Concrete architecture or backend failure.
-    type Error;
+    type Error: std::error::Error + Send + Sync + 'static;
 
     /// Declares transport and physical placement semantics for one canonical group slot.
     fn group_transport(&self, group: usize) -> ArchitectureGroupTransport;
@@ -681,6 +808,14 @@ where
     /// Returns the stable architecture-owned path of one group-local execution unit.
     fn unit_path(&self, group: usize, index: usize) -> Result<String, Self::Error>;
 
+    /// Whether observed unit execution owns both input/output capture and
+    /// intervention, including their effective companions. The traversal omits
+    /// its outer copies of those exact seams. This includes observed provider
+    /// and parallel entry points and preserves in-unit state/capture timing.
+    fn observes_unit_boundaries(&self, _group: usize, _index: usize) -> bool {
+        false
+    }
+
     /// Architecture-owned name for the activation selected at group ingress.
     fn group_input_observation_path(&self, _group: usize) -> Result<Option<String>, Self::Error> {
         Ok(None)
@@ -712,6 +847,20 @@ where
         state: &mut S,
         context: &<B::Tensor as eredu_nn::Tensor>::Context,
     ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error>;
+
+    /// Prepares the same forward with architecture-owned input observations.
+    fn begin_forward_observed<'a, O>(
+        &mut self,
+        input: Self::Input<'a>,
+        state: &mut S,
+        context: &<B::Tensor as eredu_nn::Tensor>::Context,
+        _observer: &mut O,
+    ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error>
+    where
+        O: ActivationObserver<B::Tensor, Self::Error> + ?Sized,
+    {
+        self.begin_forward(input, state, context)
+    }
 
     /// Selects or merges the activation consumed by one ready execution group.
     fn begin_execution_group(
@@ -765,6 +914,25 @@ where
         context: &<B::Tensor as eredu_nn::Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error>;
 
+    /// Executes the same unit with architecture-owned internal observation hooks.
+    #[allow(clippy::too_many_arguments)]
+    fn forward_unit_observed<O>(
+        &mut self,
+        group: usize,
+        index: usize,
+        unit: &mut Self::Unit,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &mut Self::ForwardContext,
+        context: &<B::Tensor as eredu_nn::Tensor>::Context,
+        _observer: &mut O,
+    ) -> Result<B::Tensor, Self::Error>
+    where
+        O: ActivationObserver<B::Tensor, Self::Error> + ?Sized,
+    {
+        self.forward_unit(group, index, unit, hidden, state, forward, context)
+    }
+
     /// Converts a completed group's output into its dependency-facing value.
     fn complete_execution_group(
         &mut self,
@@ -786,6 +954,21 @@ where
         context: &<B::Tensor as eredu_nn::Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error>;
 
+    /// Applies the same final readout with architecture-owned internal hooks.
+    fn finish_forward_observed<O>(
+        &mut self,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &Self::ForwardContext,
+        context: &<B::Tensor as eredu_nn::Tensor>::Context,
+        _observer: &mut O,
+    ) -> Result<B::Tensor, Self::Error>
+    where
+        O: ActivationObserver<B::Tensor, Self::Error> + ?Sized,
+    {
+        self.finish_forward(hidden, state, forward, context)
+    }
+
     /// Borrows transient forward tensors required by one unit's submission.
     fn retained_context_values<'a>(
         &'a self,
@@ -805,6 +988,11 @@ where
     B: NeuralBackend,
     S: RuntimeState<B>,
 {
+    /// Internal hooks emitted by the parallel begin/unit/finish observed methods.
+    fn parallel_observation_hooks(&self) -> crate::inspection::ObservationHookSupport {
+        Default::default()
+    }
+
     /// Embeds input and prepares forward values for rank-local execution.
     fn begin_forward_parallel<'a>(
         &mut self,
@@ -813,6 +1001,21 @@ where
         parallel: &B::ParallelContext,
         context: &<B::Tensor as eredu_nn::Tensor>::Context,
     ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error>;
+
+    /// Prepares parallel input with architecture-owned internal observations.
+    fn begin_forward_parallel_observed<'a, O>(
+        &mut self,
+        input: Self::Input<'a>,
+        state: &mut S,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as eredu_nn::Tensor>::Context,
+        _observer: &mut O,
+    ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error>
+    where
+        O: ActivationObserver<B::Tensor, Self::Error> + ?Sized,
+    {
+        self.begin_forward_parallel(input, state, parallel, context)
+    }
 
     /// Executes one rank-local unit and its required collectives.
     fn forward_unit_parallel(
@@ -826,6 +1029,36 @@ where
         parallel: &B::ParallelContext,
         context: &<B::Tensor as eredu_nn::Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error>;
+
+    /// Executes rank-local internal boundaries when supplied by the architecture.
+    /// The default preserves ordinary parallel execution.
+    #[allow(clippy::too_many_arguments)]
+    fn forward_unit_parallel_observed<O>(
+        &mut self,
+        group_index: usize,
+        index: usize,
+        unit: &mut Self::Unit,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &mut Self::ForwardContext,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as eredu_nn::Tensor>::Context,
+        _observer: &mut O,
+    ) -> Result<B::Tensor, Self::Error>
+    where
+        O: ActivationObserver<B::Tensor, Self::Error> + ?Sized,
+    {
+        self.forward_unit_parallel(
+            group_index,
+            index,
+            unit,
+            hidden,
+            state,
+            forward,
+            parallel,
+            context,
+        )
+    }
 
     /// Selects or merges a ready group's activation under a parallel context.
     fn begin_execution_group_parallel(
@@ -863,6 +1096,22 @@ where
         parallel: &B::ParallelContext,
         context: &<B::Tensor as eredu_nn::Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error>;
+
+    /// Finishes parallel readout with architecture-owned internal observations.
+    fn finish_forward_parallel_observed<O>(
+        &mut self,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &Self::ForwardContext,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as eredu_nn::Tensor>::Context,
+        _observer: &mut O,
+    ) -> Result<B::Tensor, Self::Error>
+    where
+        O: ActivationObserver<B::Tensor, Self::Error> + ?Sized,
+    {
+        self.finish_forward_parallel(hidden, state, forward, parallel, context)
+    }
 }
 
 /// Input accepted at a rank-local layered partition boundary.
@@ -915,6 +1164,15 @@ where
     B: NeuralBackend,
     S: RuntimeState<B>,
 {
+    /// Internal hooks emitted by partition begin/finish and ordinary or parallel
+    /// unit calls. This describes the global call path, independent of local ownership.
+    fn partition_observation_hooks(
+        &self,
+        _tensor_parallel: bool,
+    ) -> crate::inspection::ObservationHookSupport {
+        Default::default()
+    }
+
     /// Architecture-owned schema for primary and auxiliary partition transport.
     type Boundary: crate::ArchitectureBoundary;
 
@@ -952,6 +1210,42 @@ where
         parallel: &B::ParallelContext,
         context: &<B::Tensor as eredu_nn::Tensor>::Context,
     ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error>;
+
+    /// Prepares the same partition with architecture-owned internal observations.
+    #[allow(clippy::too_many_arguments)]
+    fn begin_partition_observed<'a, O>(
+        &mut self,
+        input: LayeredPartitionInput<
+            'a,
+            B::Tensor,
+            <Self::Boundary as crate::ArchitectureBoundary>::Boundary<B::Tensor>,
+        >,
+        mask: Option<&B::Tensor>,
+        state: &mut S,
+        expected: &crate::StateLayout,
+        first_state_ordinal: usize,
+        parallel: Option<&B::ParallelContext>,
+        context: &<B::Tensor as eredu_nn::Tensor>::Context,
+        _observer: &mut O,
+    ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error>
+    where
+        O: ActivationObserver<B::Tensor, Self::Error> + ?Sized,
+    {
+        match parallel {
+            Some(parallel) => self.begin_partition_parallel(
+                input,
+                mask,
+                state,
+                expected,
+                first_state_ordinal,
+                parallel,
+                context,
+            ),
+            None => {
+                self.begin_partition(input, mask, state, expected, first_state_ordinal, context)
+            }
+        }
+    }
 
     /// Enters the selected execution group after the partition input has been
     /// prepared. The default is the ordinary layered group entry with no graph
@@ -1018,6 +1312,30 @@ where
         >,
         Self::Error,
     >;
+
+    /// Emits the selected boundary or observed final readout under the same ownership.
+    #[allow(clippy::too_many_arguments)]
+    fn finish_partition_observed<O>(
+        &mut self,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &Self::ForwardContext,
+        owns_output: bool,
+        parallel: Option<&B::ParallelContext>,
+        context: &<B::Tensor as eredu_nn::Tensor>::Context,
+        _observer: &mut O,
+    ) -> Result<
+        LayeredPartitionOutput<
+            B::Tensor,
+            <Self::Boundary as crate::ArchitectureBoundary>::Boundary<B::Tensor>,
+        >,
+        Self::Error,
+    >
+    where
+        O: ActivationObserver<B::Tensor, Self::Error> + ?Sized,
+    {
+        self.finish_partition(hidden, state, forward, owns_output, parallel, context)
+    }
 }
 
 /// Provider-aware unit execution for architectures with routed feed-forward work.
@@ -1063,6 +1381,17 @@ where
         _index: usize,
     ) -> Result<Option<RoutedObservationPoints>, Self::Error> {
         Ok(None)
+    }
+
+    /// Whether the ordinary provider-aware unit call emits internal component hooks.
+    fn routed_unit_observations(&self) -> bool {
+        false
+    }
+
+    /// Whether the selected provider-aware call emits sparse routed-unit hooks.
+    /// This does not imply coverage of other internal component boundaries.
+    fn routed_sparse_observations(&self) -> bool {
+        false
     }
 
     /// Executes one unit through a runtime-supplied routed-expert provider.
@@ -1184,6 +1513,16 @@ where
     B: eredu_nn::GroupedNeuralBackend,
     S: RuntimeState<B>,
 {
+    /// Whether the tensor-parallel provider-aware unit call emits internal component hooks.
+    fn parallel_routed_unit_observations(&self) -> bool {
+        false
+    }
+
+    /// Sparse routed-unit coverage of the tensor-parallel provider-aware call.
+    fn parallel_routed_sparse_observations(&self) -> bool {
+        false
+    }
+
     /// Executes one tensor-parallel unit through a runtime-supplied provider.
     #[allow(clippy::too_many_arguments)]
     fn forward_unit_parallel_with_provider<P>(
@@ -1202,6 +1541,89 @@ where
     where
         P: crate::TensorParallelRoutedExpertProvider<B>,
         P::Error: std::fmt::Display;
+
+    /// Preserves provider routing observations while allowing genuine component hooks.
+    #[allow(clippy::too_many_arguments)]
+    fn forward_unit_parallel_observed_with_provider<P, O>(
+        &mut self,
+        group: usize,
+        index: usize,
+        unit: &mut Self::Unit,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &mut Self::ForwardContext,
+        pass: ExpertPass,
+        provider: &mut P,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as eredu_nn::Tensor>::Context,
+        observer: &mut O,
+    ) -> Result<B::Tensor, Self::Error>
+    where
+        P: crate::TensorParallelRoutedExpertProvider<B>,
+        P::Error: std::fmt::Display,
+        O: ActivationObserver<B::Tensor, Self::Error> + ?Sized,
+        Self::Error: std::fmt::Display,
+    {
+        match self.routed_observation_points(group, index)? {
+            Some(point) => {
+                let mut observed = ObservedExpertProvider::new(provider, observer, point);
+                self.forward_unit_parallel_with_provider(
+                    group,
+                    index,
+                    unit,
+                    hidden,
+                    state,
+                    forward,
+                    pass,
+                    &mut observed,
+                    parallel,
+                    context,
+                )
+            }
+            None => self.forward_unit_parallel_with_provider(
+                group, index, unit, hidden, state, forward, pass, provider, parallel, context,
+            ),
+        }
+    }
+
+    /// Selects ordinary/observed provider execution without changing the provider or parallel context.
+    #[allow(clippy::too_many_arguments)]
+    fn forward_unit_with_provider_observation<P, O>(
+        &mut self,
+        group: usize,
+        index: usize,
+        unit: &mut Self::Unit,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &mut Self::ForwardContext,
+        pass: ExpertPass,
+        provider: &mut P,
+        parallel: Option<&B::ParallelContext>,
+        context: &<B::Tensor as eredu_nn::Tensor>::Context,
+        observer: Option<&mut O>,
+    ) -> Result<B::Tensor, Self::Error>
+    where
+        P: crate::TensorParallelRoutedExpertProvider<B>,
+        P::Error: std::fmt::Display,
+        O: ActivationObserver<B::Tensor, Self::Error> + ?Sized,
+        Self::Error: std::fmt::Display,
+    {
+        match (parallel, observer) {
+            (Some(parallel), Some(observer)) => self.forward_unit_parallel_observed_with_provider(
+                group, index, unit, hidden, state, forward, pass, provider, parallel, context,
+                observer,
+            ),
+            (Some(parallel), None) => self.forward_unit_parallel_with_provider(
+                group, index, unit, hidden, state, forward, pass, provider, parallel, context,
+            ),
+            (None, Some(observer)) => self.forward_unit_observed_with_provider(
+                group, index, unit, hidden, state, forward, pass, provider, context, observer,
+            ),
+            (None, None) => self.forward_unit_with_provider(
+                group, index, unit, hidden, state, forward, pass, provider, context,
+            ),
+        }
+    }
 }
 
 /// Fully resident runtime using the same lifecycle as bounded execution.
@@ -1282,7 +1704,19 @@ where
     where
         H: LayeredTraversalHook<B, A::ForwardContext, A::Error> + ?Sized,
     {
-        let forward = self.architecture.begin_forward(input, state, context)?;
+        let forward = if hook.observes_activations() {
+            self.architecture.begin_forward_observed(
+                input,
+                state,
+                context,
+                &mut TraversalActivationObserver {
+                    hook,
+                    types: std::marker::PhantomData,
+                },
+            )
+        } else {
+            self.architecture.begin_forward(input, state, context)
+        }?;
         let initial = forward.hidden;
         let mut forward_context = forward.context;
         let mut schedule = ExecutionGroupSchedule::new(&self.graph);
@@ -1332,15 +1766,31 @@ where
                     {
                         break;
                     }
-                    hidden = self.architecture.forward_unit(
-                        group,
-                        index,
-                        unit,
-                        &hidden,
-                        state,
-                        &mut forward_context,
-                        context,
-                    )?;
+                    hidden = if hook.observes_activations() {
+                        self.architecture.forward_unit_observed(
+                            group,
+                            index,
+                            unit,
+                            &hidden,
+                            state,
+                            &mut forward_context,
+                            context,
+                            &mut TraversalActivationObserver {
+                                hook,
+                                types: std::marker::PhantomData,
+                            },
+                        )
+                    } else {
+                        self.architecture.forward_unit(
+                            group,
+                            index,
+                            unit,
+                            &hidden,
+                            state,
+                            &mut forward_context,
+                            context,
+                        )
+                    }?;
                     hook.after_unit(group, index, &mut hidden, &mut forward_context, context)?;
                 }
             }
@@ -1360,9 +1810,21 @@ where
         let hidden = outputs[self.graph.output()]
             .take()
             .expect("validated graph output completed");
-        let output = self
-            .architecture
-            .finish_forward(&hidden, state, &forward_context, context)?;
+        let output = if hook.observes_activations() {
+            self.architecture.finish_forward_observed(
+                &hidden,
+                state,
+                &forward_context,
+                context,
+                &mut TraversalActivationObserver {
+                    hook,
+                    types: std::marker::PhantomData,
+                },
+            )
+        } else {
+            self.architecture
+                .finish_forward(&hidden, state, &forward_context, context)
+        }?;
         Ok((output, forward_context))
     }
 
@@ -1404,6 +1866,47 @@ where
     type Lease: std::ops::DerefMut<Target = U>;
     /// Concrete acquisition or completion failure.
     type Error;
+
+    /// Whether every bound unit is idle and can be visited without materialization.
+    fn resident_parameters_available(&self) -> bool {
+        false
+    }
+
+    /// Visits all permanently bound units, with no native work or reloading.
+    /// Returns false before invoking the visitor when this mechanism is unavailable.
+    fn visit_resident_units(&mut self, _visitor: &mut impl FnMut(&mut U)) -> bool {
+        false
+    }
+
+    /// Borrows one unit for bounded parameter work independently of forward order.
+    /// A true result means the operation ran and completion was established. On
+    /// failure, native implementations retain the loan until terminal evidence.
+    fn inspect_unit<E, F, V>(
+        &mut self,
+        _ordinal: usize,
+        _address: crate::ExecutionUnitAddress,
+        _build: F,
+        _operation: V,
+        _context: &<B::Tensor as eredu_nn::Tensor>::Context,
+    ) -> Result<bool, LayerwiseAcquireError<E, Self::Error>>
+    where
+        F: FnOnce(&<B::Tensor as eredu_nn::Tensor>::Context) -> Result<U, E>,
+        V: FnOnce(&mut U) -> Result<(), Self::Error>,
+    {
+        Ok(false)
+    }
+
+    /// Publishes completed immutable replacements for resident and future loaded units.
+    /// `active` retains overrides on future reloads; false restores prepared sources.
+    /// False means no publication occurred. Implementations must validate before
+    /// replacing any handles, and must not perform fallible work after publication.
+    fn publish_parameter_replacements(
+        &mut self,
+        _values: &std::collections::BTreeMap<String, B::Tensor>,
+        _active: bool,
+    ) -> Result<bool, Self::Error> {
+        Ok(false)
+    }
 
     /// Starts one forward after architecture input preparation.
     fn begin(
@@ -1585,7 +2088,7 @@ where
 {
     /// Architecture construction or forward failure.
     #[error("layered architecture failed: {0}")]
-    Architecture(A),
+    Architecture(#[source] A),
     /// Invalid access to architecture-declared mutable state.
     #[error(transparent)]
     State(#[from] crate::StateError),
@@ -1612,6 +2115,21 @@ where
     policy: P,
     executors: Option<Vec<B::OwnedExecutor>>,
     backend: std::marker::PhantomData<fn() -> (B, S)>,
+}
+
+impl<A, B, S, P> crate::parameter_operations::LayeredParameterOwner<B, S>
+    for LayerwiseRuntime<A, B, S, P>
+where
+    B: SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as eredu_nn::Tensor>::Context>,
+    S: RuntimeState<B>,
+    A: LayeredArchitecture<B, S>,
+    P: LayerwisePolicy<B, A::Unit>,
+{
+    type Architecture = A;
+    type Policy = P;
+    fn parameter_parts(&mut self) -> Option<(&mut A, &mut P)> {
+        Some((&mut self.architecture, &mut self.policy))
+    }
 }
 
 impl<A, B, S, P> LayerwiseRuntime<A, B, S, P>
@@ -1658,6 +2176,27 @@ where
     /// Mutably borrows the concrete execution policy.
     pub fn policy_mut(&mut self) -> &mut P {
         &mut self.policy
+    }
+
+    /// Runs a bounded parameter operation through the architecture's unit owner.
+    pub fn inspect_parameter_unit<V>(
+        &mut self,
+        ordinal: usize,
+        address: crate::ExecutionUnitAddress,
+        operation: V,
+        context: &<B::Tensor as eredu_nn::Tensor>::Context,
+    ) -> Result<bool, LayerwiseAcquireError<A::Error, P::Error>>
+    where
+        V: FnOnce(&mut A::Unit) -> Result<(), P::Error>,
+    {
+        let architecture = &self.architecture;
+        self.policy.inspect_unit(
+            ordinal,
+            address,
+            |context| architecture.build_unit(address.group(), address.index(), context),
+            operation,
+            context,
+        )
     }
 
     /// Runs one complete prefill or decode pass with exact unit release points.
@@ -1754,12 +2293,14 @@ where
     where
         Observer: ActivationObserver<B::Tensor, A::Error> + ?Sized,
     {
-        self.forward_with_unit_executor_and_observer_and_context(
+        self.forward_with_internal_observer_and_context(
             input,
             state,
             context,
-            |architecture, group, index, unit, hidden, state, forward, context| {
-                architecture.forward_unit(group, index, unit, hidden, state, forward, context)
+            |architecture, group, index, unit, hidden, state, forward, context, observer| {
+                architecture.forward_unit_observed(
+                    group, index, unit, hidden, state, forward, context, observer,
+                )
             },
             observer,
         )
@@ -1799,7 +2340,7 @@ where
         input: A::Input<'a>,
         state: &mut S,
         context: &<B::Tensor as eredu_nn::Tensor>::Context,
-        execute: E,
+        mut execute: E,
         observer: &mut Observer,
     ) -> Result<(B::Tensor, A::ForwardContext), LayerwiseRuntimeError<A::Error, P::Error>>
     where
@@ -1812,6 +2353,63 @@ where
             &mut S,
             &mut A::ForwardContext,
             &<B::Tensor as eredu_nn::Tensor>::Context,
+        ) -> Result<B::Tensor, A::Error>,
+        Observer: ActivationObserver<B::Tensor, A::Error> + ?Sized,
+    {
+        self.forward_with_internal_observer_and_context(
+            input,
+            state,
+            context,
+            |architecture, group, index, unit, hidden, state, forward, context, observer| {
+                let owned = architecture.observes_unit_boundaries(group, index);
+                let path = owned
+                    .then(|| architecture.unit_path(group, index))
+                    .transpose()?;
+                let input = path
+                    .as_ref()
+                    .map(|path| observe_and_intervene(observer, &format!("{path}.input"), hidden))
+                    .transpose()?;
+                let output = execute(
+                    architecture,
+                    group,
+                    index,
+                    unit,
+                    input.as_ref().unwrap_or(hidden),
+                    state,
+                    forward,
+                    context,
+                )?;
+                match path {
+                    Some(path) => {
+                        observe_and_intervene(observer, &format!("{path}.output"), &output)
+                    }
+                    None => Ok(output),
+                }
+            },
+            observer,
+        )
+    }
+
+    /// Runs a caller-selected unit through the shared observed traversal, retaining forward resources.
+    pub fn forward_with_internal_observer_and_context<'a, E, Observer>(
+        &mut self,
+        input: A::Input<'a>,
+        state: &mut S,
+        context: &<B::Tensor as eredu_nn::Tensor>::Context,
+        mut execute: E,
+        observer: &mut Observer,
+    ) -> Result<(B::Tensor, A::ForwardContext), LayerwiseRuntimeError<A::Error, P::Error>>
+    where
+        E: FnMut(
+            &mut A,
+            usize,
+            usize,
+            &mut A::Unit,
+            &B::Tensor,
+            &mut S,
+            &mut A::ForwardContext,
+            &<B::Tensor as eredu_nn::Tensor>::Context,
+            &mut Observer,
         ) -> Result<B::Tensor, A::Error>,
         Observer: ActivationObserver<B::Tensor, A::Error> + ?Sized,
     {
@@ -1829,7 +2427,13 @@ where
                 .map_err(LayerwiseRuntimeError::Architecture)?;
             units.push(
                 (0..count)
-                    .map(|index| self.architecture.unit_path(group, index))
+                    .map(|index| {
+                        if self.architecture.observes_unit_boundaries(group, index) {
+                            Ok(None)
+                        } else {
+                            self.architecture.unit_path(group, index).map(Some)
+                        }
+                    })
                     .collect::<Result<Vec<_>, _>>()
                     .map_err(LayerwiseRuntimeError::Architecture)?,
             );
@@ -1845,6 +2449,7 @@ where
             );
         }
         let observer = std::rc::Rc::new(std::cell::RefCell::new(observer));
+        let internal_observer = observer.clone();
         let mut hook = ActivationObserverTraversalHook {
             observer,
             units,
@@ -1852,7 +2457,23 @@ where
             group_outputs,
         };
         self.forward_with_unit_executor_and_traversal_hook(
-            input, state, context, execute, &mut hook,
+            input,
+            state,
+            context,
+            |architecture, group, index, unit, hidden, state, forward, context| {
+                execute(
+                    architecture,
+                    group,
+                    index,
+                    unit,
+                    hidden,
+                    state,
+                    forward,
+                    context,
+                    &mut **internal_observer.borrow_mut(),
+                )
+            },
+            &mut hook,
         )
     }
 
@@ -1906,62 +2527,16 @@ where
         Provider::Error: std::fmt::Display,
         Observer: ActivationObserver<B::Tensor, A::Error> + ?Sized,
     {
-        let graph = self
-            .architecture
-            .execution_graph()
-            .map_err(LayerwiseRuntimeError::Architecture)?;
-        let mut units = Vec::with_capacity(graph.groups().len());
-        let mut group_inputs = Vec::with_capacity(graph.groups().len());
-        let mut group_outputs = Vec::with_capacity(graph.groups().len());
-        for group in 0..graph.groups().len() {
-            let count = self
-                .architecture
-                .group_unit_count(group)
-                .map_err(LayerwiseRuntimeError::Architecture)?;
-            units.push(
-                (0..count)
-                    .map(|index| self.architecture.unit_path(group, index))
-                    .collect::<Result<Vec<_>, _>>()
-                    .map_err(LayerwiseRuntimeError::Architecture)?,
-            );
-            group_inputs.push(
-                self.architecture
-                    .group_input_observation_path(group)
-                    .map_err(LayerwiseRuntimeError::Architecture)?,
-            );
-            group_outputs.push(
-                self.architecture
-                    .group_output_observation_path(group)
-                    .map_err(LayerwiseRuntimeError::Architecture)?,
-            );
-        }
-        let observer = std::rc::Rc::new(std::cell::RefCell::new(observer));
-        let routed_observer = observer.clone();
-        let mut hook = ActivationObserverTraversalHook {
-            observer,
-            units,
-            group_inputs,
-            group_outputs,
-        };
-        self.forward_with_unit_executor_and_traversal_hook(
+        self.forward_with_internal_observer_and_context(
             input,
             state,
             context,
-            |architecture, group, index, unit, hidden, state, forward, context| {
+            |architecture, group, index, unit, hidden, state, forward, context, observer| {
                 architecture.forward_unit_observed_with_provider(
-                    group,
-                    index,
-                    unit,
-                    hidden,
-                    state,
-                    forward,
-                    pass,
-                    provider,
-                    context,
-                    &mut **routed_observer.borrow_mut(),
+                    group, index, unit, hidden, state, forward, pass, provider, context, observer,
                 )
             },
-            &mut hook,
+            observer,
         )
     }
 
@@ -2023,7 +2598,13 @@ where
                 .map_err(LayerwiseRuntimeError::Architecture)?;
             units.push(
                 (0..count)
-                    .map(|index| self.architecture.unit_path(group, index))
+                    .map(|index| {
+                        if self.architecture.observes_unit_boundaries(group, index) {
+                            Ok(None)
+                        } else {
+                            self.architecture.unit_path(group, index).map(Some)
+                        }
+                    })
                     .collect::<Result<Vec<_>, _>>()
                     .map_err(LayerwiseRuntimeError::Architecture)?,
             );
@@ -2145,7 +2726,7 @@ where
     where
         H: LayeredTraversalHook<B, A::ForwardContext, A::Error> + ?Sized,
     {
-        self.forward_with_unit_executor_and_traversal_hook(
+        self.forward_with_unit_executor_and_traversal_hook_impl(
             input,
             state,
             context,
@@ -2153,6 +2734,7 @@ where
                 architecture.forward_unit(group, index, unit, hidden, state, forward, context)
             },
             hook,
+            true,
         )
     }
 
@@ -2162,8 +2744,35 @@ where
         input: A::Input<'a>,
         state: &mut S,
         context: &<B::Tensor as eredu_nn::Tensor>::Context,
+        execute: E,
+        hook: &mut H,
+    ) -> Result<(B::Tensor, A::ForwardContext), LayerwiseRuntimeError<A::Error, P::Error>>
+    where
+        E: FnMut(
+            &mut A,
+            usize,
+            usize,
+            &mut A::Unit,
+            &B::Tensor,
+            &mut S,
+            &mut A::ForwardContext,
+            &<B::Tensor as eredu_nn::Tensor>::Context,
+        ) -> Result<B::Tensor, A::Error>,
+        H: LayeredTraversalHook<B, A::ForwardContext, A::Error> + ?Sized,
+    {
+        self.forward_with_unit_executor_and_traversal_hook_impl(
+            input, state, context, execute, hook, false,
+        )
+    }
+
+    fn forward_with_unit_executor_and_traversal_hook_impl<'a, E, H>(
+        &mut self,
+        input: A::Input<'a>,
+        state: &mut S,
+        context: &<B::Tensor as eredu_nn::Tensor>::Context,
         mut execute: E,
         hook: &mut H,
+        observe_unit_internals: bool,
     ) -> Result<(B::Tensor, A::ForwardContext), LayerwiseRuntimeError<A::Error, P::Error>>
     where
         E: FnMut(
@@ -2200,10 +2809,20 @@ where
             .executors
             .as_ref()
             .expect("layered runtime initialized its executor cache");
-        let forward = self
-            .architecture
-            .begin_forward(input, state, context)
-            .map_err(LayerwiseRuntimeError::Architecture)?;
+        let forward = if hook.observes_activations() {
+            self.architecture.begin_forward_observed(
+                input,
+                state,
+                context,
+                &mut TraversalActivationObserver {
+                    hook,
+                    types: std::marker::PhantomData,
+                },
+            )
+        } else {
+            self.architecture.begin_forward(input, state, context)
+        }
+        .map_err(LayerwiseRuntimeError::Architecture)?;
         let initial_completion = (graph.groups().len() > 1)
             .then(|| B::submit(context, [&forward.hidden]))
             .transpose()
@@ -2308,16 +2927,32 @@ where
                                 LayerwiseRuntimeError::Policy(error)
                             }
                         })?;
-                    hidden = execute(
-                        &mut self.architecture,
-                        group,
-                        index,
-                        lease,
-                        &hidden,
-                        state,
-                        &mut forward_context,
-                        executor,
-                    )
+                    hidden = if observe_unit_internals && hook.observes_activations() {
+                        self.architecture.forward_unit_observed(
+                            group,
+                            index,
+                            lease,
+                            &hidden,
+                            state,
+                            &mut forward_context,
+                            executor,
+                            &mut TraversalActivationObserver {
+                                hook,
+                                types: std::marker::PhantomData,
+                            },
+                        )
+                    } else {
+                        execute(
+                            &mut self.architecture,
+                            group,
+                            index,
+                            lease,
+                            &hidden,
+                            state,
+                            &mut forward_context,
+                            executor,
+                        )
+                    }
                     .map_err(LayerwiseRuntimeError::Architecture)?;
                     hook.after_unit(group, index, &mut hidden, &mut forward_context, executor)
                         .map_err(LayerwiseRuntimeError::Architecture)?;
@@ -2369,10 +3004,22 @@ where
             B::order_after(completion, context)
                 .map_err(|error| LayerwiseRuntimeError::Submission(error.to_string()))?;
         }
-        let output = self
-            .architecture
-            .finish_forward(&hidden, state, &forward_context, context)
-            .map_err(LayerwiseRuntimeError::Architecture)?;
+        let output = if hook.observes_activations() {
+            self.architecture.finish_forward_observed(
+                &hidden,
+                state,
+                &forward_context,
+                context,
+                &mut TraversalActivationObserver {
+                    hook,
+                    types: std::marker::PhantomData,
+                },
+            )
+        } else {
+            self.architecture
+                .finish_forward(&hidden, state, &forward_context, context)
+        }
+        .map_err(LayerwiseRuntimeError::Architecture)?;
         policy
             .finish(&output)
             .map_err(LayerwiseRuntimeError::Policy)?;
@@ -2468,17 +3115,136 @@ where
         A: ParallelLayeredArchitecture<B, S>,
         Observer: ActivationObserver<B::Tensor, A::Error> + ?Sized,
     {
-        self.forward_parallel_with_unit_executor_and_observer(
+        self.forward_parallel_with_observer_and_context(input, state, parallel, context, observer)
+            .map(|(output, _)| output)
+    }
+
+    /// Observes parallel unit internals through the ordinary residency traversal,
+    /// retaining its forward resources for the caller's completion boundary.
+    pub fn forward_parallel_with_observer_and_context<'a, Observer>(
+        &mut self,
+        input: A::Input<'a>,
+        state: &mut S,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as eredu_nn::Tensor>::Context,
+        observer: &mut Observer,
+    ) -> Result<(B::Tensor, A::ForwardContext), LayerwiseRuntimeError<A::Error, P::Error>>
+    where
+        A: ParallelLayeredArchitecture<B, S>,
+        Observer: ActivationObserver<B::Tensor, A::Error> + ?Sized,
+    {
+        self.forward_parallel_with_internal_observer_and_context(
+            input,
+            state,
+            parallel,
+            context,
+            |architecture,
+             group,
+             index,
+             unit,
+             hidden,
+             state,
+             forward,
+             parallel,
+             context,
+             observer| {
+                architecture.forward_unit_parallel_observed(
+                    group, index, unit, hidden, state, forward, parallel, context, observer,
+                )
+            },
+            observer,
+        )
+    }
+
+    /// Runs a caller-selected parallel unit through shared input, group, unit and readout hooks.
+    pub fn forward_parallel_with_internal_observer_and_context<'a, E, Observer>(
+        &mut self,
+        input: A::Input<'a>,
+        state: &mut S,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as eredu_nn::Tensor>::Context,
+        mut execute: E,
+        observer: &mut Observer,
+    ) -> Result<(B::Tensor, A::ForwardContext), LayerwiseRuntimeError<A::Error, P::Error>>
+    where
+        A: ParallelLayeredArchitecture<B, S>,
+        E: FnMut(
+            &mut A,
+            usize,
+            usize,
+            &mut A::Unit,
+            &B::Tensor,
+            &mut S,
+            &mut A::ForwardContext,
+            &B::ParallelContext,
+            &<B::Tensor as eredu_nn::Tensor>::Context,
+            &mut Observer,
+        ) -> Result<B::Tensor, A::Error>,
+        Observer: ActivationObserver<B::Tensor, A::Error> + ?Sized,
+    {
+        let graph = self
+            .architecture
+            .execution_graph()
+            .map_err(LayerwiseRuntimeError::Architecture)?;
+        let mut units = Vec::with_capacity(graph.groups().len());
+        let mut group_inputs = Vec::with_capacity(graph.groups().len());
+        let mut group_outputs = Vec::with_capacity(graph.groups().len());
+        for group in 0..graph.groups().len() {
+            let count = self
+                .architecture
+                .group_unit_count(group)
+                .map_err(LayerwiseRuntimeError::Architecture)?;
+            units.push(
+                (0..count)
+                    .map(|index| {
+                        if self.architecture.observes_unit_boundaries(group, index) {
+                            Ok(None)
+                        } else {
+                            self.architecture.unit_path(group, index).map(Some)
+                        }
+                    })
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(LayerwiseRuntimeError::Architecture)?,
+            );
+            group_inputs.push(
+                self.architecture
+                    .group_input_observation_path(group)
+                    .map_err(LayerwiseRuntimeError::Architecture)?,
+            );
+            group_outputs.push(
+                self.architecture
+                    .group_output_observation_path(group)
+                    .map_err(LayerwiseRuntimeError::Architecture)?,
+            );
+        }
+        let observer = std::rc::Rc::new(std::cell::RefCell::new(observer));
+        let internal_observer = observer.clone();
+        let mut hook = ActivationObserverTraversalHook {
+            observer,
+            units,
+            group_inputs,
+            group_outputs,
+        };
+        self.forward_parallel_with_unit_executor_and_traversal_hook(
             input,
             state,
             parallel,
             context,
             |architecture, group, index, unit, hidden, state, forward, parallel, context| {
-                architecture.forward_unit_parallel(
-                    group, index, unit, hidden, state, forward, parallel, context,
+                execute(
+                    architecture,
+                    group,
+                    index,
+                    unit,
+                    hidden,
+                    state,
+                    forward,
+                    parallel,
+                    context,
+                    &mut **internal_observer.borrow_mut(),
                 )
             },
-            observer,
+            &mut hook,
         )
     }
 
@@ -2546,42 +3312,34 @@ where
     where
         B: eredu_nn::GroupedNeuralBackend,
         A: ParallelRoutedLayeredArchitecture<B, S>,
+        A::Error: std::fmt::Display,
         Provider: crate::TensorParallelRoutedExpertProvider<B>,
         Provider::Error: std::fmt::Display,
         Observer: ActivationObserver<B::Tensor, A::Error> + ?Sized,
     {
-        self.forward_parallel_with_unit_executor(
+        self.forward_parallel_with_internal_observer_and_context(
             input,
             state,
             parallel,
             context,
-            |architecture, group, index, unit, hidden, state, forward, parallel, context| {
-                let path = architecture.unit_path(group, index)?;
-                let input = observe_and_intervene(observer, &format!("{path}.input"), hidden)?;
-                let output = match architecture.routed_observation_points(group, index)? {
-                    Some(point) => {
-                        let mut observed = ObservedExpertProvider::new(provider, observer, point);
-                        architecture.forward_unit_parallel_with_provider(
-                            group,
-                            index,
-                            unit,
-                            &input,
-                            state,
-                            forward,
-                            pass,
-                            &mut observed,
-                            parallel,
-                            context,
-                        )
-                    }
-                    None => architecture.forward_unit_parallel_with_provider(
-                        group, index, unit, &input, state, forward, pass, provider, parallel,
-                        context,
-                    ),
-                }?;
-                observe_and_intervene(observer, &format!("{path}.output"), &output)
+            |architecture,
+             group,
+             index,
+             unit,
+             hidden,
+             state,
+             forward,
+             parallel,
+             context,
+             observer| {
+                architecture.forward_unit_parallel_observed_with_provider(
+                    group, index, unit, hidden, state, forward, pass, provider, parallel, context,
+                    observer,
+                )
             },
+            observer,
         )
+        .map(|(output, _)| output)
     }
 
     /// Runs one parallel pass with custom unit execution and a post-unit hook.
@@ -2632,7 +3390,7 @@ where
         A: ParallelLayeredArchitecture<B, S>,
         H: LayeredTraversalHook<B, A::ForwardContext, A::Error> + ?Sized,
     {
-        self.forward_parallel_with_unit_executor_and_traversal_hook(
+        self.forward_parallel_with_unit_executor_and_traversal_hook_impl(
             input,
             state,
             parallel,
@@ -2643,6 +3401,7 @@ where
                 )
             },
             hook,
+            true,
         )
     }
 
@@ -2653,8 +3412,38 @@ where
         state: &mut S,
         parallel: &B::ParallelContext,
         context: &<B::Tensor as eredu_nn::Tensor>::Context,
+        execute: E,
+        hook: &mut H,
+    ) -> Result<(B::Tensor, A::ForwardContext), LayerwiseRuntimeError<A::Error, P::Error>>
+    where
+        A: ParallelLayeredArchitecture<B, S>,
+        E: FnMut(
+            &mut A,
+            usize,
+            usize,
+            &mut A::Unit,
+            &B::Tensor,
+            &mut S,
+            &mut A::ForwardContext,
+            &B::ParallelContext,
+            &<B::Tensor as eredu_nn::Tensor>::Context,
+        ) -> Result<B::Tensor, A::Error>,
+        H: LayeredTraversalHook<B, A::ForwardContext, A::Error> + ?Sized,
+    {
+        self.forward_parallel_with_unit_executor_and_traversal_hook_impl(
+            input, state, parallel, context, execute, hook, false,
+        )
+    }
+
+    fn forward_parallel_with_unit_executor_and_traversal_hook_impl<'a, E, H>(
+        &mut self,
+        input: A::Input<'a>,
+        state: &mut S,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as eredu_nn::Tensor>::Context,
         mut execute: E,
         hook: &mut H,
+        observe_unit_internals: bool,
     ) -> Result<(B::Tensor, A::ForwardContext), LayerwiseRuntimeError<A::Error, P::Error>>
     where
         A: ParallelLayeredArchitecture<B, S>,
@@ -2693,10 +3482,22 @@ where
             .executors
             .as_ref()
             .expect("layered runtime initialized its executor cache");
-        let forward = self
-            .architecture
-            .begin_forward_parallel(input, state, parallel, context)
-            .map_err(LayerwiseRuntimeError::Architecture)?;
+        let forward = if hook.observes_activations() {
+            self.architecture.begin_forward_parallel_observed(
+                input,
+                state,
+                parallel,
+                context,
+                &mut TraversalActivationObserver {
+                    hook,
+                    types: std::marker::PhantomData,
+                },
+            )
+        } else {
+            self.architecture
+                .begin_forward_parallel(input, state, parallel, context)
+        }
+        .map_err(LayerwiseRuntimeError::Architecture)?;
         let initial_completion = (graph.groups().len() > 1)
             .then(|| B::submit(context, [&forward.hidden]))
             .transpose()
@@ -2802,17 +3603,34 @@ where
                                 LayerwiseRuntimeError::Policy(error)
                             }
                         })?;
-                    hidden = execute(
-                        &mut self.architecture,
-                        group,
-                        index,
-                        lease,
-                        &hidden,
-                        state,
-                        &mut forward_context,
-                        parallel,
-                        executor,
-                    )
+                    hidden = if observe_unit_internals && hook.observes_activations() {
+                        self.architecture.forward_unit_parallel_observed(
+                            group,
+                            index,
+                            lease,
+                            &hidden,
+                            state,
+                            &mut forward_context,
+                            parallel,
+                            executor,
+                            &mut TraversalActivationObserver {
+                                hook,
+                                types: std::marker::PhantomData,
+                            },
+                        )
+                    } else {
+                        execute(
+                            &mut self.architecture,
+                            group,
+                            index,
+                            lease,
+                            &hidden,
+                            state,
+                            &mut forward_context,
+                            parallel,
+                            executor,
+                        )
+                    }
                     .map_err(LayerwiseRuntimeError::Architecture)?;
                     hook.after_unit(group, index, &mut hidden, &mut forward_context, executor)
                         .map_err(LayerwiseRuntimeError::Architecture)?;
@@ -2871,10 +3689,28 @@ where
             B::order_after(completion, context)
                 .map_err(|error| LayerwiseRuntimeError::Submission(error.to_string()))?;
         }
-        let output = self
-            .architecture
-            .finish_forward_parallel(&hidden, state, &forward_context, parallel, context)
-            .map_err(LayerwiseRuntimeError::Architecture)?;
+        let output = if hook.observes_activations() {
+            self.architecture.finish_forward_parallel_observed(
+                &hidden,
+                state,
+                &forward_context,
+                parallel,
+                context,
+                &mut TraversalActivationObserver {
+                    hook,
+                    types: std::marker::PhantomData,
+                },
+            )
+        } else {
+            self.architecture.finish_forward_parallel(
+                &hidden,
+                state,
+                &forward_context,
+                parallel,
+                context,
+            )
+        }
+        .map_err(LayerwiseRuntimeError::Architecture)?;
         policy
             .finish(&output)
             .map_err(LayerwiseRuntimeError::Policy)?;

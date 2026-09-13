@@ -7,7 +7,10 @@ use eredu_nn::{
     RotaryOperator, RotaryPosition, RotarySpec, Tensor,
 };
 
-use crate::deepseek::{projection::ProjectionPolicy, V3Args};
+use crate::{
+    decoder::ComponentInstrumentation,
+    deepseek::{projection::ProjectionPolicy, V3Args},
+};
 
 /// Direct or normalized low-rank query projection.
 #[derive(Debug, Clone, Parameterized)]
@@ -24,10 +27,15 @@ impl<B: BlockwiseAttentionBackend> QueryProjection<B> {
         &mut self,
         input: &B::Tensor,
         context: &<B::Tensor as Tensor>::Context,
+        instrumentation: &mut ComponentInstrumentation<'_, B::Tensor>,
     ) -> Result<B::Tensor, Error> {
         match self {
             Self::Direct(projection) => projection.forward(input, context),
-            Self::LowRank(projection) => projection.forward(input, context),
+            Self::LowRank(projection) => {
+                projection.forward_with_normalized_rank(input, context, |rank, _| {
+                    instrumentation.apply("attention.query.latent", rank)
+                })
+            }
         }
     }
 }
@@ -171,26 +179,70 @@ impl<B: BlockwiseAttentionBackend> Attention<B> {
         cache: Option<&mut C>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
+        self.forward_instrumented(
+            input,
+            mask,
+            cache,
+            context,
+            &mut ComponentInstrumentation::disabled(),
+        )
+    }
+
+    /// Observes and edits the actual post-aggregation channels before the output
+    /// projection. Resident and paged compressed caches share this same boundary.
+    /// The caller owns normalization, residual addition and any parallel reduction.
+    pub fn forward_instrumented<C: CompressedAttentionCache<B::Tensor>>(
+        &mut self,
+        input: &B::Tensor,
+        mask: Option<&B::Tensor>,
+        cache: Option<&mut C>,
+        context: &<B::Tensor as Tensor>::Context,
+        instrumentation: &mut ComponentInstrumentation<'_, B::Tensor>,
+    ) -> Result<B::Tensor, Error> {
+        let attended = self.attend(input, mask, cache, context, instrumentation)?;
+        let attended = instrumentation.apply("attention.channels", attended)?;
+        instrumentation.project::<B>(
+            "attention.write_input",
+            &mut self.output,
+            &attended,
+            None,
+            context,
+        )
+    }
+
+    fn attend<C: CompressedAttentionCache<B::Tensor>>(
+        &mut self,
+        input: &B::Tensor,
+        mask: Option<&B::Tensor>,
+        cache: Option<&mut C>,
+        context: &<B::Tensor as Tensor>::Context,
+        instrumentation: &mut ComponentInstrumentation<'_, B::Tensor>,
+    ) -> Result<B::Tensor, Error> {
         let batch = input.dim(0);
         let tokens = input.dim(1);
         let offset = cache.as_ref().map_or(0, |cache| cache.offset());
-        let query = self.query.forward(input, context)?.reshape(
-            &[batch, tokens, self.heads, self.nope + self.rope_dimensions],
-            context,
-        )?;
+        let query = self
+            .query
+            .forward(input, context, instrumentation)?
+            .reshape(
+                &[batch, tokens, self.heads, self.nope + self.rope_dimensions],
+                context,
+            )?
+            .transpose_axes(&[0, 2, 1, 3], context)?;
+        // Rotary operators index positions along the penultimate axis. Keep
+        // sequence there so the phase is independent of the local head count.
         let query_nope = slice_last(&query, 0, self.nope, context)?;
         let query_rope = slice_last(&query, self.nope, self.nope + self.rope_dimensions, context)?;
         let query_rope =
             self.rotary
                 .forward(&query_rope, RotaryPosition::Offset(offset), context)?;
-        let queries =
-            B::Tensor::concatenate(&[query_nope.clone(), query_rope.clone()], -1, context)?
-                .transpose_axes(&[0, 2, 1, 3], context)?;
+        let queries = B::Tensor::concatenate(&[query_nope, query_rope], -1, context)?;
         let kv = self.kv_a.forward(input, context)?;
         let latent = self.kv_norm.forward(
             &slice_last(&kv, 0, self.latent_dimensions, context)?,
             context,
         )?;
+        let latent = instrumentation.apply("attention.key_value.latent", latent)?;
         let rotary = slice_last(
             &kv,
             self.latent_dimensions,
@@ -265,7 +317,7 @@ impl<B: BlockwiseAttentionBackend> Attention<B> {
                             &[batch, tokens, self.heads * self.value_dimensions],
                             context,
                         )?;
-                    return self.output.forward(&attended, context);
+                    return Ok(attended);
                 }
             }
         };
@@ -313,7 +365,7 @@ impl<B: BlockwiseAttentionBackend> Attention<B> {
             &[batch, tokens, self.heads * self.value_dimensions],
             context,
         )?;
-        self.output.forward(&attended, context)
+        Ok(attended)
     }
 }
 

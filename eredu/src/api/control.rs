@@ -77,6 +77,12 @@ pub enum ControlledGenerationError {
     Capture(#[from] CaptureError),
 }
 
+impl From<eredu_core::run_preparation::TextCaptureSetupError> for ControlledGenerationError {
+    fn from(error: eredu_core::run_preparation::TextCaptureSetupError) -> Self {
+        PreparedChatError::from(error).into()
+    }
+}
+
 impl<E: std::error::Error + Send + Sync + 'static>
     From<TextContinuationError<E, ControlConstraintError>> for ControlledGenerationError
 {
@@ -92,6 +98,9 @@ impl<E: std::error::Error + Send + Sync + 'static>
                     }
                     ControlledTextGenerationError::Controller(error) => {
                         ControlledTextGenerationError::Controller(error)
+                    }
+                    ControlledTextGenerationError::Preparation(error) => {
+                        ControlledTextGenerationError::Preparation(error)
                     }
                 })
             }
@@ -246,6 +255,21 @@ impl<B: TextGenerationBackend, F: FnMut(ControlledGenerationRecord) -> ControlFl
     CommittedTokenSource for Source<'_, '_, B, F>
 {
     type Error = TextContinuationError<B::Error, ControlConstraintError>;
+    fn finish_step<T, E>(
+        &mut self,
+        local: Result<T, E>,
+        cancelled: bool,
+        map_source: impl FnOnce(Self::Error) -> E,
+    ) -> Result<Option<T>, E> {
+        self.driver.runtime().finish_text_preparation_cancellable(
+            eredu_core::run_preparation::TextPreparationStage::Delivery,
+            local.map(|value| (!cancelled).then_some(value)),
+            |error| map_source(ControlledTextGenerationError::Preparation(error).into()),
+        )
+    }
+    fn delivery_failure(&self) -> Option<CaptureError> {
+        self.delivery.borrow().0.failure.clone()
+    }
     fn next_token(&mut self) -> Result<Option<u32>, Self::Error> {
         let started = Instant::now();
         let result = self.state.advance(self.driver);
@@ -432,11 +456,36 @@ impl<B: TextGenerationBackend> ControlledGenerationSession<'_, B> {
         );
     }
     fn delivery_result(&mut self) -> Result<(), ControlledGenerationError> {
-        if let Some(error) = self.delivery.failure.take() {
-            self.lifecycle.fail();
-            return Err(error.into());
+        self.finish_record_delivery(Ok(()))
+    }
+
+    fn finish_record_delivery(
+        &mut self,
+        local: Result<(), ControlledGenerationError>,
+    ) -> Result<(), ControlledGenerationError> {
+        let local = local.and_then(|()| match self.delivery.failure.take() {
+            Some(error) => Err(error.into()),
+            None => Ok(()),
+        });
+        let cancelled = self.delivery.control.cancellation().is_cancelled();
+        let result = self.driver.runtime().finish_text_preparation_cancellable(
+            eredu_core::run_preparation::TextPreparationStage::Delivery,
+            local.map(|()| (!cancelled).then_some(())),
+            |error| PreparedChatError::Backend(error).into(),
+        );
+        match result {
+            Ok(Some(())) => Ok(()),
+            Ok(None) => {
+                // Lifecycle-record callbacks occur after token commitment. Keep
+                // that boundary intact and cancel before the next prediction.
+                self.delivery.control.cancel();
+                Ok(())
+            }
+            Err(error) => {
+                self.lifecycle.fail();
+                Err(error)
+            }
         }
-        Ok(())
     }
 
     /// Advances at most one committed prediction and synchronously delivers its
@@ -506,6 +555,7 @@ impl<B: TextGenerationBackend> ControlledGenerationSession<'_, B> {
                 CommittedGenerationError::Lifecycle(error) => {
                     PreparedChatError::Generation(error).into()
                 }
+                CommittedGenerationError::Delivery(error) => error.into(),
                 CommittedGenerationError::MissingTerminalToken => {
                     PreparedChatError::MissingTerminalToken.into()
                 }
@@ -519,30 +569,32 @@ impl<B: TextGenerationBackend> ControlledGenerationSession<'_, B> {
             );
             return Err(error);
         }
-        self.delivery_result()?;
-        if !cancelled {
-            if self.cursor.token_ids().len() == committed_before
-                && self.cursor.finish_reason() == Some(FinishReason::Cancelled)
-            {
-                self.state.boundary(&mut self.driver)?;
-                self.lifecycle.cancel_without_prediction()?;
-            } else {
-                self.lifecycle
-                    .complete_prediction(self.cursor.finish_reason())?;
+        let local = (|| {
+            if !cancelled {
+                if self.cursor.token_ids().len() == committed_before
+                    && self.cursor.finish_reason() == Some(FinishReason::Cancelled)
+                {
+                    self.state.boundary(&mut self.driver)?;
+                    self.lifecycle.cancel_without_prediction()?;
+                } else {
+                    self.lifecycle
+                        .complete_prediction(self.cursor.finish_reason())?;
+                }
             }
-        }
-        if let Some(reason) = self.cursor.finish_reason() {
-            self.delivery.send(
-                ObservedGenerationEvent::Completed {
-                    reason,
-                    generated_tokens: self.token_ids().len() as u64,
-                    elapsed_seconds: self.delivery.started.elapsed().as_secs_f64(),
-                },
-                &mut emit,
-            );
-        }
-        self.lifecycle_record(&mut emit);
-        self.delivery_result()?;
+            if let Some(reason) = self.cursor.finish_reason() {
+                self.delivery.send(
+                    ObservedGenerationEvent::Completed {
+                        reason,
+                        generated_tokens: self.token_ids().len() as u64,
+                        elapsed_seconds: self.delivery.started.elapsed().as_secs_f64(),
+                    },
+                    &mut emit,
+                );
+            }
+            self.lifecycle_record(&mut emit);
+            Ok(())
+        })();
+        self.finish_record_delivery(local)?;
         Ok(self.status())
     }
 
@@ -683,6 +735,42 @@ impl<B: TextSamplingControlBackend> ControlledGenerationSession<'_, B> {
 }
 
 impl<B: TextGenerationBackend> LoadedModel<B> {
+    /// Agrees a caller-owned preparation result before entering a distributed run.
+    /// Use this around fallible media or opaque-prompt preparation. Every peer
+    /// must call the same stage in the same order, including on local failure.
+    /// Local errors are preserved; `map_backend` translates peer/transport failure.
+    /// Charges are cumulative, and rejection alone never proves native completion.
+    pub fn finish_text_preparation<T, E>(
+        &self,
+        stage: eredu_core::run_preparation::TextPreparationStage,
+        local: Result<T, E>,
+        map_backend: impl FnOnce(BackendFailure) -> E,
+    ) -> Result<T, E> {
+        self.runtime
+            .finish_text_preparation(stage, local, map_backend)
+    }
+
+    /// As [`Self::finish_text_preparation`], with `Ok(None)` representing
+    /// cancellation. A peer failure takes precedence over cancellation; a
+    /// completed cancellation returns `Ok(None)` to every successful peer.
+    pub fn finish_text_preparation_cancellable<T, E>(
+        &self,
+        stage: eredu_core::run_preparation::TextPreparationStage,
+        local: Result<Option<T>, E>,
+        map_backend: impl FnOnce(BackendFailure) -> E,
+    ) -> Result<Option<T>, E> {
+        self.runtime
+            .finish_text_preparation_cancellable(stage, local, map_backend)
+    }
+
+    /// Session lifetime logical preparation charges, including failed attempts.
+    /// Model reset, snapshot restore and experimental branches do not refund them.
+    pub fn text_preparation_usage(
+        &self,
+    ) -> Result<eredu_core::run_preparation::TextPreparationUsage, BackendFailure> {
+        self.runtime.text_preparation_usage()
+    }
+
     /// Starts a controllable ordinary/observed/intervened prepared request. No
     /// model prediction or RNG draw occurs here. Initial attribution is charged
     /// and delivered before returning the session. Unsupported execution fails
@@ -777,126 +865,153 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
         mode: OutputMode,
     ) -> Result<ControlledGenerationSession<'a, B>, ControlledGenerationError> {
         let preparation_started = Instant::now();
-        if prepared.session_identity != self.session_identity {
-            return Err(CaptureError::Invalid(
-                "prepared request belongs to another loaded session".into(),
-            )
-            .into());
-        }
-        if let ControlSupport::Unsupported { reason } =
-            B::text_execution_control_support(&self.runtime)
-        {
-            return Err(CaptureError::Unsupported(reason).into());
-        }
-        let (config, max_tokens) = self
-            .resolve_text_generation_settings(prepared.settings)
-            .map_err(PreparedChatError::Generation)?;
-        let prepare_runtime = match mode {
-            OutputMode::Semantic => prepared_chat_control_runtime,
-            OutputMode::Text => prepared_text_control_runtime,
-        };
-        let semantic = prepare_runtime(
-            &prepared.chat,
-            caller_stop_sequences,
-            self.token_validity.clone(),
-        )
-        .map_err(map_prepared_chat_setup_error)?;
-        // Versioned initial policy identity; saved native sampler state retains
-        // any later prospective changes. Compatibility also requires the opaque
-        // exact driver/run identities, never this digest alone.
-        use sha2::Digest;
-        let semantic_identity = match mode {
-            OutputMode::Text => None,
-            OutputMode::Semantic => {
-                let plan = prepared
-                    .chat
-                    .generation_runtime_plan()
-                    .expect("validated semantic plan");
-                let choice = match plan.tool_choice() {
-                    crate::runtime::chat::ToolChoice::None => "none",
-                    crate::runtime::chat::ToolChoice::Auto => "auto",
-                    crate::runtime::chat::ToolChoice::Required => "required",
-                };
-                Some((
-                    prepared.chat.format_profile_identity(),
-                    plan.generation_constraint().fingerprint,
-                    choice,
-                    prepared.chat.profile_stop_sequences(),
-                ))
+        use eredu_core::run_preparation::TextPreparationStage as Stage;
+        let host = (|| {
+            if prepared.session_identity != self.session_identity {
+                return Err(CaptureError::Invalid(
+                    "prepared request belongs to another loaded session".into(),
+                )
+                .into());
             }
-        };
-        let configuration_identity: [u8; 32] = sha2::Sha256::digest(
-            serde_json::to_vec(&(
-                EXECUTION_CONTROL_SCHEMA_VERSION,
-                mode,
-                self.tokenizer_fingerprint,
-                prepared.resolved,
-                prepared.settings.seed,
-                semantic_identity,
-                prepared.chat.eos_token_ids(),
+            if let ControlSupport::Unsupported { reason } =
+                B::text_execution_control_support(&self.runtime)
+            {
+                return Err(CaptureError::Unsupported(reason).into());
+            }
+            let (config, max_tokens) = self
+                .resolve_text_generation_settings(prepared.settings)
+                .map_err(PreparedChatError::Generation)?;
+            let prepare_runtime = match mode {
+                OutputMode::Semantic => prepared_chat_control_runtime,
+                OutputMode::Text => prepared_text_control_runtime,
+            };
+            let semantic = prepare_runtime(
+                &prepared.chat,
                 caller_stop_sequences,
-            ))
-            .map_err(|error| CaptureError::Invalid(error.to_string()))?,
-        )
-        .into();
-        let decoder = PreparedChatTokenDecoder {
-            decoder: self.text_decoder(true),
-        };
-        let vocabulary = std::sync::Arc::clone(&decoder.decoder.tokenizer);
-        let domain = eredu_runtime::TokenDomain::new(
-            self.token_validity
-                .allowed_mask()
-                .expect("facade always supplies a closed token domain")
-                .len(),
-        );
-        let pipeline = CommittedTokenPipeline::new(
-            RawTokenDecoder::with_structural_tokens(decoder, semantic.structural_tokens),
-            semantic.parser,
-        );
-        let cursor = CommittedGenerationCursor::new(prepared.chat.eos_token_ids(), max_tokens);
-        let mut delivery = Delivery {
-            configuration_identity,
-            template: ObservedGenerationRecord {
-                schema_version: CAPTURE_SCHEMA_VERSION,
-                run_id: new_identity("run"),
-                artifact_identity: prepared.artifact_identity,
-                session_id: self.session_identity.clone(),
-                capture_plan_id: prepared.plan.identity().into(),
-                intervention_plan_id: prepared.intervention.as_ref().map(|p| p.identity().into()),
-                event: ObservedGenerationEvent::Lifecycle {
-                    status: GenerationStatus::Prepared,
-                    next_prediction: 0,
+                self.token_validity.clone(),
+            )
+            .map_err(map_prepared_chat_setup_error)?;
+            // Versioned initial policy identity; saved native sampler state retains
+            // any later prospective changes. Compatibility also requires the opaque
+            // exact driver/run identities, never this digest alone.
+            use sha2::Digest;
+            let semantic_identity = match mode {
+                OutputMode::Text => None,
+                OutputMode::Semantic => {
+                    let plan = prepared
+                        .chat
+                        .generation_runtime_plan()
+                        .expect("validated semantic plan");
+                    let choice = match plan.tool_choice() {
+                        crate::runtime::chat::ToolChoice::None => "none",
+                        crate::runtime::chat::ToolChoice::Auto => "auto",
+                        crate::runtime::chat::ToolChoice::Required => "required",
+                    };
+                    Some((
+                        prepared.chat.format_profile_identity(),
+                        plan.generation_constraint().fingerprint,
+                        choice,
+                        prepared.chat.profile_stop_sequences(),
+                    ))
+                }
+            };
+            let configuration_identity: [u8; 32] = sha2::Sha256::digest(
+                serde_json::to_vec(&(
+                    EXECUTION_CONTROL_SCHEMA_VERSION,
+                    mode,
+                    self.tokenizer_fingerprint,
+                    prepared.resolved,
+                    prepared.settings.seed,
+                    semantic_identity,
+                    prepared.chat.eos_token_ids(),
+                    caller_stop_sequences,
+                ))
+                .map_err(|error| CaptureError::Invalid(error.to_string()))?,
+            )
+            .into();
+            let decoder = PreparedChatTokenDecoder {
+                decoder: self.text_decoder(true),
+            };
+            let vocabulary = std::sync::Arc::clone(&decoder.decoder.tokenizer);
+            let domain = eredu_runtime::TokenDomain::new(
+                self.token_validity
+                    .allowed_mask()
+                    .expect("facade always supplies a closed token domain")
+                    .len(),
+            );
+            let pipeline = CommittedTokenPipeline::new(
+                RawTokenDecoder::with_structural_tokens(decoder, semantic.structural_tokens),
+                semantic.parser,
+            );
+            let cursor = CommittedGenerationCursor::new(prepared.chat.eos_token_ids(), max_tokens);
+            let delivery = Delivery {
+                configuration_identity,
+                template: ObservedGenerationRecord {
+                    schema_version: CAPTURE_SCHEMA_VERSION,
+                    run_id: new_identity("run"),
+                    artifact_identity: prepared.artifact_identity,
+                    parameter_overlay_id: prepared.parameter_overlay_id,
+                    session_id: self.session_identity.clone(),
+                    capture_plan_id: prepared.plan.identity().into(),
+                    intervention_plan_id: prepared
+                        .intervention
+                        .as_ref()
+                        .map(|p| p.identity().into()),
+                    event: ObservedGenerationEvent::Lifecycle {
+                        status: GenerationStatus::Prepared,
+                        next_prediction: 0,
+                    },
                 },
-            },
-            budget: TraceBudget::new(prepared.trace_limits),
-            control,
-            sequence: 0,
-            epoch: 0,
-            prediction: 0,
-            prompt_length: prepared.prompt_token_ids.len() as u64,
-            prompt_token_ids: prepared.prompt_token_ids.clone().into(),
-            started: Instant::now(),
-            preparation_elapsed: std::time::Duration::ZERO,
-            timing: GenerationTiming::default(),
-            closed: false,
-            failure: None,
-            semantic_prefix: Vec::new(),
-        };
-        let started = ObservedGenerationEvent::Started {
-            prompt_token_ids: prepared.prompt_token_ids.clone(),
-            generation: prepared.resolved,
-            seed: prepared.settings.seed,
-        };
+                budget: TraceBudget::new(prepared.trace_limits),
+                control,
+                sequence: 0,
+                epoch: 0,
+                prediction: 0,
+                prompt_length: prepared.prompt_token_ids.len() as u64,
+                prompt_token_ids: prepared.prompt_token_ids.clone().into(),
+                started: Instant::now(),
+                preparation_elapsed: std::time::Duration::ZERO,
+                timing: GenerationTiming::default(),
+                closed: false,
+                failure: None,
+                semantic_prefix: Vec::new(),
+            };
+            let started = ObservedGenerationEvent::Started {
+                prompt_token_ids: prepared.prompt_token_ids.clone(),
+                generation: prepared.resolved,
+                seed: prepared.settings.seed,
+            };
+            Ok::<_, ControlledGenerationError>((
+                config,
+                vocabulary,
+                domain,
+                pipeline,
+                cursor,
+                delivery,
+                started,
+                semantic.controller,
+            ))
+        })();
+        let (config, vocabulary, domain, pipeline, cursor, mut delivery, started, controller) =
+            self.runtime
+                .finish_text_preparation(Stage::Request, host, |error| {
+                    PreparedChatError::Backend(error).into()
+                })?;
         let prompt = B::prepare_text_prompt(self.runtime.backend(), prepared.prompt_token_ids)
             .map_err(|error| {
                 PreparedChatError::Backend(eredu_core::BackendFailure::from_error(error))
-            })?;
+            });
+        let prompt = self.runtime.finish_text_preparation(
+            Stage::Prompt,
+            prompt,
+            PreparedChatError::Backend,
+        )?;
         let mut driver = TextGenerationDriver::new(&mut self.runtime);
         let mut state = driver
             .start(
                 prompt,
                 config,
-                TokenChoiceController::new(semantic.controller, domain),
+                TokenChoiceController::new(controller, domain),
             )
             .map_err(TextContinuationError::Generation)?;
         match prepared.intervention {
@@ -905,8 +1020,21 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
         }
         delivery.preparation_elapsed = preparation_started.elapsed();
         delivery.send(started, &mut emit);
-        if let Some(error) = delivery.failure.take() {
-            return Err(error.into());
+        let delivered = match delivery.failure.take() {
+            Some(error) => Err(ControlledGenerationError::Capture(error)),
+            None => Ok(if delivery.control.cancellation().is_cancelled() {
+                None
+            } else {
+                Some(())
+            }),
+        };
+        let ready = driver.runtime().finish_text_preparation_cancellable(
+            Stage::Delivery,
+            delivered,
+            |error| PreparedChatError::Backend(error).into(),
+        )?;
+        if ready.is_none() {
+            delivery.control.cancel();
         }
         Ok(ControlledGenerationSession {
             driver,

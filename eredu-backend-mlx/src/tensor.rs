@@ -1,4 +1,5 @@
 use crate::nn;
+use eredu_core::checkpoint::TensorDtype;
 use eredu_nn::{
     multimodal::{MaskedOutputProjectionInput, MultiAxisRotaryLayout, MultiAxisRotarySpec},
     AttentionMask, Error, Index, PadMode, Tensor,
@@ -15,6 +16,26 @@ use safemlx::{
     Array, Dtype, Stream,
 };
 use smallvec::SmallVec;
+
+/// Native scalar metadata shared by capture and communication; no evaluation.
+pub(crate) fn portable_dtype(dtype: Dtype) -> TensorDtype {
+    match dtype {
+        Dtype::Bool => TensorDtype::Bool,
+        Dtype::Uint8 => TensorDtype::U8,
+        Dtype::Uint16 => TensorDtype::U16,
+        Dtype::Uint32 => TensorDtype::U32,
+        Dtype::Uint64 => TensorDtype::U64,
+        Dtype::Int8 => TensorDtype::I8,
+        Dtype::Int16 => TensorDtype::I16,
+        Dtype::Int32 => TensorDtype::I32,
+        Dtype::Int64 => TensorDtype::I64,
+        Dtype::Float16 => TensorDtype::F16,
+        Dtype::Float32 => TensorDtype::F32,
+        Dtype::Float64 => TensorDtype::F64,
+        Dtype::Bfloat16 => TensorDtype::Bf16,
+        Dtype::Complex64 => TensorDtype::Complex64,
+    }
+}
 
 fn backend<T>(result: Result<T, safemlx::error::Exception>) -> Result<T, Error> {
     result.map_err(Error::backend)
@@ -250,12 +271,18 @@ impl Tensor for MlxTensor {
     }
 
     fn take_axis(&self, indexes: &Self, axis: i32, context: &Self::Context) -> Result<Self, Error> {
-        tensor(Array::take_axis(
-            self.as_array(),
+        let rank = i32::try_from(self.as_array().ndim()).map_err(Error::backend)?;
+        let normalized = if axis < 0 { axis + rank } else { axis };
+        if !(0..rank).contains(&normalized) {
+            return Err(Error::backend("gather axis is outside tensor rank"));
+        }
+        let indexes = crate::backend::nn::tensor::validate_take_indices(
             indexes.as_array(),
-            axis,
+            self.as_array().dim(normalized),
             context,
-        ))
+        )
+        .map_err(Error::backend)?;
+        tensor(Array::take_axis(self.as_array(), &indexes, axis, context))
     }
 
     fn zeros_like(&self, context: &Self::Context) -> Result<Self, Error> {

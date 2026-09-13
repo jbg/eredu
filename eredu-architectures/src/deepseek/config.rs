@@ -394,12 +394,18 @@ impl V3Args {
                 .any(|policy| *policy == LayerPolicy::SparseMoe)
     }
 
-    /// Resolves one canonical matrix's physical encoding.
+    /// Resolves a canonical matrix, preserving the published dense embedding,
+    /// readout and router unless an admitted per-parameter transform overrides it.
     pub fn linear_format_for(&self, name: &str) -> LinearFormat {
-        self.linear_formats
-            .get(name)
-            .copied()
-            .unwrap_or(self.linear_format)
+        self.linear_formats.get(name).copied().unwrap_or_else(|| {
+            if matches!(name, "model.embed_tokens.weight" | "lm_head.weight")
+                || name.ends_with(".mlp.gate.weight")
+            {
+                LinearFormat::Dense
+            } else {
+                self.linear_format
+            }
+        })
     }
 
     /// Validates all derived geometry and execution policies.
@@ -898,12 +904,35 @@ impl V4Args {
         Ok(target)
     }
 
-    /// Resolves one canonical matrix's physical encoding.
+    /// Resolves one canonical matrix's physical encoding. Published embeddings
+    /// and routers remain dense; explicit admitted transforms take precedence.
     pub fn linear_format_for(&self, name: &str) -> LinearFormat {
-        self.linear_formats
-            .get(name)
-            .copied()
-            .unwrap_or(self.linear_format)
+        self.linear_formats.get(name).copied().unwrap_or_else(|| {
+            if name == "embed.weight"
+                || name.ends_with(".ffn.gate.weight")
+                || name.ends_with(".markov_head.markov_w1.weight")
+            {
+                LinearFormat::Dense
+            } else if name.contains(".ffn.switch_mlp.") || name.contains(".ffn.experts.") {
+                self.expert_linear_format()
+            } else {
+                self.linear_format
+            }
+        })
+    }
+
+    pub(crate) fn expert_linear_format(&self) -> LinearFormat {
+        match self.expert_format {
+            ExpertFormat::Dense => LinearFormat::Dense,
+            ExpertFormat::MxFp4 => LinearFormat::MxFp4,
+            ExpertFormat::BlockFp8 => match self.linear_format {
+                format @ LinearFormat::E4M3BlockFp8(_) => format,
+                _ => LinearFormat::E4M3BlockFp8(
+                    BlockFp8Format::new(128, 128, BlockFp8ScaleEncoding::Ue8m0)
+                        .expect("positive constant expert block geometry"),
+                ),
+            },
+        }
     }
 
     /// Validates derived geometry and exact V4 execution policy.
@@ -1368,6 +1397,9 @@ pub fn v3_architecture_fingerprint(args: &V3Args) -> String {
     eredu_core::cache::derive_prompt_cache_architecture_fingerprint(
         "deepseek_v3",
         [
+            // Cached later-layer latents depend on correctly token-indexed query
+            // rotation; reject states produced by the former head-axis equation.
+            ("mla_equation_revision", "2".to_owned()),
             ("model_type", args.model_type.clone()),
             ("hidden_size", args.hidden_size.to_string()),
             ("num_hidden_layers", args.num_hidden_layers.to_string()),
@@ -1455,6 +1487,35 @@ mod tests {
     }
 
     #[test]
+    fn v3_rejects_cache_identity_from_head_indexed_query_rotation() {
+        use eredu_core::cache::{
+            validate_prompt_cache_model_identity, PromptCacheDescriptor, PromptCacheError,
+            PromptCacheTopology,
+        };
+        let args = parse_v3_config(&fixture()).unwrap();
+        let layout = crate::deepseek::v3::state_layout(&args).unwrap();
+        let identity =
+            crate::deepseek::v3::state_identity(&args, &layout, 0, PromptCacheTopology::default())
+                .unwrap()
+                .prompt_cache_identity(&layout)
+                .unwrap();
+        let current =
+            PromptCacheDescriptor::from_model_identity(identity.clone(), "checkpoint", "prefix", 1)
+                .unwrap();
+        validate_prompt_cache_model_identity(&current, &identity).unwrap();
+        // Fingerprint emitted for this fixture before MLA equation revision 2.
+        let legacy = current
+            .with_architecture_fingerprint(
+                "sha256:efd949ae58a1d46a33e7e48ea6607454913e07784646185ed11a36658e1eaf62",
+            )
+            .unwrap();
+        assert!(matches!(
+            validate_prompt_cache_model_identity(&legacy, &identity),
+            Err(PromptCacheError::Incompatible(_)),
+        ));
+    }
+
+    #[test]
     fn normalizes_v3_layer_schedule_without_backend_types() {
         let args = parse_v3_config(&fixture()).unwrap();
         assert_eq!(
@@ -1521,10 +1582,21 @@ mod tests {
             "activation_scheme": "dynamic",
             "weight_block_size": [128, 128]
         });
-        assert!(matches!(
-            parse_v3_config(&fixture).unwrap().linear_format,
-            LinearFormat::E4M3BlockFp8(_)
-        ));
+        let mut args = parse_v3_config(&fixture).unwrap();
+        assert!(matches!(args.linear_format, LinearFormat::E4M3BlockFp8(_)));
+        for name in [
+            "model.embed_tokens.weight",
+            "lm_head.weight",
+            "model.layers.1.mlp.gate.weight",
+        ] {
+            assert_eq!(args.linear_format_for(name), LinearFormat::Dense);
+            args.linear_formats.insert(name.into(), LinearFormat::MxFp4);
+            assert_eq!(args.linear_format_for(name), LinearFormat::MxFp4);
+        }
+        assert_eq!(
+            args.linear_format_for("model.layers.1.self_attn.q_proj.weight"),
+            args.linear_format
+        );
     }
 
     #[test]
@@ -1774,6 +1846,40 @@ mod tests {
         ));
         fixture["dspark_block_size"] = Value::from(4);
         assert!(parse_v4_config(&fixture).is_err());
+    }
+
+    #[test]
+    fn v4_fp8_dense_parameters_keep_their_selected_encoding() {
+        for scale_fmt in ["float32", "ue8m0"] {
+            let mut fixture = v4_fixture();
+            fixture["quantization_config"] = serde_json::json!({
+                "quant_method": "fp8", "fmt": "e4m3",
+                "activation_scheme": "dynamic", "weight_block_size": [128, 128]
+            });
+            if scale_fmt == "ue8m0" {
+                fixture["quantization_config"]["scale_fmt"] = scale_fmt.into();
+            }
+            let mut args = parse_v4_config(&fixture).unwrap();
+            for parameter in [
+                "embed.weight",
+                "layers.0.ffn.gate.weight",
+                "mtp.0.ffn.gate.weight",
+                "mtp.0.markov_head.markov_w1.weight",
+            ] {
+                assert_eq!(args.linear_format_for(parameter), LinearFormat::Dense);
+                args.linear_formats
+                    .insert(parameter.into(), LinearFormat::MxFp4);
+                assert_eq!(args.linear_format_for(parameter), LinearFormat::MxFp4);
+            }
+            for parameter in [
+                "head.weight",
+                "layers.0.attn.wq_a.weight",
+                "mtp.0.markov_head.markov_w2.weight",
+                "mtp.0.e_proj.weight",
+            ] {
+                assert_eq!(args.linear_format_for(parameter), args.linear_format);
+            }
+        }
     }
 
     #[test]

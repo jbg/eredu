@@ -16,7 +16,11 @@ use super::{
 };
 
 /// Current reusable prompt-cache schema version.
-pub const PROMPT_CACHE_SCHEMA_VERSION: u32 = 8;
+///
+/// Version 9 rejects states produced before source-precision-preserving affine
+/// materialization. Earlier metadata cannot distinguish that numerical policy
+/// from the former unloaded-placeholder precision.
+pub const PROMPT_CACHE_SCHEMA_VERSION: u32 = 9;
 
 /// One named contiguous state range in a portable prompt-cache identity.
 #[derive(Debug, Clone, Eq, Hash, PartialEq, Serialize, Deserialize)]
@@ -1373,6 +1377,19 @@ mod tests {
         let restored: PromptCacheManifest = serde_json::from_str(&json).unwrap();
         restored.validate().unwrap();
         assert_eq!(restored, manifest);
+    }
+
+    #[test]
+    fn legacy_materialization_cache_is_rejected_before_payload_validation() {
+        let mut legacy = manifest();
+        legacy.schema_version = 8;
+        legacy.blocks[0].payload_sha256 = "not a payload digest".into();
+        let encoded = serde_json::to_string(&legacy).unwrap();
+        let decoded: PromptCacheManifest = serde_json::from_str(&encoded).unwrap();
+        assert!(matches!(
+            decoded.validate(),
+            Err(PromptCacheError::UnsupportedSchema(8))
+        ));
     }
 
     #[test]

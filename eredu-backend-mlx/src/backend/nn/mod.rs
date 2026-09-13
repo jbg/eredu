@@ -19,6 +19,7 @@ pub(crate) mod native_quantization;
 pub(crate) mod nested;
 pub(crate) mod normalization;
 pub(crate) mod primitives;
+pub(crate) mod relative_attention;
 pub(crate) mod rope;
 /// Backend-neutral architecture operators specialized to MLX.
 pub mod shared;

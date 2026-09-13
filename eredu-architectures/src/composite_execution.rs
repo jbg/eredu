@@ -76,6 +76,29 @@ impl CompositeTensorCollective {
     }
 }
 
+/// Embedding sums for independently looked-up token segments. Media positions
+/// are supplied by their own ingress and must not enlarge these native waves.
+pub(crate) fn segmented_token_ingress_collectives(
+    positions: impl IntoIterator<Item = u64>,
+    hidden_width: i32,
+    tensor_partitions: usize,
+) -> Result<Option<Vec<CompositeTensorCollective>>, String> {
+    if tensor_partitions <= 1 {
+        return Ok(None);
+    }
+    positions
+        .into_iter()
+        .map(|positions| {
+            i32::try_from(positions)
+                .map(|positions| CompositeTensorCollective::Sum {
+                    shape: vec![1, positions, hidden_width],
+                })
+                .map_err(|_| "composite token ingress positions exceed i32".to_owned())
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map(Some)
+}
+
 /// Exact prepared tensors paired with their architecture-owned admission proof.
 pub struct PreparedCompositeInput<'a, T, P> {
     prepared: &'a eredu_runtime::PreparedModelInput<T>,
@@ -127,14 +150,47 @@ impl<'a, T, P> PreparedCompositeInput<'a, T, P> {
     }
 }
 
+/// Builds only semantic token parts from an exact admission. The architecture
+/// supplies placeholder identities; media tensors are neither copied nor encoded.
+pub(crate) fn prepared_token_parts<T: Tensor, P>(
+    input: PreparedCompositeInput<'_, T, P>,
+    context: &T::Context,
+    placeholder: impl Fn(&P) -> Option<(u32, u64)>,
+) -> Result<Vec<T>, eredu_nn::Error> {
+    input
+        .prepared()
+        .parts()
+        .iter()
+        .zip(input.admitted().parts())
+        .map(|(part, plan)| {
+            if let Some((token, positions)) = placeholder(plan) {
+                let token = i32::try_from(token).map_err(eredu_nn::Error::backend)?;
+                let positions = i32::try_from(positions).map_err(eredu_nn::Error::backend)?;
+                T::full_i32(token, &[1, positions], context)
+            } else {
+                match (part.modality(), part.payload()) {
+                    (
+                        eredu_core::InputModality::Text,
+                        eredu_runtime::PreparedInputPayload::TokenIds(tokens),
+                    ) => Ok(tokens.clone()),
+                    _ => Err(eredu_nn::Error::backend(
+                        "composite prediction input has no declared token identity",
+                    )),
+                }
+            }
+        })
+        .collect()
+}
+
 /// Architecture-owned interpretation of admitted prepared input.
 pub trait CompositeArchitecture<B, S>: LayeredArchitecture<B, S>
 where
     B: NeuralBackend,
     S: eredu_runtime::RuntimeState<B>,
 {
-    /// One architecture-specific plan for each ordered input part.
-    type InputPartPlan;
+    /// One architecture-specific plan for each ordered input part, with a neutral
+    /// accounting projection of the same admitted geometry.
+    type InputPartPlan: Clone + Into<crate::media_plan::PreparedInputPartPlan>;
     /// Minimal normalized configuration retained for repeated input admission.
     type AdmissionConfig: Clone;
 
@@ -154,6 +210,17 @@ where
         input: &eredu_runtime::PreparedModelInput<B::Tensor>,
         inspector: &impl eredu_runtime::PreparedInputInspector<B::Tensor>,
     ) -> Result<AdmittedCompositeInput<Self::InputPartPlan>, eredu_core::CapabilityError>;
+
+    /// Reconstructs the target's exact semantic token sequence for a prediction
+    /// lane, including architecture-declared media placeholders. The default
+    /// accepts ordinary text token parts; media-aware families share their
+    /// ingress token construction with this operation.
+    fn prepared_prediction_token_ids(
+        input: PreparedCompositeInput<'_, B::Tensor, Self::InputPartPlan>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, eredu_nn::Error> {
+        B::Tensor::concatenate(&prepared_token_parts(input, context, |_| None)?, 1, context)
+    }
 
     /// Returns whether one request-optional execution group is active for the
     /// exact admitted input.
@@ -206,6 +273,28 @@ where
         true
     }
 
+    /// Packs an internal group activation into its declared continuation shape.
+    /// The default preserves the ordinary wire-ready activation without work.
+    fn encode_group_continuation(
+        &self,
+        _group: usize,
+        hidden: B::Tensor,
+        _context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Self::Error> {
+        Ok(hidden)
+    }
+
+    /// Restores the internal shape using the retained, admitted request context.
+    fn decode_group_continuation(
+        &self,
+        _group: usize,
+        hidden: B::Tensor,
+        _forward: &Self::ForwardContext,
+        _context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Self::Error> {
+        Ok(hidden)
+    }
+
     /// Exact TP collective sequence for every PP stage of one prepared group.
     ///
     /// `None` means the architecture declares no shared-world schedule for the
@@ -232,6 +321,15 @@ where
         _tensor_partitions: usize,
     ) -> Result<Option<Vec<CompositeTensorCollective>>, String> {
         Ok(None)
+    }
+
+    /// Whether a retained context still has decoder-ingress collectives to run.
+    ///
+    /// Media may create a context before deferred token lookups are resolved.
+    /// Inactive pipeline ranks must mirror those lookups in the primary wave.
+    /// The default describes architectures which resolve ingress at context creation.
+    fn primary_ingress_collectives_pending(&self, _forward: &Self::ForwardContext) -> bool {
+        false
     }
 
     /// Exact TP reductions surrounding one routed decoder unit.
@@ -457,6 +555,10 @@ where
         B::Tensor: 'a;
     type Error = A::Error;
 
+    fn observation_hooks(&self) -> eredu_runtime::inspection::ObservationHookSupport {
+        self.inner.observation_hooks()
+    }
+
     fn group_transport(&self, group: usize) -> eredu_runtime::ArchitectureGroupTransport {
         self.inner.group_transport(group)
     }
@@ -500,6 +602,10 @@ where
 
     fn unit_path(&self, group: usize, index: usize) -> Result<String, Self::Error> {
         self.inner.unit_path(group, index)
+    }
+
+    fn observes_unit_boundaries(&self, group: usize, index: usize) -> bool {
+        self.inner.observes_unit_boundaries(group, index)
     }
 
     fn group_input_observation_path(&self, group: usize) -> Result<Option<String>, Self::Error> {
@@ -592,6 +698,25 @@ where
             .complete_execution_group(group, hidden, state, forward, context)
     }
 
+    fn forward_unit_observed<O>(
+        &mut self,
+        group: usize,
+        index: usize,
+        unit: &mut Self::Unit,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &mut Self::ForwardContext,
+        context: &<B::Tensor as Tensor>::Context,
+        observer: &mut O,
+    ) -> Result<B::Tensor, Self::Error>
+    where
+        O: eredu_runtime::ActivationObserver<B::Tensor, Self::Error> + ?Sized,
+    {
+        self.inner.forward_unit_observed(
+            group, index, unit, hidden, state, forward, context, observer,
+        )
+    }
+
     fn finish_forward(
         &mut self,
         hidden: &B::Tensor,
@@ -610,6 +735,21 @@ where
     ) -> Self::RetainedContextValues<'a> {
         self.inner.retained_context_values(forward, group, index)
     }
+
+    fn finish_forward_observed<O>(
+        &mut self,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &Self::ForwardContext,
+        context: &<B::Tensor as Tensor>::Context,
+        observer: &mut O,
+    ) -> Result<B::Tensor, Self::Error>
+    where
+        O: eredu_runtime::ActivationObserver<B::Tensor, Self::Error> + ?Sized,
+    {
+        self.inner
+            .finish_forward_observed(hidden, state, forward, context, observer)
+    }
 }
 
 impl<A, B, S> RoutedLayeredArchitecture<B, S> for PreparedCompositeArchitecture<A>
@@ -619,6 +759,14 @@ where
     A: CompositeArchitecture<B, S> + RoutedLayeredArchitecture<B, S> + 'static,
     A::InputPartPlan: 'static,
 {
+    fn routed_unit_observations(&self) -> bool {
+        self.inner.routed_unit_observations()
+    }
+
+    fn routed_sparse_observations(&self) -> bool {
+        self.inner.routed_sparse_observations()
+    }
+
     fn routed_observation_points(
         &self,
         group: usize,
@@ -647,6 +795,29 @@ where
             group, index, unit, hidden, state, forward, pass, provider, context,
         )
     }
+
+    fn forward_unit_observed_with_provider<P, O>(
+        &mut self,
+        group: usize,
+        index: usize,
+        unit: &mut Self::Unit,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &mut Self::ForwardContext,
+        pass: eredu_runtime::ExpertPass,
+        provider: &mut P,
+        context: &<B::Tensor as Tensor>::Context,
+        observer: &mut O,
+    ) -> Result<B::Tensor, Self::Error>
+    where
+        P: RoutedExpertProvider<B>,
+        P::Error: std::fmt::Display,
+        O: eredu_runtime::ActivationObserver<B::Tensor, Self::Error> + ?Sized,
+    {
+        self.inner.forward_unit_observed_with_provider(
+            group, index, unit, hidden, state, forward, pass, provider, context, observer,
+        )
+    }
 }
 
 impl<A, B, S> ParallelLayeredArchitecture<B, S> for PreparedCompositeArchitecture<A>
@@ -656,6 +827,10 @@ where
     A: CompositeArchitecture<B, S> + ParallelLayeredArchitecture<B, S> + 'static,
     A::InputPartPlan: 'static,
 {
+    fn parallel_observation_hooks(&self) -> eredu_runtime::inspection::ObservationHookSupport {
+        self.inner.parallel_observation_hooks()
+    }
+
     fn begin_forward_parallel<'a>(
         &mut self,
         input: Self::Input<'a>,
@@ -680,6 +855,26 @@ where
     ) -> Result<B::Tensor, Self::Error> {
         self.inner.forward_unit_parallel(
             group, index, unit, hidden, state, forward, parallel, context,
+        )
+    }
+
+    fn forward_unit_parallel_observed<O>(
+        &mut self,
+        group: usize,
+        index: usize,
+        unit: &mut Self::Unit,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &mut Self::ForwardContext,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+        observer: &mut O,
+    ) -> Result<B::Tensor, Self::Error>
+    where
+        O: eredu_runtime::ActivationObserver<B::Tensor, Self::Error> + ?Sized,
+    {
+        self.inner.forward_unit_parallel_observed(
+            group, index, unit, hidden, state, forward, parallel, context, observer,
         )
     }
 
@@ -728,6 +923,22 @@ where
         self.inner
             .finish_forward_parallel(hidden, state, forward, parallel, context)
     }
+
+    fn finish_forward_parallel_observed<O>(
+        &mut self,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &Self::ForwardContext,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+        observer: &mut O,
+    ) -> Result<B::Tensor, Self::Error>
+    where
+        O: eredu_runtime::ActivationObserver<B::Tensor, Self::Error> + ?Sized,
+    {
+        self.inner
+            .finish_forward_parallel_observed(hidden, state, forward, parallel, context, observer)
+    }
 }
 
 impl<A, B, S> PartitionedLayeredArchitecture<B, S> for PreparedCompositeArchitecture<A>
@@ -738,6 +949,13 @@ where
     A::InputPartPlan: 'static,
 {
     type Boundary = A::Boundary;
+
+    fn partition_observation_hooks(
+        &self,
+        tensor_parallel: bool,
+    ) -> eredu_runtime::inspection::ObservationHookSupport {
+        self.inner.partition_observation_hooks(tensor_parallel)
+    }
 
     fn boundary_schema(&self) -> Result<Self::Boundary, Self::Error> {
         self.inner.boundary_schema()
@@ -828,5 +1046,35 @@ where
     > {
         self.inner
             .finish_partition(hidden, state, forward, owns_output, parallel, context)
+    }
+
+    fn finish_partition_observed<O>(
+        &mut self,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &Self::ForwardContext,
+        owns_output: bool,
+        parallel: Option<&B::ParallelContext>,
+        context: &<B::Tensor as Tensor>::Context,
+        observer: &mut O,
+    ) -> Result<
+        eredu_runtime::LayeredPartitionOutput<
+            B::Tensor,
+            <Self::Boundary as eredu_runtime::ArchitectureBoundary>::Boundary<B::Tensor>,
+        >,
+        Self::Error,
+    >
+    where
+        O: eredu_runtime::ActivationObserver<B::Tensor, Self::Error> + ?Sized,
+    {
+        self.inner.finish_partition_observed(
+            hidden,
+            state,
+            forward,
+            owns_output,
+            parallel,
+            context,
+            observer,
+        )
     }
 }

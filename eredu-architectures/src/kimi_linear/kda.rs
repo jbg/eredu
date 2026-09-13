@@ -9,6 +9,7 @@ use eredu_nn::{
 use eredu_runtime::RuntimeStateComponents;
 
 use super::ModelArgs;
+use crate::decoder::ComponentInstrumentation;
 
 /// Backend-neutral Kimi Delta Attention operator.
 #[derive(Debug, Clone, eredu_nn::Parameterized)]
@@ -134,25 +135,26 @@ impl<B: NeuralBackend> KimiDeltaAttention<B> {
     where
         S: RuntimeStateComponents<B>,
     {
-        self.forward_inner(input, state, context, |projection, value, context| {
-            projection.forward(value, context)
-        })
+        self.forward_instrumented(
+            input,
+            state,
+            None,
+            context,
+            &mut ComponentInstrumentation::disabled(),
+        )
     }
 
-    fn forward_inner<S, F>(
+    /// Executes the recurrence with component hooks on the consumed channel values.
+    pub fn forward_instrumented<S>(
         &mut self,
         input: &B::Tensor,
         state: &mut S,
+        parallel: Option<&B::ParallelContext>,
         context: &<B::Tensor as Tensor>::Context,
-        project: F,
+        instrumentation: &mut ComponentInstrumentation<'_, B::Tensor>,
     ) -> Result<B::Tensor, Error>
     where
         S: RuntimeStateComponents<B>,
-        F: FnOnce(
-            &mut B::Linear,
-            &B::Tensor,
-            &<B::Tensor as Tensor>::Context,
-        ) -> Result<B::Tensor, Error>,
     {
         let shape = input.shape();
         if shape.len() != 3 {
@@ -167,6 +169,11 @@ impl<B: NeuralBackend> KimiDeltaAttention<B> {
             self.k_proj.forward(input, context)?,
             self.v_proj.forward(input, context)?,
         ];
+        for (suffix, value) in ["query", "key", "value"].into_iter().zip(&projected) {
+            if instrumentation.enabled() {
+                instrumentation.observe(&format!("attention.{suffix}.projected"), value)?;
+            }
+        }
         let mut convolved = Vec::with_capacity(3);
         for (slot, (conv, value)) in [
             (&self.q_conv1d, &projected[0]),
@@ -182,6 +189,11 @@ impl<B: NeuralBackend> KimiDeltaAttention<B> {
                 conv.forward(value, history.as_ref(), context)?
             };
             *state.fixed_component(role).map_err(Error::backend)? = output.history;
+            if instrumentation.enabled() {
+                let suffix = ["query", "key", "value"][slot];
+                instrumentation
+                    .observe(&format!("attention.{suffix}.convolved"), &output.output)?;
+            }
             convolved.push(output.output);
         }
         let head_shape = [batch, sequence, self.num_heads, self.head_dim];
@@ -198,10 +210,12 @@ impl<B: NeuralBackend> KimiDeltaAttention<B> {
         )?
         .multiply_scalar((self.head_dim as f32).sqrt().recip(), context)?;
         let value = convolved[2].reshape(&head_shape, context)?;
-        let decay_logits = self
-            .f_b_proj
-            .forward(&self.f_a_proj.forward(input, context)?, context)?
-            .reshape(&head_shape, context)?;
+        let decay_logits = {
+            let decay_input = self.f_a_proj.forward(input, context)?;
+            instrumentation.observe("attention.decay.latent", &decay_input)?;
+            self.f_b_proj.forward(&decay_input, context)?
+        }
+        .reshape(&head_shape, context)?;
         let dt_bias = self
             .dt_bias
             .as_ref()
@@ -236,9 +250,12 @@ impl<B: NeuralBackend> KimiDeltaAttention<B> {
             .map_err(Error::backend)? = Some(scan.state);
         state.advance_fixed(sequence).map_err(Error::backend)?;
         let gate = B::sigmoid(
-            self.g_b_proj
-                .forward(&self.g_a_proj.forward(input, context)?, context)?
-                .reshape(&head_shape, context)?,
+            {
+                let gate_input = self.g_a_proj.forward(input, context)?;
+                instrumentation.observe("attention.gate.latent", &gate_input)?;
+                self.g_b_proj.forward(&gate_input, context)?
+            }
+            .reshape(&head_shape, context)?,
             context,
         )?;
         let normalized = self
@@ -246,7 +263,14 @@ impl<B: NeuralBackend> KimiDeltaAttention<B> {
             .forward(&scan.output, context)?
             .multiply(&gate, context)?;
         let normalized = normalized.reshape(&[batch, sequence, projection], context)?;
-        project(&mut self.o_proj, &normalized, context)
+        let channels = instrumentation.apply("attention.channels", normalized)?;
+        instrumentation.project::<B>(
+            "attention.write_input",
+            &mut self.o_proj,
+            &channels,
+            parallel,
+            context,
+        )
     }
 }
 
@@ -262,8 +286,12 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> KimiDeltaAttention<B
     where
         S: RuntimeStateComponents<B>,
     {
-        self.forward_inner(input, state, context, |projection, value, context| {
-            B::row_parallel_linear(projection, value, parallel, context)
-        })
+        self.forward_instrumented(
+            input,
+            state,
+            Some(parallel),
+            context,
+            &mut ComponentInstrumentation::disabled(),
+        )
     }
 }

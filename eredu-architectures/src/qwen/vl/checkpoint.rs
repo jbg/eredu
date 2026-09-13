@@ -291,6 +291,23 @@ mod tests {
 
         assert_eq!(target.text.quantization, Some(quantization));
         assert!(!target.vision.linear_formats.is_empty());
+        let relative = "blocks.0.attn.qkv.weight";
+        let canonical = "model.visual.blocks.0.attn.qkv.weight";
+        assert_eq!(target.vision.linear_format(relative), quantization.into());
+        assert_eq!(target.vision.linear_format(canonical), quantization.into());
+        let mut imported = target.vision.clone();
+        imported.linear_formats = HashMap::from([(canonical.into(), quantization.into())]);
+        assert_eq!(imported.linear_format(relative), quantization.into());
+        assert_eq!(imported.linear_format(canonical), quantization.into());
+        imported
+            .validate_for(vision::VisionMode::DeepStack)
+            .unwrap();
+        imported
+            .linear_formats
+            .insert(relative.into(), eredu_checkpoint::LinearFormat::Dense);
+        assert!(imported
+            .validate_for(vision::VisionMode::DeepStack)
+            .is_err());
         target.text.validate().unwrap();
         target
             .vision

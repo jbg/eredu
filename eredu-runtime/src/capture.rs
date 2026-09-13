@@ -3,6 +3,19 @@
 use eredu_core::capture::*;
 
 mod checkpoint;
+mod empty;
+mod generated;
+mod invocation;
+pub use invocation::CaptureInvocationSelection;
+mod speculative;
+pub use speculative::{
+    CaptureBackendProvider, PartitionCaptureBackendProvider, PreparedSpeculativeActivationRestore,
+    SpeculativeActivationCheckpoint, SpeculativeCaptureObserver, SpeculativeCaptureScope,
+};
+mod routed;
+use empty::empty_payload;
+pub use generated::generated_capture_source;
+pub mod partition;
 #[cfg(test)]
 mod tests;
 pub use checkpoint::{
@@ -16,13 +29,24 @@ pub struct CaptureSession {
     owner: std::sync::Arc<()>,
     pub(crate) checkpoint_ready: bool,
     has_step: bool,
-    pub(crate) plan: AdmittedCapturePlan,
+    pub(crate) invocation: Option<CaptureInvocationShape>,
+    transaction: Option<(eredu_core::DistributedCommitEpoch, CaptureTransactionStatus)>,
+    last_transaction_epoch: Option<eredu_core::DistributedCommitEpoch>,
+    partition: Option<partition::PartitionCaptureRun>,
+    pub(crate) plan: std::sync::Arc<AdmittedCapturePlan>,
     pub(crate) ledger: CaptureLedger,
     pub(crate) records: Option<Vec<CaptureRecord>>,
     pub(crate) prediction: u64,
     pub(crate) phase: CapturePhase,
     pub(crate) capture_seconds: f64,
     pub(crate) interventions: Option<crate::intervention::InterventionRun>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CaptureTransactionStatus {
+    Pending,
+    Committed,
+    Aborted,
 }
 
 impl CaptureSession {
@@ -32,8 +56,12 @@ impl CaptureSession {
             owner: std::sync::Arc::new(()),
             checkpoint_ready: true,
             has_step: false,
+            invocation: None,
+            transaction: None,
+            last_transaction_epoch: None,
+            partition: None,
             ledger: CaptureLedger::new(&plan),
-            plan,
+            plan: std::sync::Arc::new(plan),
             records: None,
             prediction: 0,
             phase: CapturePhase::Prefill,
@@ -47,6 +75,127 @@ impl CaptureSession {
         &self.plan
     }
 
+    pub(crate) fn prepare_transaction(
+        &mut self,
+        epoch: eredu_core::DistributedCommitEpoch,
+        pass: crate::ExpertPass,
+    ) -> Result<(), CaptureError> {
+        if self.records.is_none()
+            || self.transaction.is_some()
+            || self
+                .last_transaction_epoch
+                .is_some_and(|previous| previous >= epoch)
+        {
+            return Err(CaptureError::Invalid(
+                "capture transaction requires a fresh epoch and an undelivered step".into(),
+            ));
+        }
+        self.last_transaction_epoch = Some(epoch);
+        self.bind_partition_run_epoch(epoch);
+        self.transaction = Some((epoch, CaptureTransactionStatus::Pending));
+        let phase = match pass {
+            crate::ExpertPass::Prefill => CapturePhase::Prefill,
+            crate::ExpertPass::Decode => CapturePhase::Decode,
+        };
+        if self.phase != phase {
+            return Err(CaptureError::Invalid(
+                "capture phase differs from the actual forward".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Starts this forward's step inside shared observer preparation. Claim the
+    /// epoch before fallible reservation so even rejected attempts cannot reuse it.
+    pub(crate) fn prepare_step_transaction(
+        &mut self,
+        epoch: eredu_core::DistributedCommitEpoch,
+        pass: crate::ExpertPass,
+        prediction: u64,
+    ) -> Result<(), CaptureError> {
+        if self.plan.invocation_bounds().is_some() {
+            return Err(CaptureError::Invalid(
+                "independent capture must prepare explicit invocation geometry".into(),
+            ));
+        }
+        if self.records.is_some()
+            || self.transaction.is_some()
+            || self
+                .last_transaction_epoch
+                .is_some_and(|previous| previous >= epoch)
+        {
+            return Err(CaptureError::Invalid(
+                "capture transaction requires a fresh epoch and a drained step".into(),
+            ));
+        }
+        self.last_transaction_epoch = Some(epoch);
+        self.bind_partition_run_epoch(epoch);
+        self.transaction = Some((epoch, CaptureTransactionStatus::Pending));
+        self.checkpoint_ready = false;
+        let phase = match pass {
+            crate::ExpertPass::Prefill => CapturePhase::Prefill,
+            crate::ExpertPass::Decode => CapturePhase::Decode,
+        };
+        self.begin_step_inner(phase, prediction)
+    }
+
+    pub(crate) fn complete_transaction(
+        &mut self,
+        epoch: eredu_core::DistributedCommitEpoch,
+    ) -> Result<(), CaptureError> {
+        if self.records.is_none()
+            || self.transaction != Some((epoch, CaptureTransactionStatus::Pending))
+        {
+            return Err(CaptureError::Invalid(
+                "capture completion has no matching pending transaction".into(),
+            ));
+        }
+        if self
+            .partition
+            .as_ref()
+            .is_some_and(|run| !run.delivery_complete(epoch))
+        {
+            return Err(CaptureError::Invalid(
+                "partition capture delivery is incomplete".into(),
+            ));
+        }
+        self.finish_routed_captures()?;
+        self.finish_interventions()
+    }
+
+    pub(crate) fn finish_transaction(
+        &mut self,
+        epoch: eredu_core::DistributedCommitEpoch,
+        committed: bool,
+    ) {
+        if let Some(partition) = &mut self.partition {
+            partition.finish(
+                epoch,
+                committed,
+                self.records.as_mut(),
+                self.interventions
+                    .as_mut()
+                    .and_then(|run| run.records.as_mut()),
+            );
+        }
+        if self.transaction.is_some_and(|(active, _)| active == epoch) {
+            self.transaction = Some((
+                epoch,
+                if committed {
+                    CaptureTransactionStatus::Committed
+                } else {
+                    CaptureTransactionStatus::Aborted
+                },
+            ));
+        }
+        if !committed {
+            self.checkpoint_ready = false;
+            if self.transaction.is_none() && self.records.is_some() {
+                self.transaction = Some((epoch, CaptureTransactionStatus::Aborted));
+            }
+        }
+    }
+
     /// Immutable intervention admission currently paired with this shared owner.
     pub fn intervention_plan(&self) -> Option<&eredu_core::intervention::AdmittedInterventionPlan> {
         self.interventions.as_ref().map(|run| &run.plan)
@@ -56,6 +205,29 @@ impl CaptureSession {
     /// missing values. Exhaustion here fails the step: emitting an unaccounted skip
     /// record would itself violate the export limit.
     pub fn begin_step(&mut self, phase: CapturePhase, prediction: u64) -> Result<(), CaptureError> {
+        if self.plan.invocation_bounds().is_some() {
+            return Err(CaptureError::Invalid(
+                "independent capture requires explicit invocation geometry".into(),
+            ));
+        }
+        if self.transaction.is_some() {
+            return Err(CaptureError::Invalid(
+                "capture step cannot replace an undrained transaction".into(),
+            ));
+        }
+        self.begin_step_inner(phase, prediction)
+    }
+
+    fn begin_step_inner(
+        &mut self,
+        phase: CapturePhase,
+        prediction: u64,
+    ) -> Result<(), CaptureError> {
+        if self.plan.invocation_bounds().is_some() != self.invocation.is_some() {
+            return Err(CaptureError::Invalid(
+                "capture invocation geometry/authority mismatch".into(),
+            ));
+        }
         if self.records.is_some() {
             return Err(CaptureError::Invalid(
                 "previous capture step has not been consumed".into(),
@@ -71,12 +243,30 @@ impl CaptureSession {
         self.checkpoint_ready = false;
         self.has_step = true;
         self.ledger.begin_step();
+        if self.invocation.is_some() {
+            if let Some(CaptureSkipReason::Limit { budget, cumulative }) = self.ledger.reserve(
+                invocation::INVOCATION_METADATA.checked_mul(
+                    self.partition
+                        .as_ref()
+                        .map_or(1, |run| run.world_size() as u64),
+                )?,
+            )? {
+                return Err(CaptureError::Limit { budget, cumulative });
+            }
+        }
+        if let Some(partition) = &mut self.partition {
+            partition.begin_step();
+        }
         let mut records = Vec::new();
         for (selection, point) in self.plan.plan().selections.iter().zip(self.plan.points()) {
             let charged = metadata_reservation(selection, point)?;
-            if let Some(CaptureSkipReason::Limit { budget, cumulative }) =
-                self.ledger.reserve(charged)?
-            {
+            if let Some(CaptureSkipReason::Limit { budget, cumulative }) = self.ledger.reserve(
+                charged.checked_mul(
+                    self.partition
+                        .as_ref()
+                        .map_or(1, |run| run.world_size() as u64),
+                )?,
+            )? {
                 return Err(CaptureError::Limit { budget, cumulative });
             }
             records.push(CaptureRecord {
@@ -86,6 +276,7 @@ impl CaptureSession {
                 node_id: point.node_id.clone(),
                 position: point.position,
                 source_shape: None,
+                source_dtype: None,
                 selected_shape: None,
                 outcome: if selection.schedule.includes(phase, prediction) {
                     CaptureOutcome::Missing
@@ -116,6 +307,25 @@ impl CaptureSession {
         path: &str,
         tensor: &B::Tensor,
     ) -> Result<(), CaptureExecutionError<B::Error>> {
+        self.observe_classified(backend, path, tensor, |error| error)
+    }
+
+    // Generated sources can fail portable contract checks after reservation.
+    // Classify those before finalizing the record, using the same forward driver.
+    fn observe_classified<B: CaptureBackend>(
+        &mut self,
+        backend: &mut B,
+        path: &str,
+        tensor: &B::Tensor,
+        classify: impl Fn(CaptureExecutionError<B::Error>) -> CaptureExecutionError<B::Error>,
+    ) -> Result<(), CaptureExecutionError<B::Error>> {
+        if self.partition.is_some() {
+            return Err(CaptureError::Invalid(
+                "partition-bound capture requires its live producer authority".into(),
+            )
+            .into());
+        }
+        let geometry = self.tensor_geometry()?;
         let Some(records) = self.records.as_mut() else {
             return Err(CaptureError::Invalid("capture step not started".into()).into());
         };
@@ -142,11 +352,10 @@ impl CaptureSession {
                 selection,
                 point,
                 record,
-                self.plan.request(),
-                self.phase,
-                self.prediction,
+                geometry,
                 &mut self.ledger,
-            );
+            )
+            .map_err(&classify);
             self.capture_seconds += started.elapsed().as_secs_f64();
             if let Err(error) = result {
                 let reason = match &error {
@@ -176,16 +385,42 @@ impl CaptureSession {
 
     /// Moves the current bounded record batch to the consumer.
     pub fn take_step(&mut self) -> Option<CapturedStep> {
+        if self
+            .transaction
+            .is_some_and(|(_, status)| status == CaptureTransactionStatus::Pending)
+        {
+            return None;
+        }
+        // The low-level, nontransactional owner must also finalize sparse
+        // receipts before handing out records. Failed/incomplete payloads become
+        // explicit failed outcomes; no tentative sparse rows escape as Missing.
+        let _ = self.finish_routed_captures();
+        let outcome = match self.transaction.take() {
+            None => CaptureStepOutcome::Untracked,
+            Some((_, CaptureTransactionStatus::Committed)) => CaptureStepOutcome::Committed,
+            Some((_, CaptureTransactionStatus::Aborted)) => CaptureStepOutcome::Aborted,
+            Some((_, CaptureTransactionStatus::Pending)) => {
+                unreachable!("pending step cannot drain")
+            }
+        };
+        let committed = outcome != CaptureStepOutcome::Aborted;
         if let Some(records) = &self.records {
-            self.checkpoint_ready = self.finish_interventions().is_ok()
+            self.checkpoint_ready = committed
+                && self.finish_interventions().is_ok()
                 && !records
                     .iter()
                     .any(|record| matches!(record.outcome, CaptureOutcome::Failed { .. }));
         }
         self.records.take().map(|records| CapturedStep {
+            outcome,
             phase: self.phase,
+            invocation: self.invocation.take(),
             prediction_index: self.prediction,
             records,
+            partitions: self
+                .partition
+                .as_mut()
+                .map_or_else(Vec::new, |run| run.take_evidence()),
             interventions: self
                 .interventions
                 .as_mut()
@@ -205,18 +440,17 @@ pub(crate) fn capture_value<B: CaptureBackend>(
     selection: &CaptureSelection,
     point: &eredu_core::ObservationPoint,
     record: &mut CaptureRecord,
-    request: CaptureRequestShape,
-    phase: CapturePhase,
-    prediction: u64,
+    geometry: CaptureInvocationShape,
     ledger: &mut CaptureLedger,
 ) -> Result<(), CaptureExecutionError<B::Error>> {
     let path = &selection.path;
+    record.source_dtype = backend.source_dtype(tensor);
 
     let shape = backend
         .shape(tensor)
         .map_err(CaptureExecutionError::Backend)?;
-    request.validate_actual(point, phase, prediction, &shape)?;
-    if let Some(expected) = request.resolve(point, phase, prediction)? {
+    geometry.validate_actual(point, &shape)?;
+    if let Some(expected) = geometry.resolve(point)? {
         if expected != shape {
             return Err(CaptureError::Invalid(format!(
                 "runtime shape for {path}: expected {expected:?}, got {shape:?}"
@@ -225,6 +459,20 @@ pub(crate) fn capture_value<B: CaptureBackend>(
         }
     }
     let slice = resolve_slice(point, selection, &shape)?;
+    capture_resolved_value(backend, tensor, selection, record, shape, &slice, ledger)
+}
+
+/// The native reservation/transform sequence shared by ordinary observations,
+/// intervention evidence and globally identified partition fragments.
+pub(super) fn capture_resolved_value<B: CaptureBackend>(
+    backend: &mut B,
+    tensor: &B::Tensor,
+    selection: &CaptureSelection,
+    record: &mut CaptureRecord,
+    shape: Vec<u64>,
+    slice: &ResolvedCaptureSlice,
+    ledger: &mut dyn CaptureReservation,
+) -> Result<(), CaptureExecutionError<B::Error>> {
     let usage = backend.estimate(tensor, selection, &slice)?;
     record.source_shape = Some(shape);
     record.selected_shape = Some(slice.shape.clone());
@@ -233,27 +481,23 @@ pub(crate) fn capture_value<B: CaptureBackend>(
         return Ok(());
     }
     record.charged = record.charged.checked_add(usage)?;
-    let mut payload = backend
-        .transform(tensor, selection, &slice)
-        .map_err(CaptureExecutionError::Backend)?;
-    if let CapturePayload::Candidates(candidates) = &mut payload {
-        candidates.source = if record.position == eredu_core::ObservationPosition::AfterIntervention
-        {
-            CandidateLogitsSource::Effective
-        } else {
-            CandidateLogitsSource::Original
-        };
+    let transformed = backend.transform(tensor, selection, &slice);
+    // A deferred source becomes known only after its reserved factory runs.
+    // Preserve that fact even if the subsequent transformation fails.
+    record.source_dtype = backend.source_dtype(tensor);
+    let mut payload = transformed.map_err(CaptureExecutionError::Backend)?;
+    let source = if record.position == eredu_core::ObservationPosition::AfterIntervention {
+        CandidateLogitsSource::Effective
+    } else {
+        CandidateLogitsSource::Original
+    };
+    match &mut payload {
+        CapturePayload::Candidates(candidates) => candidates.source = source,
+        CapturePayload::TokenScores(scores) => scores.source = source,
+        _ => {}
     }
     let available = elements(&slice.shape)?;
-    record.outcome = match selection.transform {
-        CaptureTransform::Preview { max_elements } if max_elements < available => {
-            CaptureOutcome::Truncated {
-                available_elements: available,
-                emitted_elements: max_elements,
-            }
-        }
-        _ => CaptureOutcome::Captured,
-    };
+    record.outcome = completed_capture_outcome(&selection.transform, available);
     record.payload = Some(payload);
     // Count through a bounded sink, without allocating a second JSON buffer.
     // This is a backend-contract check, not a substitute for the pre-copy estimate.
@@ -264,6 +508,18 @@ pub(crate) fn capture_value<B: CaptureBackend>(
     serde_json::to_writer(&mut sink, record)
         .map_err(|_| CaptureError::Invalid("backend underestimated encoded capture size".into()))?;
     Ok(())
+}
+
+fn completed_capture_outcome(transform: &CaptureTransform, available: u64) -> CaptureOutcome {
+    match transform {
+        CaptureTransform::Preview { max_elements } if *max_elements < available => {
+            CaptureOutcome::Truncated {
+                available_elements: available,
+                emitted_elements: *max_elements,
+            }
+        }
+        _ => CaptureOutcome::Captured,
+    }
 }
 
 pub(crate) fn bounded_diagnostic(error: &impl std::fmt::Display) -> String {
@@ -350,12 +606,7 @@ pub(crate) fn validate_continuation(
         &ResolvedCaptureSlice,
     ) -> Result<CaptureUsage, CaptureError>,
 ) -> Result<(), CaptureError> {
-    let checked = plan.plan().clone().admit(
-        &discovery.catalog,
-        &discovery.support,
-        &discovery.support.capture,
-        plan.request(),
-    )?;
+    let checked = plan.readmit(discovery)?;
     if checked.identity() != plan.identity() {
         return Err(CaptureError::Invalid(
             "capture admission does not match this session's catalog".into(),
@@ -408,6 +659,16 @@ pub(crate) fn preflight_continuation(
         &ResolvedCaptureSlice,
     ) -> Result<CaptureUsage, CaptureError>,
 ) -> Result<(), CaptureError> {
+    if plan.invocation_bounds().is_some() {
+        return invocation::preflight_invocations(
+            plan,
+            extra,
+            base,
+            scheduled_costs,
+            inherited,
+            estimate,
+        );
+    }
     let remaining = plan
         .request()
         .max_predictions
@@ -512,5 +773,5 @@ pub enum CaptureExecutionError<E: std::error::Error + 'static> {
     Admission(#[from] CaptureError),
     /// Native transformation failed under the backend's recovery owner.
     #[error("native capture failed: {0}")]
-    Backend(E),
+    Backend(#[source] E),
 }

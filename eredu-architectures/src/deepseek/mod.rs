@@ -13,6 +13,7 @@ pub mod block;
 pub mod checkpoint;
 /// Strict V3/R1 and V4 configuration normalization.
 pub mod config;
+mod encoded_expert_residency;
 /// Shared routed-plus-shared expert block.
 pub mod moe;
 /// Shared embedded-prediction layers and outputs.

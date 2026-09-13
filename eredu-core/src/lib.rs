@@ -25,10 +25,13 @@ pub mod capability;
 pub mod capture;
 /// Neutral checkpoint tensor descriptions and validation.
 pub mod checkpoint;
+/// Portable scalar component topology and effective parameter relationships.
+pub mod component;
 /// Backend-neutral distributed scheduler consensus.
 pub mod consensus;
 /// Logical architecture and capture discovery contracts.
 pub mod discovery;
+pub mod parameters;
 pub use discovery::*;
 /// Portable execution plans, capabilities, and telemetry.
 pub mod execution;
@@ -50,6 +53,8 @@ pub mod observation;
 pub mod realtime;
 /// Weight-residency ownership, capacity, and resource planning.
 pub mod residency;
+/// Portable text-run preparation status and cumulative reservation reports.
+pub mod run_preparation;
 /// Transactional fair work scheduler.
 pub mod scheduler;
 /// Exact session admission and unresolved-submission ownership.
@@ -181,8 +186,9 @@ pub use speculative::{
     SpeculativeOptimisticBranch, SpeculativeOutputError, SpeculativeOutputRuntime,
     SpeculativePrefill, SpeculativeProposal, SpeculativePublicationStatus, SpeculativePublisher,
     SpeculativeRandomness, SpeculativeRequest, SpeculativeRequestTable, SpeculativeSampling,
-    SpeculativeSchedule, SpeculativeSchedulerStats, SpeculativeSemanticConstraint,
-    SpeculativeSemanticState, SpeculativeStats, SpeculativeTelemetry,
+    SpeculativeSchedule, SpeculativeScheduleState, SpeculativeSchedulerStats,
+    SpeculativeSemanticConstraint, SpeculativeSemanticState, SpeculativeStats,
+    SpeculativeTelemetry,
 };
 pub use topology::{
     balanced_contiguous_range, ParallelAxis, ParallelCoordinates, ParallelRankTopology,

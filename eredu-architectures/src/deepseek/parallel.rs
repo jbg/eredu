@@ -221,45 +221,37 @@ fn local_axis(
 fn vocabulary_range(
     layout: &LocalModelLayout,
     logical_name: &str,
+    weight: &str,
     global_vocabulary: usize,
     family: &str,
 ) -> Result<VocabularyParallelRange, ParallelPlanError> {
-    let mut selected = None;
-    for (target, tensor) in layout
-        .tensors()
-        .filter(|(_, tensor)| tensor.logical_name() == logical_name)
+    // Vocabulary coordinates belong to the weight rows. FP8 scale rows index
+    // blocks of vocabulary entries; their physical ranges are compiled by the
+    // format-aware parameter planner and are not token coordinates.
+    let tensor = layout
+        .tensor(weight)
+        .ok_or_else(|| invalid(format!("missing local {family} vocabulary weight {weight}")))?;
+    if tensor.logical_name() != logical_name
+        || tensor.global_shape().first().copied() != Some(global_vocabulary)
     {
-        if tensor.global_shape().first().copied() != Some(global_vocabulary) {
-            return Err(invalid(format!(
-                "{family} vocabulary member {target} has global shape {:?}, expected {global_vocabulary} rows",
-                tensor.global_shape()
-            )));
-        }
-        let range = match tensor.placement() {
-            TensorPlacement::Range {
-                axis: 0,
-                start,
-                end,
-            } => *start..*end,
-            TensorPlacement::Replicated => 0..global_vocabulary,
-            placement => {
-                return Err(invalid(format!(
-                    "{family} vocabulary member {target} has non-row placement {placement:?}"
-                )))
-            }
-        };
-        if selected.as_ref().is_some_and(|current| current != &range) {
-            return Err(invalid(format!(
-                "{family} vocabulary group {logical_name} has inconsistent companion ranges"
-            )));
-        }
-        selected = Some(range);
+        return Err(invalid(format!(
+            "{family} vocabulary weight {weight} has group {:?} and shape {:?}, expected {logical_name} with {global_vocabulary} rows",
+            tensor.logical_name(), tensor.global_shape()
+        )));
     }
-    let local = selected.ok_or_else(|| {
-        invalid(format!(
-            "missing local {family} vocabulary layout for {logical_name}"
-        ))
-    })?;
+    let local = match tensor.placement() {
+        TensorPlacement::Range {
+            axis: 0,
+            start,
+            end,
+        } => *start..*end,
+        TensorPlacement::Replicated => 0..global_vocabulary,
+        placement => {
+            return Err(invalid(format!(
+                "{family} vocabulary weight {weight} has non-row placement {placement:?}"
+            )))
+        }
+    };
     let range = VocabularyParallelRange {
         global_vocabulary,
         local,
@@ -308,22 +300,9 @@ fn same_logical_range(
             omitted = true;
             continue;
         }
-        if tensor.logical_units() != Some(global_units) {
-            return Err(invalid(format!(
-                "{family} {label} tensor {target} has semantic width {:?}, expected {global_units}",
-                tensor.logical_units()
-            )));
-        }
-        let range = tensor.logical_range().cloned().ok_or_else(|| {
-            invalid(format!(
-                "{family} {label} tensor {target} has no exact semantic range"
-            ))
-        })?;
-        if range.is_empty() || range.end > global_units {
-            return Err(invalid(format!(
-                "{family} {label} tensor {target} has invalid semantic range {range:?}"
-            )));
-        }
+        let range = tensor
+            .expanded_logical_range(global_units)
+            .map_err(|error| invalid(format!("{family} {label} tensor {target}: {error}")))?;
         if selected.as_ref().is_some_and(|current| current != &range) {
             return Err(invalid(format!(
                 "{family} {label} placement differs between execution units"
@@ -439,8 +418,20 @@ pub fn v3_local_geometry(
     let geometry = V3LocalGeometry {
         state_layout: v3::state_layout(&local)
             .map_err(|error| invalid(format!("invalid local V3 state layout: {error}")))?,
-        embedding_range: vocabulary_range(layout, "model.embed_tokens", global_vocabulary, "V3")?,
-        output_range: vocabulary_range(layout, "lm_head", global_vocabulary, "V3")?,
+        embedding_range: vocabulary_range(
+            layout,
+            "model.embed_tokens",
+            "model.embed_tokens.weight",
+            global_vocabulary,
+            "V3",
+        )?,
+        output_range: vocabulary_range(
+            layout,
+            "lm_head",
+            "lm_head.weight",
+            global_vocabulary,
+            "V3",
+        )?,
         routed_expert_intermediate_range,
         shared_expert_intermediate_range,
         architecture_fingerprint: v3_architecture_fingerprint(args),
@@ -545,8 +536,14 @@ pub fn v4_local_geometry(
     let geometry = V4LocalGeometry {
         state_layout: v4::state_layout(&local)
             .map_err(|error| invalid(format!("invalid local V4 state layout: {error}")))?,
-        embedding_range: vocabulary_range(layout, "embed", global_vocabulary, "V4")?,
-        output_range: vocabulary_range(layout, "head", global_vocabulary, "V4")?,
+        embedding_range: vocabulary_range(
+            layout,
+            "embed",
+            "embed.weight",
+            global_vocabulary,
+            "V4",
+        )?,
+        output_range: vocabulary_range(layout, "head", "head.weight", global_vocabulary, "V4")?,
         routed_expert_intermediate_range,
         shared_expert_intermediate_range,
         architecture_fingerprint: v4_architecture_fingerprint(args),
@@ -1115,7 +1112,7 @@ where
 pub fn v3_static_parameter_groups(
     args: &V3Args,
 ) -> Result<Vec<ParameterGroupSpec>, ParallelPlanError> {
-    Ok(vec![
+    let groups = vec![
         group(
             "model.embed_tokens",
             ParameterRole::Vocabulary,
@@ -1138,7 +1135,15 @@ pub fn v3_static_parameter_groups(
                 MemberSharding::Balanced { axis: 0 },
             )],
         )?,
-    ])
+    ];
+    // Published V3 statics are dense even when the layer default is FP8.
+    // Explicit admitted formats cover GGUF and transformed embedding/head data.
+    expand_linear_formats(groups, |name| {
+        args.linear_formats
+            .get(name)
+            .copied()
+            .unwrap_or(LinearFormat::Dense)
+    })
 }
 
 /// Declares one V3 target or embedded-prediction unit's semantic groups.
@@ -1250,7 +1255,16 @@ pub fn v3_layer_parameter_groups(
     } else {
         dense_v3_group(args, layer)?.into_iter().collect()
     });
-    expand_linear_formats(groups, |name| args.linear_format_for(name))
+    expand_linear_formats(groups, |name| {
+        if name == format!("{root}.mlp.gate.weight") {
+            args.linear_formats
+                .get(name)
+                .copied()
+                .unwrap_or(LinearFormat::Dense)
+        } else {
+            args.linear_format_for(name)
+        }
+    })
 }
 
 /// Declares pinned V4 vocabulary, target hyper-head, and final norm groups.
@@ -1329,7 +1343,18 @@ pub fn v4_static_parameter_groups(
             ],
         )?);
     }
-    expand_linear_formats(groups, |name| args.linear_format_for(name))
+    expand_linear_formats(groups, |name| {
+        // Published embedding tables remain dense under the FP8 linear default.
+        // Retain any separately admitted source/transform encoding explicitly.
+        if name == "embed.weight" || name.ends_with(".markov_head.markov_w1.weight") {
+            args.linear_formats
+                .get(name)
+                .copied()
+                .unwrap_or(LinearFormat::Dense)
+        } else {
+            args.linear_format_for(name)
+        }
+    })
 }
 
 /// Describes every V3 target/prediction parameter with explicit graph ownership.
@@ -1605,7 +1630,16 @@ pub fn v4_layer_parameter_groups(
         )?);
     }
     groups.extend(expert_groups_v4(args, layer, &root)?);
-    expand_linear_formats(groups, |name| args.linear_format_for(name))
+    expand_linear_formats(groups, |name| {
+        if name == format!("{root}.ffn.gate.weight") {
+            args.linear_formats
+                .get(name)
+                .copied()
+                .unwrap_or(LinearFormat::Dense)
+        } else {
+            args.linear_format_for(name)
+        }
+    })
 }
 
 fn dense_v3_group(
@@ -1778,210 +1812,13 @@ fn expert_groups(
     )?])
 }
 
-fn remap_segments(
-    sharding: &MemberSharding,
-    axis: usize,
-    divisor: usize,
-    name: &str,
-) -> Result<MemberSharding, ParallelPlanError> {
-    let remap = |segments: &[std::ops::Range<usize>]| {
-        segments
-            .iter()
-            .map(|segment| {
-                if !segment.start.is_multiple_of(divisor)
-                    || !segment.end.is_multiple_of(divisor)
-                {
-                    return Err(invalid(format!(
-                        "packed DeepSeek companion {name} segment {segment:?} is not aligned to {divisor}"
-                    )));
-                }
-                Ok(segment.start / divisor..segment.end / divisor)
-            })
-            .collect::<Result<Vec<_>, _>>()
-    };
-    match sharding {
-        MemberSharding::PartitionedSegments {
-            axis: selected,
-            segments,
-        } if *selected == axis => Ok(MemberSharding::PartitionedSegments {
-            axis: *selected,
-            segments: remap(segments)?,
-        }),
-        MemberSharding::Segmented {
-            axis: selected,
-            segments,
-        } if *selected == axis => Ok(MemberSharding::Segmented {
-            axis: *selected,
-            segments: remap(segments)?,
-        }),
-        other => Ok(other.clone()),
-    }
-}
-
-fn expand_linear_member(
-    source: &ParameterMemberSpec,
-    format: LinearFormat,
-) -> Result<Vec<ParameterMemberSpec>, ParallelPlanError> {
-    let name = source.target();
-    let shape = source.global_shape();
-    let expert_bank = name.ends_with(".gate_up_proj") || name.ends_with(".down_proj");
-    if (!name.ends_with(".weight") && !expert_bank)
-        || shape.len() < 2
-        || format == LinearFormat::Dense
-    {
-        return Ok(vec![source.clone()]);
-    }
-    let row_axis = shape.len() - 2;
-    let column_axis = shape.len() - 1;
-    let prefix = name.strip_suffix(".weight").unwrap_or(name);
-    match format {
-        LinearFormat::Dense => unreachable!(),
-        LinearFormat::E4M3BlockFp8(fp8) => {
-            fp8.validate().map_err(|error| invalid(error.to_string()))?;
-            let rows = usize::try_from(fp8.block_rows)
-                .map_err(|_| invalid(format!("invalid block rows for {name}")))?;
-            let columns = usize::try_from(fp8.block_columns)
-                .map_err(|_| invalid(format!("invalid block columns for {name}")))?;
-            let mut scale_shape = shape.to_vec();
-            scale_shape[row_axis] = scale_shape[row_axis].div_ceil(rows);
-            scale_shape[column_axis] = scale_shape[column_axis].div_ceil(columns);
-            let scale_sharding = remap_segments(source.sharding(), row_axis, rows, name)
-                .and_then(|value| remap_segments(&value, column_axis, columns, name))?;
-            Ok(vec![
-                source.clone(),
-                member(
-                    if expert_bank {
-                        format!("{prefix}_scales")
-                    } else {
-                        format!("{prefix}.weight_scale_inv")
-                    },
-                    scale_shape,
-                    scale_sharding,
-                ),
-            ])
-        }
-        LinearFormat::GgufIQuant { ggml_type, .. } => {
-            let (block_values, block_bytes) = ggml_type
-                .block_and_bytes()
-                .map_err(|error| invalid(error.to_string()))?;
-            let block_values = usize::try_from(block_values)
-                .map_err(|_| invalid(format!("GGUF block width for {name} exceeds usize")))?;
-            let block_bytes = usize::try_from(block_bytes)
-                .map_err(|_| invalid(format!("GGUF block bytes for {name} exceeds usize")))?;
-            let input = shape[column_axis];
-            if !input.is_multiple_of(block_values) {
-                return Err(invalid(format!(
-                    "GGUF DeepSeek matrix {name} input {input} is not aligned to block {block_values}"
-                )));
-            }
-            let mut packed = shape.to_vec();
-            packed[column_axis] = input / block_values * block_bytes;
-            Ok(vec![member(
-                name,
-                packed,
-                remap_segments(source.sharding(), column_axis, block_values, name)?,
-            )])
-        }
-        LinearFormat::Affine(_) | LinearFormat::MxFp4 => {
-            let quantization = format
-                .weight_quantization()
-                .expect("packed affine format has quantization");
-            let bits = usize::try_from(quantization.bits())
-                .map_err(|_| invalid(format!("packed bit width for {name} exceeds usize")))?;
-            let group = usize::try_from(quantization.group_size())
-                .map_err(|_| invalid(format!("packed group width for {name} exceeds usize")))?;
-            let input = shape[column_axis];
-            let packed_bits = input
-                .checked_mul(bits)
-                .ok_or_else(|| invalid(format!("packed DeepSeek matrix {name} overflows")))?;
-            if group == 0 || !input.is_multiple_of(group) || !packed_bits.is_multiple_of(32) {
-                return Err(invalid(format!(
-                    "packed DeepSeek matrix {name} input {input} is incompatible with group {group} and {bits} bits"
-                )));
-            }
-            let pack = 32 / bits;
-            let mut packed = shape.to_vec();
-            packed[column_axis] = packed_bits / 32;
-            let mut companion = shape.to_vec();
-            companion[column_axis] = input / group;
-            let mut members = vec![member(
-                name,
-                packed,
-                remap_segments(source.sharding(), column_axis, pack, name)?,
-            )];
-            let companion_sharding = remap_segments(source.sharding(), column_axis, group, name)?;
-            members.push(member(
-                if expert_bank {
-                    format!("{prefix}_scales")
-                } else {
-                    format!("{prefix}.scales")
-                },
-                companion.clone(),
-                companion_sharding.clone(),
-            ));
-            if quantization.has_biases() {
-                members.push(member(
-                    if expert_bank {
-                        format!("{prefix}_biases")
-                    } else {
-                        format!("{prefix}.biases")
-                    },
-                    companion,
-                    companion_sharding,
-                ));
-            }
-            Ok(members)
-        }
-    }
-}
-
-fn gcd(mut left: usize, mut right: usize) -> usize {
-    while right != 0 {
-        let remainder = left % right;
-        left = right;
-        right = remainder;
-    }
-    left
-}
-
 fn expand_linear_formats(
     groups: Vec<ParameterGroupSpec>,
     format: impl Fn(&str) -> LinearFormat,
 ) -> Result<Vec<ParameterGroupSpec>, ParallelPlanError> {
-    groups
-        .into_iter()
-        .map(|group| {
-            let mut members = Vec::new();
-            for source in group.members() {
-                members.extend(expand_linear_member(source, format(source.target()))?);
-            }
-            match group.partition_units() {
-                Some(mut units) => {
-                    for member in &members {
-                        match member.sharding() {
-                            MemberSharding::Partitioned { axis } => {
-                                units = gcd(units, member.global_shape()[*axis]);
-                            }
-                            MemberSharding::PartitionedSegments { segments, .. }
-                            | MemberSharding::Segmented { segments, .. } => {
-                                for segment in segments {
-                                    units = gcd(units, segment.len());
-                                }
-                            }
-                            _ => {}
-                        }
-                    }
-                    ParameterGroupSpec::partitioned(
-                        group.logical_name(),
-                        group.role(),
-                        units,
-                        members,
-                    )
-                }
-                None => ParameterGroupSpec::new(group.logical_name(), group.role(), members),
-            }
-        })
-        .collect()
+    eredu_runtime::expand_linear_format_parameter_groups(groups, |member| {
+        crate::linear_format::standard_parallel_linear_format(member, format(member.target()))
+    })
 }
 
 fn replicated<N, I>(
@@ -2118,6 +1955,82 @@ mod tests {
     }
 
     #[test]
+    fn expert_component_ranges_expand_uniform_encoded_partition_units() {
+        for units in [2, 4, 64] {
+            let mut layout = LocalModelLayout::default();
+            for (name, shape, local, placement) in [
+                (
+                    "routed",
+                    vec![4, 128, 8],
+                    vec![4, 64, 8],
+                    TensorPlacement::Indices {
+                        axis: 1,
+                        indices: (32..64).chain(96..128).collect(),
+                    },
+                ),
+                (
+                    "shared",
+                    vec![64, 8],
+                    vec![32, 8],
+                    TensorPlacement::Range {
+                        axis: 0,
+                        start: 32,
+                        end: 64,
+                    },
+                ),
+            ] {
+                layout.insert(
+                    name.into(),
+                    LocalTensorLayout::new(
+                        name,
+                        ParameterRole::FeedForwardIntermediate,
+                        shape,
+                        local,
+                        placement,
+                        Some(units),
+                        Some(units / 2..units),
+                        false,
+                    ),
+                );
+            }
+            assert_eq!(
+                same_logical_range(
+                    &layout,
+                    ["routed".into(), "shared".into()],
+                    64,
+                    "fixture",
+                    "expert"
+                )
+                .unwrap(),
+                Some(32..64)
+            );
+        }
+        for (units, range) in [(0, 0..0), (3, 0..1), (2, 1..3)] {
+            let mut layout = LocalModelLayout::default();
+            layout.insert(
+                "invalid".into(),
+                LocalTensorLayout::new(
+                    "invalid",
+                    ParameterRole::FeedForwardIntermediate,
+                    vec![64, 8],
+                    vec![32, 8],
+                    TensorPlacement::Range {
+                        axis: 0,
+                        start: 32,
+                        end: 64,
+                    },
+                    Some(units),
+                    Some(range),
+                    false,
+                ),
+            );
+            assert!(
+                same_logical_range(&layout, ["invalid".into()], 64, "fixture", "expert").is_err()
+            );
+        }
+    }
+
+    #[test]
     fn v3_fp8_plan_keeps_inverse_scales_atomic_with_weight_shards() {
         let mut args = v3_args();
         args.hidden_size = 128;
@@ -2154,6 +2067,110 @@ mod tests {
             .iter()
             .any(|name| name.ends_with("experts.down_proj_scales")));
         assert_eq!(expert.partition_units(), Some(1));
+    }
+
+    #[test]
+    fn v4_mixed_fp8_experts_keep_mxfp4_scale_rows_in_target_and_prediction() {
+        let mut args = v4_args();
+        args.hidden_size = 256;
+        args.moe_intermediate_size = 256;
+        args.linear_format = LinearFormat::E4M3BlockFp8(
+            BlockFp8Format::new(128, 128, BlockFp8ScaleEncoding::Ue8m0).unwrap(),
+        );
+        args.expert_format = crate::deepseek::ExpertFormat::MxFp4;
+        for (layer, root) in [(0, "layers.0"), (3, "mtp.0")] {
+            let groups =
+                expand_linear_formats(expert_groups_v4(&args, layer, root).unwrap(), |name| {
+                    args.linear_format_for(name)
+                })
+                .unwrap();
+            let expert = groups
+                .iter()
+                .find(|group| group.logical_name().ends_with("routed_expert_intermediate"))
+                .unwrap();
+            for (suffix, shape) in [
+                ("gate_up_proj", vec![4, 512, 32]),
+                ("gate_up_proj_scales", vec![4, 512, 8]),
+                ("down_proj", vec![4, 256, 32]),
+                ("down_proj_scales", vec![4, 256, 8]),
+            ] {
+                let member = expert
+                    .members()
+                    .iter()
+                    .find(|member| member.target() == format!("{root}.ffn.switch_mlp.{suffix}"))
+                    .unwrap();
+                assert_eq!(member.global_shape(), shape);
+            }
+            let name = format!("{root}.ffn.switch_mlp.gate_up_proj");
+            assert_eq!(args.linear_format_for(&name), LinearFormat::MxFp4);
+            assert_eq!(
+                args.linear_format_for(&format!("{root}.ffn.experts.0.w1.weight")),
+                LinearFormat::MxFp4
+            );
+            args.linear_formats
+                .insert(name.clone(), LinearFormat::Dense);
+            let policy =
+                crate::deepseek::v4::moe_policy_at(&args, layer, &format!("{root}.ffn")).unwrap();
+            assert_eq!(policy.expert_gate_up_format, LinearFormat::Dense);
+            assert_eq!(policy.expert_down_format, LinearFormat::MxFp4);
+        }
+    }
+
+    #[test]
+    fn v4_fp8_vocabulary_uses_token_rows_and_keeps_embedding_dense() {
+        for encoding in [
+            BlockFp8ScaleEncoding::FloatingPoint,
+            BlockFp8ScaleEncoding::Ue8m0,
+        ] {
+            let mut args = v4_args();
+            args.hidden_size = 128;
+            args.vocab_size = 256;
+            args.linear_format =
+                LinearFormat::E4M3BlockFp8(BlockFp8Format::new(128, 128, encoding).unwrap());
+            let groups = v4_static_parameter_groups(&args).unwrap();
+            let embedding = groups
+                .iter()
+                .find(|group| group.logical_name() == "embed")
+                .unwrap();
+            assert_eq!(embedding.members().len(), 1);
+            assert_eq!(embedding.members()[0].target(), "embed.weight");
+            let head = groups
+                .iter()
+                .find(|group| group.logical_name() == "head")
+                .unwrap();
+            let scale = head
+                .members()
+                .iter()
+                .find(|member| member.target() == "head.weight_scale_inv")
+                .unwrap();
+            assert_eq!(scale.global_shape(), &[2, 1]);
+            for rank in 0..2 {
+                let mut layout = LocalModelLayout::default();
+                vocab(
+                    &mut layout,
+                    "head.weight",
+                    "head",
+                    256,
+                    rank * 128..(rank + 1) * 128,
+                );
+                insert(
+                    &mut layout,
+                    "head.weight_scale_inv",
+                    "head",
+                    vec![2, 1],
+                    vec![1, 1],
+                    TensorPlacement::Range {
+                        axis: 0,
+                        start: rank,
+                        end: rank + 1,
+                    },
+                );
+                let range = vocabulary_range(&layout, "head", "head.weight", 256, "V4").unwrap();
+                assert_eq!(range.local, rank * 128..(rank + 1) * 128);
+                assert!(vocabulary_range(&layout, "head", "head.weight", 255, "V4").is_err());
+                assert!(vocabulary_range(&layout, "other", "head.weight", 256, "V4").is_err());
+            }
+        }
     }
 
     #[test]

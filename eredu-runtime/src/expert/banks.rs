@@ -10,7 +10,7 @@ pub enum RoutedBankProviderError<E> {
     Missing(RoutedBankId),
     /// The selected bank's acquisition, execution, or completion failed.
     #[error("routed bank failed: {0}")]
-    Provider(E),
+    Provider(#[source] E),
 }
 
 /// Independently identified providers may share a bounded residency pool.
@@ -84,7 +84,7 @@ impl<B: GroupedNeuralBackend, P: RoutedExpertProvider<B>> RoutedExpertProvider<B
     fn forward_grouped(
         &mut self,
         resident: &mut B::GatedProductGroups,
-        request: RoutedExpertRequest<'_, B::Tensor>,
+        request: RoutedExpertRequest<'_, '_, B::Tensor>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error> {
         self.selected(request.bank)?
@@ -94,7 +94,7 @@ impl<B: GroupedNeuralBackend, P: RoutedExpertProvider<B>> RoutedExpertProvider<B
     fn forward_compact_grouped(
         &mut self,
         resident: &mut B::GatedProductGroups,
-        request: RoutedExpertRequest<'_, B::Tensor>,
+        request: RoutedExpertRequest<'_, '_, B::Tensor>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error> {
         self.selected(request.bank)?
@@ -104,7 +104,7 @@ impl<B: GroupedNeuralBackend, P: RoutedExpertProvider<B>> RoutedExpertProvider<B
     fn forward_linear_routed(
         &mut self,
         resident: &mut B::LinearGroups,
-        request: RoutedExpertRequest<'_, B::Tensor>,
+        request: RoutedExpertRequest<'_, '_, B::Tensor>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error> {
         self.selected(request.bank)?
@@ -114,7 +114,7 @@ impl<B: GroupedNeuralBackend, P: RoutedExpertProvider<B>> RoutedExpertProvider<B
     fn forward_relu2_routed(
         &mut self,
         resident: &mut B::Relu2Groups,
-        request: RoutedExpertRequest<'_, B::Tensor>,
+        request: RoutedExpertRequest<'_, '_, B::Tensor>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error> {
         self.selected(request.bank)?
@@ -128,7 +128,7 @@ impl<B: GroupedNeuralBackend, P: TensorParallelRoutedExpertProvider<B>>
     fn forward_grouped_tensor_parallel(
         &mut self,
         resident: &mut B::GatedProductGroups,
-        request: RoutedExpertRequest<'_, B::Tensor>,
+        request: RoutedExpertRequest<'_, '_, B::Tensor>,
         parts: usize,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<RoutedExpertTensorParallelOutput<B::Tensor>, Self::Error> {
@@ -139,7 +139,7 @@ impl<B: GroupedNeuralBackend, P: TensorParallelRoutedExpertProvider<B>>
     fn forward_compact_grouped_tensor_parallel(
         &mut self,
         resident: &mut B::GatedProductGroups,
-        request: RoutedExpertRequest<'_, B::Tensor>,
+        request: RoutedExpertRequest<'_, '_, B::Tensor>,
         parts: usize,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<RoutedExpertTensorParallelOutput<B::Tensor>, Self::Error> {
@@ -150,7 +150,7 @@ impl<B: GroupedNeuralBackend, P: TensorParallelRoutedExpertProvider<B>>
     fn forward_relu2_routed_tensor_parallel(
         &mut self,
         resident: &mut B::Relu2Groups,
-        request: RoutedExpertRequest<'_, B::Tensor>,
+        request: RoutedExpertRequest<'_, '_, B::Tensor>,
         parts: usize,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<RoutedExpertTensorParallelOutput<B::Tensor>, Self::Error> {
@@ -187,7 +187,7 @@ impl<B: GroupedNeuralBackend, P: RoutedExpertProvider<B> + ?Sized> RoutedExpertP
     fn forward_grouped(
         &mut self,
         resident: &mut B::GatedProductGroups,
-        request: RoutedExpertRequest<'_, B::Tensor>,
+        request: RoutedExpertRequest<'_, '_, B::Tensor>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error> {
         self.as_mut().forward_grouped(resident, request, context)
@@ -195,7 +195,7 @@ impl<B: GroupedNeuralBackend, P: RoutedExpertProvider<B> + ?Sized> RoutedExpertP
     fn forward_compact_grouped(
         &mut self,
         resident: &mut B::GatedProductGroups,
-        request: RoutedExpertRequest<'_, B::Tensor>,
+        request: RoutedExpertRequest<'_, '_, B::Tensor>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error> {
         self.as_mut()
@@ -204,7 +204,7 @@ impl<B: GroupedNeuralBackend, P: RoutedExpertProvider<B> + ?Sized> RoutedExpertP
     fn forward_linear_routed(
         &mut self,
         resident: &mut B::LinearGroups,
-        request: RoutedExpertRequest<'_, B::Tensor>,
+        request: RoutedExpertRequest<'_, '_, B::Tensor>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error> {
         self.as_mut()
@@ -213,7 +213,7 @@ impl<B: GroupedNeuralBackend, P: RoutedExpertProvider<B> + ?Sized> RoutedExpertP
     fn forward_relu2_routed(
         &mut self,
         resident: &mut B::Relu2Groups,
-        request: RoutedExpertRequest<'_, B::Tensor>,
+        request: RoutedExpertRequest<'_, '_, B::Tensor>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error> {
         self.as_mut()
@@ -226,7 +226,7 @@ impl<B: GroupedNeuralBackend, P: TensorParallelRoutedExpertProvider<B> + ?Sized>
     fn forward_grouped_tensor_parallel(
         &mut self,
         resident: &mut B::GatedProductGroups,
-        request: RoutedExpertRequest<'_, B::Tensor>,
+        request: RoutedExpertRequest<'_, '_, B::Tensor>,
         partitions: usize,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<RoutedExpertTensorParallelOutput<B::Tensor>, Self::Error> {
@@ -236,7 +236,7 @@ impl<B: GroupedNeuralBackend, P: TensorParallelRoutedExpertProvider<B> + ?Sized>
     fn forward_compact_grouped_tensor_parallel(
         &mut self,
         resident: &mut B::GatedProductGroups,
-        request: RoutedExpertRequest<'_, B::Tensor>,
+        request: RoutedExpertRequest<'_, '_, B::Tensor>,
         partitions: usize,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<RoutedExpertTensorParallelOutput<B::Tensor>, Self::Error> {
@@ -246,7 +246,7 @@ impl<B: GroupedNeuralBackend, P: TensorParallelRoutedExpertProvider<B> + ?Sized>
     fn forward_relu2_routed_tensor_parallel(
         &mut self,
         resident: &mut B::Relu2Groups,
-        request: RoutedExpertRequest<'_, B::Tensor>,
+        request: RoutedExpertRequest<'_, '_, B::Tensor>,
         partitions: usize,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<RoutedExpertTensorParallelOutput<B::Tensor>, Self::Error> {

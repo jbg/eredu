@@ -17,7 +17,7 @@ use safemlx::{
 
 use crate::{
     module::PhysicalParam,
-    native_quantization::{native_grouped_linear, NativeQuantizedTensor},
+    native_quantization::{native_grouped_linear_from_array, NativeQuantizedTensor},
 };
 
 use super::grouping::{
@@ -35,6 +35,9 @@ mod gated_product;
 mod packed_linear;
 mod relu2;
 mod selection;
+mod units;
+use units::observe_units;
+pub(crate) use units::NativeGroupedUnitObserver;
 
 pub use gated_product::PackedGatedProductGroups;
 pub use packed_linear::packed_grouped_linear;

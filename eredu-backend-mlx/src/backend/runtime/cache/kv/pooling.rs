@@ -62,20 +62,28 @@ impl PoolingCache {
         })
     }
 
-    pub fn deep_clone_state(&self) -> Result<Self, Exception> {
-        let clone = |array: &Option<Array>| {
+    /// Copies complete logical state using the caller's native stream.
+    pub fn deep_clone_state(&self, stream: &Stream) -> Result<Self, Exception> {
+        self.isolated_snapshot(stream)
+    }
+
+    /// Copies every logical element of partial, pooled and overlap views into
+    /// independent compact storage. Transaction graph clones are insufficient
+    /// for durable snapshots of strided views.
+    pub(crate) fn isolated_snapshot(&self, stream: &Stream) -> Result<Self, Exception> {
+        let copy = |array: &Option<Array>| {
             array
                 .as_ref()
-                .map(|array| array.clone().deep_clone())
+                .map(|array| array.contiguous(false, stream)?.deep_clone())
                 .transpose()
         };
         Ok(Self {
             ratio: self.ratio,
-            pending_values: clone(&self.pending_values)?,
-            pending_gates: clone(&self.pending_gates)?,
-            pooled: clone(&self.pooled)?,
-            overlap_values: clone(&self.overlap_values)?,
-            overlap_gates: clone(&self.overlap_gates)?,
+            pending_values: copy(&self.pending_values)?,
+            pending_gates: copy(&self.pending_gates)?,
+            pooled: copy(&self.pooled)?,
+            overlap_values: copy(&self.overlap_values)?,
+            overlap_gates: copy(&self.overlap_gates)?,
             processed_tokens: self.processed_tokens,
         })
     }

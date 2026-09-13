@@ -1,5 +1,6 @@
 //! Kimi Linear normalization, residual, and heterogeneous mixer assembly.
 
+use crate::decoder::ComponentInstrumentation;
 use eredu_nn::{
     BlockwiseAttentionBackend, CompressedAttentionCache, Error, GroupedNeuralBackend,
     NeuralBackend, NormalizationConstructionSpec, NormalizationOperator, ParameterSpec,
@@ -104,12 +105,33 @@ impl<B: NeuralBackend> KdaReplicatedBlock<B> {
         state: &mut C,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
+        self.forward_instrumented(
+            hidden,
+            state,
+            context,
+            &mut ComponentInstrumentation::disabled(),
+        )
+    }
+
+    pub(crate) fn forward_instrumented<C: RuntimeStateComponents<B>>(
+        &mut self,
+        hidden: &B::Tensor,
+        state: &mut C,
+        context: &<B::Tensor as Tensor>::Context,
+        instrumentation: &mut ComponentInstrumentation<'_, B::Tensor>,
+    ) -> Result<B::Tensor, Error> {
         let normalized = self.input_norm.forward(hidden, context)?;
-        let mixed = self.mixer.forward(&normalized, state, context)?;
-        let hidden = hidden.add(&mixed, context)?;
+        let normalized = instrumentation.apply("attention.input", normalized)?;
+        let mixed =
+            self.mixer
+                .forward_instrumented(&normalized, state, None, context, instrumentation)?;
+        let hidden = finish_mixer::<B>(hidden, mixed, context, instrumentation)?;
         let normalized = self.post_attention_norm.forward(&hidden, context)?;
-        let feed_forward = self.feed_forward.forward(&normalized, context)?;
-        hidden.add(&feed_forward, context)
+        let normalized = instrumentation.apply("feed_forward.input", normalized)?;
+        let output =
+            self.feed_forward
+                .forward_instrumented(&normalized, None, context, instrumentation)?;
+        finish_feed_forward::<B>(&hidden, output, false, context, instrumentation)
     }
 }
 
@@ -165,15 +187,44 @@ impl<B: NeuralBackend + BlockwiseAttentionBackend> ReplicatedBlock<B> {
     where
         C: RuntimeStateComponents<B> + CompressedAttentionCache<B::Tensor>,
     {
+        self.forward_instrumented(
+            hidden,
+            mask,
+            state,
+            context,
+            &mut ComponentInstrumentation::disabled(),
+        )
+    }
+
+    pub(crate) fn forward_instrumented<C>(
+        &mut self,
+        hidden: &B::Tensor,
+        mask: Option<&B::Tensor>,
+        state: &mut C,
+        context: &<B::Tensor as Tensor>::Context,
+        instrumentation: &mut ComponentInstrumentation<'_, B::Tensor>,
+    ) -> Result<B::Tensor, Error>
+    where
+        C: RuntimeStateComponents<B> + CompressedAttentionCache<B::Tensor>,
+    {
         let normalized = self.input_norm.forward(hidden, context)?;
-        let mixed = match &mut self.mixer {
-            TokenMixer::Kda(mixer) => mixer.forward(&normalized, state, context)?,
-            TokenMixer::Mla(mixer) => mixer.forward(&normalized, mask, Some(state), context)?,
-        };
-        let hidden = hidden.add(&mixed, context)?;
+        let normalized = instrumentation.apply("attention.input", normalized)?;
+        let mixed = forward_mixer::<B, C>(
+            &mut self.mixer,
+            &normalized,
+            mask,
+            state,
+            None,
+            context,
+            instrumentation,
+        )?;
+        let hidden = finish_mixer::<B>(hidden, mixed, context, instrumentation)?;
         let normalized = self.post_attention_norm.forward(&hidden, context)?;
-        let feed_forward = self.feed_forward.forward(&normalized, context)?;
-        hidden.add(&feed_forward, context)
+        let normalized = instrumentation.apply("feed_forward.input", normalized)?;
+        let output =
+            self.feed_forward
+                .forward_instrumented(&normalized, None, context, instrumentation)?;
+        finish_feed_forward::<B>(&hidden, output, false, context, instrumentation)
     }
 }
 
@@ -336,15 +387,64 @@ where
             &<B::Tensor as Tensor>::Context,
         ) -> Result<B::Tensor, Error>,
     {
+        self.forward_partition_instrumented_with_feed_forward(
+            hidden,
+            mask,
+            state,
+            None,
+            context,
+            &mut ComponentInstrumentation::disabled(),
+            |policy, input, context, _| feed_forward(policy, input, context),
+        )
+    }
+
+    /// Runs the same residual equations for ordinary and observed local partitions.
+    pub fn forward_partition_instrumented_with_feed_forward<C, F>(
+        &mut self,
+        hidden: &B::Tensor,
+        mask: Option<&B::Tensor>,
+        state: &mut C,
+        parallel: Option<&B::ParallelContext>,
+        context: &<B::Tensor as Tensor>::Context,
+        instrumentation: &mut ComponentInstrumentation<'_, B::Tensor>,
+        feed_forward: F,
+    ) -> Result<B::Tensor, Error>
+    where
+        C: RuntimeStateComponents<B> + CompressedAttentionCache<B::Tensor>,
+        F: FnOnce(
+            &mut FeedForward<B>,
+            &B::Tensor,
+            &<B::Tensor as Tensor>::Context,
+            &mut ComponentInstrumentation<'_, B::Tensor>,
+        ) -> Result<B::Tensor, Error>,
+    {
         let normalized = self.input_norm.forward(hidden, context)?;
-        let mixed = match &mut self.mixer {
-            TokenMixer::Kda(mixer) => mixer.forward(&normalized, state, context)?,
-            TokenMixer::Mla(mixer) => mixer.forward(&normalized, mask, Some(state), context)?,
-        };
-        let hidden = hidden.add(&mixed, context)?;
+        let normalized = instrumentation.apply("attention.input", normalized)?;
+        let mixed = forward_mixer::<B, C>(
+            &mut self.mixer,
+            &normalized,
+            mask,
+            state,
+            parallel,
+            context,
+            instrumentation,
+        )?;
+        let hidden = finish_mixer::<B>(hidden, mixed, context, instrumentation)?;
         let normalized = self.post_attention_norm.forward(&hidden, context)?;
-        let feed_forward = feed_forward(&mut self.feed_forward, &normalized, context)?;
-        hidden.add(&feed_forward, context)
+        let normalized = instrumentation.apply("feed_forward.input", normalized)?;
+        let output = feed_forward(
+            &mut self.feed_forward,
+            &normalized,
+            context,
+            instrumentation,
+        )?;
+        finish_feed_forward::<B>(
+            &hidden,
+            output,
+            matches!(self.feed_forward, FeedForward::Sparse(_)),
+            context,
+            instrumentation,
+        )
     }
 
     /// Executes tensor-partitioned token mixing and feed-forward projections.
@@ -393,18 +493,64 @@ where
             &<B::Tensor as Tensor>::Context,
         ) -> Result<B::Tensor, Error>,
     {
-        let normalized = self.input_norm.forward(hidden, context)?;
-        let mixed = match &mut self.mixer {
-            TokenMixer::Kda(mixer) => {
-                mixer.forward_parallel(&normalized, state, parallel, context)?
-            }
-            TokenMixer::Mla(mixer) => {
-                mixer.forward_parallel(&normalized, mask, Some(state), parallel, context)?
-            }
-        };
-        let hidden = hidden.add(&mixed, context)?;
-        let normalized = self.post_attention_norm.forward(&hidden, context)?;
-        let output = feed_forward(&mut self.feed_forward, &normalized, parallel, context)?;
-        hidden.add(&output, context)
+        self.forward_partition_instrumented_with_feed_forward(
+            hidden,
+            mask,
+            state,
+            Some(parallel),
+            context,
+            &mut ComponentInstrumentation::disabled(),
+            |policy, input, context, _| feed_forward(policy, input, parallel, context),
+        )
     }
+}
+
+fn forward_mixer<B, C>(
+    mixer: &mut TokenMixer<B>,
+    input: &B::Tensor,
+    mask: Option<&B::Tensor>,
+    state: &mut C,
+    parallel: Option<&B::ParallelContext>,
+    context: &<B::Tensor as Tensor>::Context,
+    instrumentation: &mut ComponentInstrumentation<'_, B::Tensor>,
+) -> Result<B::Tensor, Error>
+where
+    B: BlockwiseAttentionBackend,
+    C: RuntimeStateComponents<B> + CompressedAttentionCache<B::Tensor>,
+{
+    match mixer {
+        TokenMixer::Kda(mixer) => {
+            mixer.forward_instrumented(input, state, parallel, context, instrumentation)
+        }
+        TokenMixer::Mla(mixer) => {
+            mixer.forward_instrumented(input, mask, Some(state), parallel, context, instrumentation)
+        }
+    }
+}
+
+fn finish_mixer<B: NeuralBackend>(
+    hidden: &B::Tensor,
+    output: B::Tensor,
+    context: &<B::Tensor as Tensor>::Context,
+    instrumentation: &mut ComponentInstrumentation<'_, B::Tensor>,
+) -> Result<B::Tensor, Error> {
+    let write = instrumentation.apply("attention.write", output)?;
+    let output = instrumentation.apply("attention.output", write)?;
+    instrumentation.apply("attention.residual", hidden.add(&output, context)?)
+}
+
+fn finish_feed_forward<B: NeuralBackend>(
+    hidden: &B::Tensor,
+    output: B::Tensor,
+    sparse: bool,
+    context: &<B::Tensor as Tensor>::Context,
+    instrumentation: &mut ComponentInstrumentation<'_, B::Tensor>,
+) -> Result<B::Tensor, Error> {
+    let output = if sparse {
+        instrumentation.apply("feed_forward.contribution", output)?
+    } else {
+        let write = instrumentation.apply("feed_forward.write", output)?;
+        instrumentation.apply("feed_forward.output", write)?
+    };
+    instrumentation.apply("feed_forward.residual", hidden.add(&output, context)?)
 }

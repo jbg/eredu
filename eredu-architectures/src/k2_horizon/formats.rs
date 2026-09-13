@@ -19,16 +19,6 @@ pub(crate) fn normalize_source_formats(args: &mut ModelArgs) -> Result<(), Confi
             continue;
         }
         let root = format!("model.layers.{layer}.mlp.experts");
-        if args.moe_intermediate_size % metadata.format().block_rows != 0
-            && matches!(
-                args.linear_format_for(&format!("{root}.0.gate_proj.weight")),
-                LinearFormat::E4M3BlockFp8(_)
-            )
-        {
-            return Err(ConfigError::Invalid(
-                "packed FP8 gate and up projections must end at scale-block boundaries".into(),
-            ));
-        }
         for (target, fields) in [
             ("gate_up_proj", &["gate_proj", "up_proj"][..]),
             ("down_proj", &["down_proj"][..]),

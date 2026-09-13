@@ -159,6 +159,12 @@ impl QuantizedEmbedding {
         x: impl AsRef<Array>,
         stream: &crate::Stream,
     ) -> Result<Array, Exception> {
+        if matches!(
+            self.inner.weight.value.dtype(),
+            Dtype::Float32 | Dtype::Float16 | Dtype::Bfloat16
+        ) {
+            return self.inner.as_linear(x.as_ref(), stream);
+        }
         if let Some(native) = &self.native {
             return native.linear(x.as_ref(), true, stream);
         }
@@ -195,6 +201,12 @@ impl Module<&Array> for QuantizedEmbedding {
     type Output = Array;
 
     fn forward(&mut self, x: &Array, stream: &crate::Stream) -> Result<Array, Self::Error> {
+        if matches!(
+            self.inner.weight.value.dtype(),
+            Dtype::Float32 | Dtype::Float16 | Dtype::Bfloat16
+        ) {
+            return self.inner.forward(x, stream);
+        }
         if let Some(native) = &self.native {
             return native.embedding(x, stream);
         }
@@ -234,6 +246,10 @@ impl Module<&Array> for QuantizedEmbedding {
         )?;
 
         let ret_shape = s.iter().copied().chain(once(-1)).collect::<Vec<_>>();
-        out.reshape(&ret_shape, stream)
+        // Packed embedding capabilities promise F32 activations. MLX's MXFP4
+        // dequantizer defaults to BF16; normalize the selected rows before they
+        // reach vocabulary reduction, state or prediction fusion.
+        out.as_dtype(Dtype::Float32, stream)?
+            .reshape(&ret_shape, stream)
     }
 }

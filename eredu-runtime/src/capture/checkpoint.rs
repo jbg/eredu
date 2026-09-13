@@ -18,6 +18,7 @@ pub struct CaptureCheckpoint {
     artifact_identity: String,
     plan: AdmittedCapturePlan,
     intervention: Option<AdmittedInterventionPlan>,
+    partition: Option<partition::PartitionCaptureIdentity>,
     prediction: u64,
     phase: CapturePhase,
     has_step: bool,
@@ -67,6 +68,8 @@ impl PreparedCaptureRestore<'_> {
         self.run.phase = self.phase;
         self.run.has_step = self.has_step;
         self.run.capture_seconds = 0.0;
+        self.run.transaction = None;
+        self.run.invocation = None;
         self.run.checkpoint_ready = true;
     }
 }
@@ -80,6 +83,11 @@ impl CaptureSession {
             &self.plan,
             self.interventions.as_ref().map(|run| &run.plan),
             &discovery.artifact_identity,
+        )?
+        .checked_add(
+            self.partition
+                .as_ref()
+                .map_or(Some(0), |run| run.identity_heap_bytes())?,
         )
     }
     /// Saves portable schedule position only after the current records have been
@@ -100,13 +108,12 @@ impl CaptureSession {
                 "capture checkpoint requires a successful, drained record boundary".into(),
             ));
         }
-        let checked = self.plan.plan().clone().admit(
-            &discovery.catalog,
-            &discovery.support,
-            &discovery.support.capture,
-            self.plan.request(),
-        )?;
+        let checked = self.plan.readmit(discovery)?;
         if checked.identity() != self.plan.identity()
+            || self
+                .partition
+                .as_ref()
+                .is_some_and(|run| !run.matches_artifact(&discovery.artifact_identity))
             || self
                 .interventions
                 .as_ref()
@@ -119,8 +126,9 @@ impl CaptureSession {
         Ok(CaptureCheckpoint {
             owner: Arc::clone(&self.owner),
             artifact_identity: discovery.artifact_identity.clone(),
-            plan: self.plan.clone(),
+            plan: self.plan.as_ref().clone(),
             intervention: self.interventions.as_ref().map(|run| run.plan.clone()),
+            partition: self.partition.as_ref().and_then(|run| run.child_identity()),
             prediction: self.prediction,
             phase: self.phase,
             has_step: self.has_step,
@@ -140,7 +148,10 @@ impl CaptureSession {
                 "capture checkpoint belongs to another run".into(),
             ));
         }
-        if self.records.is_some()
+        if self
+            .transaction
+            .is_some_and(|(_, status)| status == super::CaptureTransactionStatus::Pending)
+            || self.records.is_some()
             || self
                 .interventions
                 .as_ref()
@@ -187,6 +198,11 @@ impl CaptureCheckpoint {
             &self.plan,
             self.intervention.as_ref(),
             &self.artifact_identity,
+        )?
+        .checked_add(
+            self.partition
+                .as_ref()
+                .map_or(Some(0), |identity| identity.heap_bytes())?,
         )
     }
 
@@ -218,7 +234,7 @@ impl CaptureCheckpoint {
                 .checked_add(heap_bytes(plan)?)?
                 .checked_add(u64::try_from(child.discovery.artifact_identity.len()).ok()?)?
                 .checked_add(u64::try_from(child.session_id.len()).ok()?)?
-                .checked_add(64)?;
+                .checked_add(AdmittedInterventionPlan::identity_storage_bytes())?;
             for operation in &plan.operations {
                 let point = child
                     .discovery
@@ -279,12 +295,23 @@ impl CaptureCheckpoint {
         geometry.max_predictions = request.max_predictions;
         let mut plan = self.plan.plan().clone();
         plan.limits = request.limits;
-        let plan = plan.admit(
-            &request.discovery.catalog,
-            &request.discovery.support,
-            &request.discovery.support.capture,
-            geometry,
-        )?;
+        let plan = match self.plan.invocation_bounds() {
+            Some(mut bounds) => {
+                bounds.max_predictions = request.max_predictions;
+                plan.admit_invocations(
+                    &request.discovery.catalog,
+                    &request.discovery.support,
+                    &request.discovery.support.capture,
+                    bounds,
+                )?
+            }
+            None => plan.admit(
+                &request.discovery.catalog,
+                &request.discovery.support,
+                &request.discovery.support.capture,
+                geometry,
+            )?,
+        };
         super::validate_continuation(
             &plan,
             request.discovery,
@@ -312,7 +339,12 @@ impl CaptureCheckpoint {
                     .ok_or_else(|| {
                         CaptureError::Invalid("child intervention plan is absent".into())
                     })?;
-                let admitted = operations.admit(child.discovery, geometry, child.session_id)?;
+                let admitted = match plan.invocation_bounds() {
+                    Some(bounds) => {
+                        operations.admit_invocations(child.discovery, bounds, child.session_id)?
+                    }
+                    None => operations.admit(child.discovery, geometry, child.session_id)?,
+                };
                 crate::intervention::validate_continuation(
                     &plan,
                     &admitted,
@@ -333,6 +365,9 @@ impl CaptureCheckpoint {
         // Installation stays with the same shared owner. A fully empty child still
         // carries its inherited ledger, so removing controls cannot erase usage.
         let mut child = CaptureSession::new(plan);
+        if let Some(identity) = &self.partition {
+            child.configure_partition_capture(identity.clone())?;
+        }
         if let Some((plan, estimator)) = intervention {
             child.enable_interventions(plan, estimator)?;
         }
@@ -361,6 +396,7 @@ fn checkpoint_storage_bytes(
             .checked_add(heap_bytes(plan.plan())?)?
             .checked_add(heap_bytes(plan.points())?)?
             .checked_add(u64::try_from(plan.identity().len()).ok()?)?
+            .checked_add(u64::try_from(plan.intent_identity().len()).ok()?)?
             .checked_add(u64::try_from(plan.artifact_identity().len()).ok()?)?
             .checked_add(u64::try_from(plan.session_id().len()).ok()?)?;
     }

@@ -367,15 +367,9 @@ impl ConditionalPartitionLocalGeometry {
             expected_roles.push("embedding".into());
         }
         if self.target_units.end == target_count {
-            expected_roles.push("norm".into());
-            let output = if parsed.text.tie_word_embeddings {
-                "embedding"
-            } else {
-                "output"
-            };
-            if !expected_roles.iter().any(|role| role == output) {
-                expected_roles.push(output.into());
-            }
+            // The shared decoder transport declares its output consumer;
+            // tied storage is expressed by the parameter group's aliases.
+            expected_roles.extend(["norm".into(), "output".into()]);
         }
         if self.static_roles != expected_roles {
             return Err(invalid(format!(
@@ -871,12 +865,14 @@ fn block_groups<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend>(
                 linear,
                 |metadata, shape| {
                     let name = metadata.id.as_str();
-                    if name.contains("in_proj_qkv") {
+                    if name.contains("in_proj_qkv") || name.ends_with("conv1d.weight") {
+                        // The convolution consumes concatenated Q, K and V.
+                        // Each rank needs the same head slice of all three
+                        // segments as its local input projection.
                         segmented_member_sharding(config, metadata, 0, &segments)
                     } else if name.contains("in_proj_z")
                         || name.contains("in_proj_b")
                         || name.contains("in_proj_a")
-                        || name.ends_with("conv1d.weight")
                         || name.ends_with("dt_bias")
                         || name.ends_with("A_log")
                     {
@@ -1044,45 +1040,58 @@ pub fn unit_parallel_parameter_groups<
         Unit::Target(block) if group == 0 => {
             block_groups(block, config, &format!("model.layers.{index}"))
         }
-        Unit::Prediction(PredictionUnit {
-            hidden_norm,
-            embedding_norm,
-            fusion,
-            block,
-            final_norm,
-        }) if group > 0 && index == 0 => {
-            let root = format!("mtp.layers.{}", group - 1);
-            let mut groups = vec![
-                module_parameter_group::<B::Tensor, _>(
-                    format!("{root}.hidden_norm"),
-                    ParameterRole::Replicated,
-                    hidden_norm,
-                    |_, _| Ok(MemberSharding::Replicated),
-                )?,
-                module_parameter_group::<B::Tensor, _>(
-                    format!("{root}.embedding_norm"),
-                    ParameterRole::Replicated,
-                    embedding_norm,
-                    |_, _| Ok(MemberSharding::Replicated),
-                )?,
-                module_parameter_group::<B::Tensor, _>(
-                    format!("{root}.fusion"),
-                    ParameterRole::Replicated,
-                    fusion,
-                    |_, _| Ok(MemberSharding::Replicated),
-                )?,
-                module_parameter_group::<B::Tensor, _>(
-                    format!("{root}.final_norm"),
-                    ParameterRole::Replicated,
-                    final_norm,
-                    |_, _| Ok(MemberSharding::Replicated),
-                )?,
-            ];
-            groups.extend(block_groups(block, config, &root)?);
-            Ok(groups)
+        Unit::Prediction(PredictionUnit { block, .. }) if group > 0 && index == 0 => {
+            block_groups(block, config, &format!("mtp.layers.{}", group - 1))
         }
         _ => Err(ParallelPlanError::InvalidGroup(format!(
             "Qwen hybrid unit kind does not match ({group}, {index})"
         ))),
     }
+}
+
+/// Canonical checkpoint-shared modules, pinned on each consuming MTP partition.
+pub fn prediction_shared_parameter_groups<
+    B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
+>(
+    shared: &super::PredictionShared<B>,
+    depths: usize,
+) -> Result<Vec<eredu_runtime::OwnedParameterGroupSpec>, ParallelPlanError> {
+    let groups = vec![
+        module_parameter_group::<B::Tensor, _>(
+            "mtp.pre_fc_norm_hidden",
+            ParameterRole::Replicated,
+            &shared.hidden_norm,
+            |_, _| Ok(MemberSharding::Replicated),
+        )?,
+        module_parameter_group::<B::Tensor, _>(
+            "mtp.pre_fc_norm_embedding",
+            ParameterRole::Replicated,
+            &shared.embedding_norm,
+            |_, _| Ok(MemberSharding::Replicated),
+        )?,
+        module_parameter_group::<B::Tensor, _>(
+            "mtp.fc",
+            ParameterRole::Replicated,
+            &shared.fusion,
+            |_, _| Ok(MemberSharding::Replicated),
+        )?,
+        module_parameter_group::<B::Tensor, _>(
+            "mtp.norm",
+            ParameterRole::Replicated,
+            &shared.final_norm,
+            |_, _| Ok(MemberSharding::Replicated),
+        )?,
+    ];
+    let consumers = (0..depths)
+        .map(|depth| {
+            eredu_runtime::ExecutionGroupId::new(format!("mtp.{depth}"))
+                .map(|group| (group, 0))
+                .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let owner = eredu_runtime::ParameterGroupOwner::static_unit_consumers("mtp", consumers);
+    Ok(groups
+        .into_iter()
+        .map(|group| eredu_runtime::OwnedParameterGroupSpec::new(owner.clone(), group))
+        .collect())
 }

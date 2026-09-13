@@ -180,6 +180,21 @@ impl Group {
         self.native_size()
     }
 
+    /// Returns the transport stream selected by this native communicator.
+    ///
+    /// This is independent of a model's compute stream. In particular, Ring
+    /// selects CPU transport even when its inputs are produced by a GPU graph.
+    pub fn communication_stream(&self) -> Result<Stream> {
+        let _guard = runtime_lock::enter();
+        Stream::try_from_op(|res| {
+            // SAFETY: the output guard owns `res`; this group remains alive
+            // while MLX copies its selected stream into that owned handle.
+            unsafe {
+                safemlx_sys::mlx_distributed_group_communication_stream(res, self.native.c_group)
+            }
+        })
+    }
+
     /// Split the group by `color`, optionally ordering new ranks by `key`.
     ///
     /// A missing or negative key asks MLX to use the current group rank. Backend
@@ -604,6 +619,21 @@ mod tests {
         assert_eq!(group.size(), 1);
         assert!(format!("{group:?}").contains("rank: 0"));
         assert!(format!("{group:?}").contains("size: 1"));
+    }
+
+    #[test]
+    fn communicator_stream_owns_its_handle_after_group_teardown() {
+        let group = singleton();
+        let stream = group.communication_stream().unwrap();
+        let retained = stream.clone();
+        drop(stream);
+        drop(group);
+        let values = Array::from_slice(&[-3.0f32, 2.5, 7.0], &[3]);
+        let result = values.add(&values, &retained).unwrap();
+        assert_eq!(
+            result.evaluated().unwrap().as_slice::<f32>(),
+            &[-6.0, 5.0, 14.0]
+        );
     }
 
     #[test]

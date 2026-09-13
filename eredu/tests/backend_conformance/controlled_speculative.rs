@@ -43,6 +43,182 @@ fn options() -> ControlledSpeculativeOptions {
 }
 
 #[test]
+fn public_internal_activation_authority_preserves_parity_and_applies_edits() {
+    use eredu::api::SpeculativeActivationPlan;
+    use eredu_core::{capture::*, intervention::*};
+    for factor in [1.0, 2.0] {
+        let (mut model, chat, settings) = setup();
+        let request = || PreparedChatSpeculativeGenerationRequest {
+            input: PreparedChatInput::prepared_backend_input(&chat, vec![3, 4]),
+            drafting: SpeculativeDraft::Embedded,
+            settings,
+            options: Default::default(),
+            caller_stop_sequences: &[],
+            cancellation: Default::default(),
+            on_event: |_| {},
+        };
+        let baseline = model.generate_prepared_chat_speculative(request()).unwrap();
+        let plan = model
+            .prepare_speculative_activations(SpeculativeActivationPlan {
+                schema_version: eredu_core::speculative::SPECULATIVE_ACTIVATION_SCHEMA_VERSION,
+                captures: observed_mock::plan(),
+                interventions: observed_mock::intervention_plan(factor),
+                bounds: CaptureInvocationBounds {
+                    batch: 1,
+                    max_sequence: 4,
+                    max_context: None,
+                    max_predictions: 6,
+                },
+            })
+            .unwrap();
+        let identity = plan.identity().to_owned();
+        let mut records = Vec::new();
+        let output = model
+            .with_controlled_chat_speculative(
+                request(),
+                ControlledSpeculativeOptions {
+                    activations: Some(plan.clone()),
+                    ..options()
+                },
+                |session| {
+                    while let Some(step) = session.step()? {
+                        assert!(step.captures.is_empty());
+                        records.extend(step.activations);
+                    }
+                    assert!(session.take_activation_evidence()?.is_none());
+                    Ok(())
+                },
+            )
+            .unwrap();
+        assert_eq!(output.token_ids()[0], (7.0 * factor) as u32);
+        if factor == 1.0 {
+            assert_eq!(output.token_ids(), baseline.token_ids());
+        }
+        assert_eq!(records[0].captures.invocation.unwrap().sequence, 2);
+        assert!(records
+            .iter()
+            .all(|r| r.completed && r.admission_identity.as_deref() == Some(identity.as_str())));
+        assert!(records
+            .iter()
+            .flat_map(|r| &r.captures.interventions)
+            .any(|edit| edit.outcome == InterventionOutcome::Applied));
+        let mut continuous = Vec::new();
+        let streamed = model
+            .generate_observed_chat_speculative(
+                request(),
+                ControlledSpeculativeOptions {
+                    activations: Some(plan.clone()),
+                    ..Default::default()
+                },
+                |step| {
+                    continuous.extend(step.activations);
+                    std::ops::ControlFlow::Continue(())
+                },
+            )
+            .unwrap();
+        assert_eq!(streamed.token_ids(), output.token_ids());
+        assert_eq!(continuous.len(), records.len());
+        for (a, b) in continuous.iter().zip(&records) {
+            assert_eq!(
+                (a.origin, a.phase, a.captures.invocation),
+                (b.origin, b.phase, b.captures.invocation)
+            );
+            assert_eq!(a.captures.records, b.captures.records);
+            assert_eq!(a.captures.interventions, b.captures.interventions);
+        }
+        let fresh = model.generate_prepared_chat_speculative(request()).unwrap();
+        assert_eq!(fresh.token_ids(), baseline.token_ids());
+        let (mut other, _, _) = setup();
+        let mut entered = false;
+        let result = other.with_controlled_chat_speculative(
+            request(),
+            ControlledSpeculativeOptions {
+                activations: Some(plan),
+                ..Default::default()
+            },
+            |_| {
+                entered = true;
+                Ok(())
+            },
+        );
+        assert!(result.is_err());
+        assert!(!entered);
+    }
+}
+
+#[test]
+fn failed_internal_actions_deliver_bounded_original_evidence_without_recovery() {
+    use eredu::api::SpeculativeActivationPlan;
+    use eredu_core::{capture::*, intervention::InterventionPlan};
+    for transport_bytes in [1, 1 << 20] {
+        let (mut model, chat, settings) = setup();
+        let mut captures = observed_mock::plan();
+        captures.selections[0].id = "injected-native-failure".into();
+        let plan = model
+            .prepare_speculative_activations(SpeculativeActivationPlan {
+                schema_version: eredu_core::speculative::SPECULATIVE_ACTIVATION_SCHEMA_VERSION,
+                captures,
+                interventions: InterventionPlan::none(),
+                bounds: CaptureInvocationBounds {
+                    batch: 1,
+                    max_sequence: 4,
+                    max_context: None,
+                    max_predictions: 6,
+                },
+            })
+            .unwrap();
+        let result = model.with_controlled_chat_speculative(
+            PreparedChatSpeculativeGenerationRequest {
+                input: PreparedChatInput::prepared_backend_input(&chat, vec![3, 4]),
+                drafting: SpeculativeDraft::Embedded,
+                settings,
+                options: Default::default(),
+                caller_stop_sequences: &[],
+                cancellation: Default::default(),
+                on_event: |_| panic!("failed prefill published"),
+            },
+            ControlledSpeculativeOptions {
+                activations: Some(plan),
+                trace_limits: eredu::api::TraceLimits {
+                    per_record_bytes: transport_bytes,
+                    total_bytes: transport_bytes,
+                },
+                ..Default::default()
+            },
+            |session| {
+                let error = session.step().unwrap_err();
+                let SpeculativeControlError::Backend(source) = &error else {
+                    panic!("lost original backend error: {error}");
+                };
+                assert!(std::error::Error::source(source).is_some());
+                let evidence = session.take_activation_evidence();
+                if transport_bytes == 1 {
+                    assert!(matches!(
+                        evidence,
+                        Err(SpeculativeControlError::Capture(CaptureError::Limit {
+                            budget: CaptureBudget::Encoded,
+                            ..
+                        }))
+                    ));
+                } else {
+                    let evidence = evidence?.unwrap();
+                    assert_eq!(evidence.sequence, 0);
+                    assert!(!evidence.activation.completed);
+                    assert_eq!(evidence.activation.origin.committed_tokens, 0);
+                }
+                assert!(session.take_activation_evidence()?.is_none());
+                assert!(matches!(
+                    session.step(),
+                    Err(SpeculativeControlError::Failed)
+                ));
+                Err(error)
+            },
+        );
+        assert!(result.is_err());
+    }
+}
+
+#[test]
 fn controlled_speculation_uses_identical_semantics_and_reports_accepted_and_failed_proposals() {
     let (mut model, chat, settings) = setup();
     let mut expected_events = Vec::new();
@@ -127,6 +303,19 @@ fn controlled_speculation_uses_identical_semantics_and_reports_accepted_and_fail
 #[test]
 fn controlled_speculative_snapshots_replay_semantics_without_rewinding_delivery_or_budgets() {
     let (mut model, chat, settings) = setup();
+    let activations = model
+        .prepare_speculative_activations(eredu::api::SpeculativeActivationPlan {
+            schema_version: eredu_core::speculative::SPECULATIVE_ACTIVATION_SCHEMA_VERSION,
+            captures: observed_mock::plan(),
+            interventions: eredu_core::intervention::InterventionPlan::none(),
+            bounds: eredu_core::capture::CaptureInvocationBounds {
+                batch: 1,
+                max_sequence: 4,
+                max_context: None,
+                max_predictions: 6,
+            },
+        })
+        .unwrap();
     let mut events = Vec::new();
     let mut replayed = Vec::new();
     model
@@ -140,13 +329,19 @@ fn controlled_speculative_snapshots_replay_semantics_without_rewinding_delivery_
                 cancellation: Default::default(),
                 on_event: |e| events.push(e),
             },
-            options(),
+            ControlledSpeculativeOptions {
+                activations: Some(activations),
+                ..options()
+            },
             |session| {
                 assert!(matches!(
                     session.snapshot(),
                     Err(SpeculativeControlError::NotQuiescent)
                 ));
-                session.step()?;
+                let first = session.step()?.unwrap();
+                let last = first.activations.last().unwrap();
+                let mut last_invocation = last.invocation;
+                let mut last_usage = last.captures.cumulative_usage;
                 let timing = session.timing();
                 assert!(session.can_snapshot());
                 let snapshot = session.snapshot()?;
@@ -156,6 +351,15 @@ fn controlled_speculative_snapshots_replay_semantics_without_rewinding_delivery_
                     let mut tokens = Vec::new();
                     while let Some(step) = session.step()? {
                         assert_eq!(step.epoch, epoch);
+                        for activation in &step.activations {
+                            assert!(activation.invocation > last_invocation);
+                            assert!(
+                                activation.captures.cumulative_usage.encoded_bytes
+                                    > last_usage.encoded_bytes
+                            );
+                            last_invocation = activation.invocation;
+                            last_usage = activation.captures.cumulative_usage;
+                        }
                         sequences.push(step.sequence);
                         tokens.extend(step.committed_token_ids);
                         if step.status == Status::ReadyToSubmitVerification {

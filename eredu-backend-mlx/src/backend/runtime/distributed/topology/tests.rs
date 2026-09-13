@@ -6,6 +6,84 @@ use eredu_runtime::{
 };
 use safetensors::tensor::{serialize_to_file, Dtype, TensorView};
 
+#[test]
+fn preparation_failures_preserve_native_causes_through_the_portable_boundary() {
+    use eredu_runtime::{PartitionedRuntimeConstructionError, PartitionedSessionPreparationError};
+    use std::error::Error as _;
+
+    let native = || safemlx::error::Exception::custom("injected native preparation failure");
+    let mechanism = Error::from(PartitionedRuntimeConstructionError::Mechanism(
+        Error::Exception(native()),
+    ));
+    let architecture = Error::from(PartitionedRuntimeConstructionError::Architecture(
+        eredu_nn::Error::backend_source(native()),
+    ));
+    type SessionError = eredu_runtime::ReplicatedTextSessionError<eredu_nn::Error, Error, Error>;
+    let errors = [
+        Error::CommunicationManifestConsensus(Box::new(
+            eredu_runtime::CommunicationManifestConsensusError::Transport(Error::Exception(
+                native(),
+            )),
+        )),
+        Error::from(PartitionedSessionPreparationError::Factory(mechanism)),
+        Error::from(PartitionedSessionPreparationError::Factory(architecture)),
+        Error::Other(Box::new(SessionError::Mechanism(
+            Error::Exception(native()),
+        ))),
+    ];
+    for error in errors {
+        let failure = eredu_core::BackendFailure::from_error(error);
+        let mut current: &dyn std::error::Error = &failure;
+        loop {
+            if let Some(native) = current.downcast_ref::<safemlx::error::Exception>() {
+                assert!(native
+                    .what()
+                    .contains("injected native preparation failure"));
+                break;
+            }
+            current = current
+                .source()
+                .expect("original native cause must remain reachable");
+        }
+        assert!(failure.source().unwrap().is::<Error>());
+    }
+}
+
+#[test]
+fn boxed_policy_failures_remain_discoverable_through_the_portable_boundary() {
+    use eredu_runtime::{PartitionExecutionError, PartitionedSessionPreparationError};
+    let causes: [Box<dyn std::error::Error + Send + Sync>; 2] = [
+        Box::new(PartitionExecutionError::ResidencyPolicyMismatch),
+        Box::new(std::io::Error::from_raw_os_error(5)),
+    ];
+    for (index, cause) in causes.into_iter().enumerate() {
+        let message = cause.to_string();
+        let boxed = Error::Other(cause);
+        assert_eq!(boxed.to_string(), message);
+        let failure = eredu_core::BackendFailure::from_error(Error::from(
+            PartitionedSessionPreparationError::Factory(boxed),
+        ));
+        let mut current: &dyn std::error::Error = &failure;
+        loop {
+            if index == 0 {
+                if let Some(error) = current.downcast_ref::<PartitionExecutionError>() {
+                    assert!(matches!(
+                        error,
+                        PartitionExecutionError::ResidencyPolicyMismatch
+                    ));
+                    break;
+                }
+            } else if let Some(error) = current.downcast_ref::<std::io::Error>() {
+                assert_eq!(error.raw_os_error(), Some(5));
+                break;
+            }
+            current = current
+                .source()
+                .expect("original leaf error remains reachable");
+        }
+    }
+}
+
 fn completion_policy() -> eredu_runtime::CommunicationCompletionPolicy {
     eredu_runtime::CommunicationCompletionPolicy::new(
         std::time::Duration::from_secs(30),

@@ -189,7 +189,14 @@ fn selected_entry_byte_corruption_fails_before_checkpoint_work() {
     let (_dir, store) = fixture();
     let entry = entries().into_iter().next().unwrap();
     let identity = entry.identity;
+    let parameter_targets = entry
+        .unit
+        .bindings()
+        .iter()
+        .map(|b| ((identity, b.name().to_owned()), b.name().to_owned()))
+        .collect();
     let selected = SelectedAddressableEntries {
+        parameter_targets,
         entries: vec![entry],
         transformations: BTreeMap::new(),
         expected_bytes: BTreeMap::from([(identity, 15)]),
@@ -223,7 +230,14 @@ fn selected_entry_placement_coverage_fails_before_checkpoint_work() {
     let (_dir, store) = fixture();
     let entry = entries().into_iter().next().unwrap();
     let identity = entry.identity;
+    let parameter_targets = entry
+        .unit
+        .bindings()
+        .iter()
+        .map(|b| ((identity, b.name().to_owned()), b.name().to_owned()))
+        .collect();
     let selected = SelectedAddressableEntries {
+        parameter_targets,
         entries: vec![entry],
         transformations: BTreeMap::new(),
         expected_bytes: BTreeMap::from([(identity, 16)]),
@@ -255,7 +269,14 @@ fn residency_report_retains_exact_selected_entry_placement() {
         eredu_runtime::AddressableBankDistribution::Replicated,
     )
     .unwrap();
+    let parameter_targets = entry
+        .unit
+        .bindings()
+        .iter()
+        .map(|b| ((identity, b.name().to_owned()), b.name().to_owned()))
+        .collect();
     let selected = SelectedAddressableEntries {
+        parameter_targets,
         entries: vec![entry],
         transformations: BTreeMap::new(),
         expected_bytes: BTreeMap::from([(identity, 16)]),

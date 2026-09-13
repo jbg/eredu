@@ -16,7 +16,7 @@ use std::{
 
 /// Shared lease and transfer owner for a residency manager.
 pub struct ManagerInner {
-    pub(super) store: Arc<dyn eredu_checkpoint::store::CheckpointSource>,
+    pub(super) sources: ResidencySources,
     pub(super) state: Mutex<ManagerState>,
     pub(super) changed: Condvar,
     pub(super) failed_transfer: Arc<AtomicBool>,
@@ -411,25 +411,25 @@ pub(super) fn internal_id() -> OffloadUnitId {
 
 pub(super) fn prefetch_locked(
     state: &mut ManagerState,
-    store: &dyn eredu_checkpoint::store::CheckpointSource,
+    sources: &ResidencySources,
     id: &OffloadUnitId,
     tier: MemoryTier,
 ) -> Result<PrefetchOutcome, ResidencyError> {
     let outcome = state.control.begin_prefetch(id, tier)?;
-    ensure_resident(state, store, id, tier, false)?;
+    ensure_resident(state, sources, id, tier, false)?;
     Ok(outcome)
 }
 
 pub(super) fn ensure_resident(
     state: &mut ManagerState,
-    store: &dyn eredu_checkpoint::store::CheckpointSource,
+    sources: &ResidencySources,
     id: &OffloadUnitId,
     tier: MemoryTier,
     initializing: bool,
 ) -> Result<bool, ResidencyError> {
     ensure_many_resident(
         state,
-        store,
+        sources,
         std::slice::from_ref(id),
         tier,
         false,
@@ -440,7 +440,7 @@ pub(super) fn ensure_resident(
 
 pub(super) fn ensure_many_resident(
     state: &mut ManagerState,
-    store: &dyn eredu_checkpoint::store::CheckpointSource,
+    sources: &ResidencySources,
     ids: &[OffloadUnitId],
     tier: MemoryTier,
     return_transfer: bool,
@@ -471,7 +471,7 @@ pub(super) fn ensure_many_resident(
     }
     for owner in owner_ids {
         let owner_tier = tier;
-        ensure_resident(state, store, &owner, owner_tier, initializing)?;
+        ensure_resident(state, sources, &owner, owner_tier, initializing)?;
         if state.alias_owner_pins.insert((owner.clone(), owner_tier)) {
             state.control.ledger_mut().pin(&owner, owner_tier, 1)?;
         }
@@ -523,7 +523,7 @@ pub(super) fn ensure_many_resident(
                 let shared = shared_host_buffers_for_unit(state, id)?;
                 let buffers = materialize_host_buffers(
                     id,
-                    store,
+                    sources.source(id),
                     &bindings,
                     &state.source_stream,
                     &state.materialization,
@@ -598,6 +598,7 @@ pub(super) fn ensure_many_resident(
                 .ok_or(ResidencyError::StatePoisoned)?
                 .bindings()
                 .to_vec();
+            let store = sources.source(id);
             let shared = shared_arrays_for_unit(state, store, id)?;
             let item = loop {
                 let item = match tier {

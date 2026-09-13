@@ -470,25 +470,6 @@ mod consumer_scope_tests {
     }
 }
 
-fn communication_dtype(dtype: Dtype) -> TensorDtype {
-    match dtype {
-        Dtype::Bool => TensorDtype::Bool,
-        Dtype::Uint8 => TensorDtype::U8,
-        Dtype::Uint16 => TensorDtype::U16,
-        Dtype::Uint32 => TensorDtype::U32,
-        Dtype::Uint64 => TensorDtype::U64,
-        Dtype::Int8 => TensorDtype::I8,
-        Dtype::Int16 => TensorDtype::I16,
-        Dtype::Int32 => TensorDtype::I32,
-        Dtype::Int64 => TensorDtype::I64,
-        Dtype::Float16 => TensorDtype::F16,
-        Dtype::Float32 => TensorDtype::F32,
-        Dtype::Float64 => TensorDtype::F64,
-        Dtype::Bfloat16 => TensorDtype::Bf16,
-        Dtype::Complex64 => TensorDtype::Complex64,
-    }
-}
-
 #[derive(Clone, Copy)]
 enum MlxCommunicationDtypes {
     Floating,
@@ -543,7 +524,7 @@ fn validate_route_bundle(
     for value in values {
         let array = value.as_array();
         validate_communication_tensor(array, MlxCommunicationDtypes::FloatingI32AndU32)?;
-        let dtype = communication_dtype(array.dtype());
+        let dtype = crate::tensor::portable_dtype(array.dtype());
         if !requirement.dtypes().contains(&dtype) {
             return Err(safemlx::error::Exception::custom(format!(
                 "point-to-point route does not admit dtype {dtype:?}"
@@ -626,7 +607,7 @@ impl eredu_runtime::CommunicationTensorMetadata<MlxNeuralBackend>
     for MlxCommunicationTensorMetadata
 {
     fn dtype(&self, tensor: &MlxTensor) -> TensorDtype {
-        communication_dtype(tensor.as_array().dtype())
+        crate::tensor::portable_dtype(tensor.as_array().dtype())
     }
 
     fn shape(&self, tensor: &MlxTensor) -> Vec<usize> {
@@ -1026,10 +1007,7 @@ impl PointToPointBackend for MlxNeuralBackend {
                     )
                 })?;
                 let received_header = received.try_index_device(0..header_len, executor)?;
-                let received_payload = received.try_index_device(header_len.., executor)?;
-                let payload = received_payload
-                    .view_dtype(input.dtype(), executor)?
-                    .reshape(input.shape(), executor)?;
+                let payload = decode_boundary_payload(received, header_len, input, executor)?;
                 outputs.push(payload);
                 received_headers.push((received_header, expected.clone()));
             }
@@ -1058,6 +1036,28 @@ impl PointToPointBackend for MlxNeuralBackend {
             completion,
         })
     }
+}
+
+/// Byte framing permits arbitrary header lengths. Copy the byte slice before
+/// reinterpreting an unaligned payload: native typed kernels may round a view's
+/// byte offset to an element offset even though byte-wise host reads succeed.
+pub(super) fn decode_boundary_payload(
+    received: &Array,
+    header_len: i32,
+    prototype: &Array,
+    executor: &Stream,
+) -> Result<Array, safemlx::error::Exception> {
+    let bytes = received.try_index_device(header_len.., executor)?;
+    let bytes = if (header_len as usize).is_multiple_of(prototype.item_size()) {
+        bytes
+    } else {
+        // MLX Copy shares storage; byte arithmetic materializes an aligned
+        // output while the received frame remains retained by the completion.
+        bytes.add(Array::from_slice(&[0u8], &[]), executor)?
+    };
+    bytes
+        .view_dtype(prototype.dtype(), executor)?
+        .reshape(prototype.shape(), executor)
 }
 
 impl TransferBackend for MlxNeuralBackend {

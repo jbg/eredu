@@ -7,6 +7,7 @@ use eredu_nn::{
     PoolingAttentionCache, PoolingOverlap, PoolingWindows, Tensor,
 };
 
+use crate::decoder::ComponentInstrumentation;
 use crate::deepseek::{projection::ProjectionPolicy, V4Args, V4AttentionPolicy};
 use eredu_runtime::ActivationObserver;
 
@@ -573,10 +574,16 @@ impl<B: eredu_nn::GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> Att
         cache: Option<&mut C>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
-        self.forward_with_selected(input, mask, cache, context, |_| Ok(()))
+        self.forward_instrumented(
+            input,
+            mask,
+            cache,
+            context,
+            &mut ComponentInstrumentation::disabled(),
+        )
     }
 
-    /// Executes attention while reporting sparse pooled-position selections.
+    /// Executes the same attention driver with pooled-position and component hooks.
     pub fn forward_observed<C, O>(
         &mut self,
         path: &str,
@@ -590,22 +597,26 @@ impl<B: eredu_nn::GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> Att
         C: PoolingAttentionCache<B::Tensor>,
         O: ActivationObserver<B::Tensor, Error> + ?Sized,
     {
-        self.forward_with_selected(input, mask, cache, context, |positions| {
-            observer.observe(&format!("{path}.selected_indexes"), positions)
-        })
+        let mut borrowed = eredu_runtime::BorrowedActivationObserver(observer);
+        self.forward_instrumented(
+            input,
+            mask,
+            cache,
+            context,
+            &mut ComponentInstrumentation::new(path, &mut borrowed),
+        )
     }
 
-    fn forward_with_selected<C, F>(
+    pub(crate) fn forward_instrumented<C>(
         &mut self,
         input: &B::Tensor,
         mask: Option<&B::Tensor>,
         cache: Option<&mut C>,
         context: &<B::Tensor as Tensor>::Context,
-        mut selected: F,
+        instrumentation: &mut ComponentInstrumentation<'_, B::Tensor>,
     ) -> Result<B::Tensor, Error>
     where
         C: PoolingAttentionCache<B::Tensor>,
-        F: FnMut(&B::Tensor) -> Result<(), Error>,
     {
         let batch = input.dim(0);
         let tokens = input.dim(1);
@@ -615,6 +626,7 @@ impl<B: eredu_nn::GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> Att
             None => input.clone(),
         };
         let query_residual = self.query.normalization.forward(&query_residual, context)?;
+        let query_residual = instrumentation.apply("query.latent", query_residual)?;
         let query = self
             .query
             .second
@@ -626,6 +638,7 @@ impl<B: eredu_nn::GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> Att
         let kv = self
             .kv_norm
             .forward(&self.wkv.forward(input, context)?, context)?;
+        let kv = instrumentation.apply("key_value.latent", kv)?;
         let kv = self
             .rope
             .apply(&kv.expand_dims(1, context)?, offset, false, context)?;
@@ -660,7 +673,13 @@ impl<B: eredu_nn::GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> Att
             Some(cache) => {
                 let local = cache.append_local(kv, context)?;
                 let generated_local_mask;
+                let expanded_local_mask;
                 let local_mask = match mask {
+                    Some(mask) if mask.shape() == [tokens, 1] => {
+                        expanded_local_mask =
+                            mask.broadcast_to(&[tokens, local.dim(1)], context)?;
+                        &expanded_local_mask
+                    }
                     Some(mask) => mask,
                     None => {
                         generated_local_mask = cache.local_mask(tokens, offset, context)?;
@@ -715,7 +734,7 @@ impl<B: eredu_nn::GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> Att
                             let positions = positions
                                 .as_ref()
                                 .expect("non-empty V4 pool has selected positions");
-                            selected(positions)?;
+                            instrumentation.observe("selected_indexes", positions)?;
                             let full_pool_mask = cache.pooling_mask(0, tokens, offset, context)?;
                             let selected_pool_mask = full_pool_mask
                                 .as_ref()
@@ -762,6 +781,17 @@ impl<B: eredu_nn::GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> Att
             }
         };
         output = self.rope.apply(&output, offset, true, context)?;
+        if instrumentation.enabled() {
+            // Intervention operates on genuine inverse-rotated aggregation
+            // channels. These views are only made for an admitted observer.
+            let channels = output
+                .transpose_axes(&[0, 2, 1, 3], context)?
+                .reshape(&[batch, tokens, self.heads * self.head_dimensions], context)?;
+            output = instrumentation
+                .apply("channels", channels)?
+                .reshape(&[batch, tokens, self.heads, self.head_dimensions], context)?
+                .transpose_axes(&[0, 2, 1, 3], context)?;
+        }
         let heads_per_group = self.heads / self.groups;
         output = output
             .reshape(
@@ -784,7 +814,8 @@ impl<B: eredu_nn::GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> Att
                 ],
                 context,
             )?;
-        output = B::grouped_linear(
+        output = instrumentation.project_grouped::<B>(
+            "grouped_input",
             &mut self.wo_a,
             &output,
             self.groups,
@@ -794,7 +825,15 @@ impl<B: eredu_nn::GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> Att
         output = output
             .transpose_axes(&[0, 2, 1, 3], context)?
             .reshape(&[batch, tokens, self.groups * self.output_rank], context)?;
-        self.wo_b.forward(&output, context)
+        instrumentation.observe("projection", &output)?;
+        let output = instrumentation.project::<B>(
+            "projection_input",
+            &mut self.wo_b,
+            &output,
+            None,
+            context,
+        )?;
+        instrumentation.apply("write", output)
     }
 }
 

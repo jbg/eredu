@@ -14,6 +14,8 @@ pub struct MlxTextSamplingState {
     pub(super) prng: Option<RandomState>,
     pub(super) sampler: MlxTextSampler,
     pub(super) next_prediction: u64,
+    /// Parameter version bound on first submission and preserved by snapshots.
+    pub(super) parameter_epoch: Option<u64>,
 }
 
 #[derive(Clone)]

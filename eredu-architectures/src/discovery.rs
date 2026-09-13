@@ -4,7 +4,9 @@ use crate::configuration::{GgufModelConfig, SafetensorsModelConfig};
 use crate::processor_plan::ArtifactArchitecturePlan;
 use eredu_core::*;
 
+mod components;
 mod families;
+mod routed_components;
 
 impl ArtifactArchitecturePlan {
     /// Describes admitted family semantics and implemented observation points.
@@ -16,7 +18,9 @@ impl ArtifactArchitecturePlan {
     /// Genuine mutable hooks declared alongside their instrumentation geometry.
     /// This catalog is separate from read-only observations and graph nodes.
     pub fn intervention_points(&self) -> Vec<eredu_core::intervention::InterventionPoint> {
-        let graph = self.discovery_builder();
+        let mut graph = self.discovery_builder();
+        routed_components::declare_captures(&mut graph);
+        graph.scope_requirements();
         graph
             .interventions
             .into_iter()
@@ -114,6 +118,7 @@ impl Builder {
             conditions: vec!["Global routed-expert IDs; shared experts are unchanged".into(),
                 "Force selects exactly top-k distinct IDs per selected token row and uses architecture weights".into(),
                 "Zero contribution preserves IDs and other coefficient magnitudes; expert computation may still occur".into()],
+            routed_units: None,
             routing: Some(InterventionRoutingPolicy {
                 expert_count: spec.group_count() as u32, top_k: spec.top_k() as u32, scoring,
                 normalize_selected: spec.normalize_selected(), normalization_epsilon: spec.normalization_epsilon(),
@@ -132,6 +137,12 @@ impl Builder {
                 edges: vec![],
                 parameter_groups: vec![],
                 layer_groups: vec![],
+                components: vec![],
+                component_transforms: vec![],
+                routed_components: vec![],
+                component_readout: None,
+                component_scopes: vec![],
+                speculative_invocations: vec![],
                 observations: ObservationCatalog {
                     schema_version: DISCOVERY_SCHEMA_VERSION,
                     points: vec![],
@@ -168,22 +179,7 @@ impl Builder {
     ) {
         let mut groups = vec![];
         if let Some(prefix) = parameter {
-            let group = format!("parameters:{prefix}");
-            if !self
-                .descriptor
-                .parameter_groups
-                .iter()
-                .any(|g| g.id == group)
-            {
-                self.descriptor
-                    .parameter_groups
-                    .push(ArchitectureParameterGroup {
-                        id: group.clone(),
-                        canonical_prefix: prefix.into(),
-                        shared_with: None,
-                    });
-            }
-            groups.push(group);
+            groups.push(self.parameter_group(prefix));
         }
         self.descriptor.nodes.push(ArchitectureNode {
             id: id.into(),
@@ -199,6 +195,33 @@ impl Builder {
             moe: None,
             completeness: DescriptionCompleteness::Complete,
         });
+    }
+
+    fn parameter_group(&mut self, prefix: &str) -> String {
+        let group = format!("parameters:{prefix}");
+        if !self
+            .descriptor
+            .parameter_groups
+            .iter()
+            .any(|candidate| candidate.id == group)
+        {
+            self.descriptor
+                .parameter_groups
+                .push(ArchitectureParameterGroup {
+                    id: group.clone(),
+                    canonical_prefix: prefix.into(),
+                    shared_with: None,
+                });
+        }
+        group
+    }
+
+    fn attach_parameters(&mut self, node: &str, prefix: &str) {
+        let group = self.parameter_group(prefix);
+        let node = self.get_mut(node);
+        if !node.parameter_groups.contains(&group) {
+            node.parameter_groups.push(group);
+        }
     }
 
     fn get_mut(&mut self, id: &str) -> &mut ArchitectureNode {
@@ -238,6 +261,13 @@ impl Builder {
                 InterventionKind::Replace,
                 InterventionKind::Add,
             ];
+            if shape
+                .as_ref()
+                .and_then(|s| s.last())
+                .is_some_and(|a| a.name == "component")
+            {
+                operations.push(InterventionKind::MaskComponents);
+            }
             if logits {
                 operations.push(InterventionKind::MaskLogits);
             }
@@ -250,6 +280,7 @@ impl Builder {
                 prefill: ObservationSupportStatus::Unverified("requires loaded-session support".into()),
                 decode: ObservationSupportStatus::Unverified("requires loaded-session support".into()),
                 conditions: vec!["Runtime dtype must exactly match the plan; no payload broadcasting or dtype conversion".into()],
+                routed_units: None,
                 routing: None,
             });
         }
@@ -276,6 +307,40 @@ impl Builder {
             retained_bytes: None,
             host_bytes: None,
         });
+    }
+
+    /// Declares both sides of a real component hook. Effective values are read-only
+    /// and never acquire a second intervention target.
+    fn component_observation(
+        &mut self,
+        node: &str,
+        path: String,
+        meaning: &str,
+        shape: Vec<TensorAxis>,
+    ) {
+        self.observation(
+            node,
+            path.clone(),
+            meaning,
+            ObservationDtype::Floating,
+            Some(shape),
+            false,
+        );
+        let mut effective = self
+            .descriptor
+            .observations
+            .points
+            .last()
+            .expect("inserted observation")
+            .clone();
+        effective.path = format!("{path}.effective");
+        effective.meaning =
+            format!("Effective {meaning}; consumed after all interventions at this boundary");
+        effective.position = ObservationPosition::AfterIntervention;
+        self.get_mut(node)
+            .observation_paths
+            .push(effective.path.clone());
+        self.descriptor.observations.points.push(effective);
     }
 
     fn start(&mut self, embedding: &str, width: usize) -> String {
@@ -400,6 +465,33 @@ impl Builder {
                     .collect(),
             })
             .collect();
+
+        for group in &mut self.descriptor.components {
+            group.shared_write_weight =
+                crate::decoder::repeated::source_name(root, physical_layers, &group.write_weight);
+            if let Some(projection) = &mut group.write_input_projection {
+                projection.shared_weight = crate::decoder::repeated::source_name(
+                    root,
+                    physical_layers,
+                    &projection.weight,
+                );
+            }
+            for read in group
+                .reads
+                .iter_mut()
+                .chain(group.output_gate.iter_mut().map(|gate| &mut gate.read))
+            {
+                read.shared_weight =
+                    crate::decoder::repeated::source_name(root, physical_layers, &read.weight);
+                for projection in &mut read.input_projections {
+                    projection.shared_weight = crate::decoder::repeated::source_name(
+                        root,
+                        physical_layers,
+                        &projection.weight,
+                    );
+                }
+            }
+        }
 
         // Use the same exact alias mapping as checkpoint lowering, including
         // inter-pass normalization. Logical prefixes and capture paths stay intact.
@@ -565,12 +657,237 @@ impl Builder {
         }
     }
 
+    fn projection_input_observation(&mut self, node: &str, path: String, shape: Vec<TensorAxis>) {
+        self.read_only_observation(
+            node,
+            path,
+            "Actual multiplication input after the selected projection input transform; read-only evidence",
+            shape,
+        );
+    }
+
+    fn read_only_observation(
+        &mut self,
+        node: &str,
+        path: String,
+        meaning: &str,
+        shape: Vec<TensorAxis>,
+    ) {
+        self.get_mut(node).observation_paths.push(path.clone());
+        self.descriptor.observations.points.push(ObservationPoint {
+            path,
+            node_id: node.into(),
+            meaning: meaning.into(),
+            value_type: ObservationValueType::Tensor,
+            dtype: ObservationDtype::Floating,
+            axes: Some(shape),
+            prefill: true,
+            decode: true,
+            requirements: vec![ObservationRequirement::ActivationHooks],
+            position: ObservationPosition::ReadOnly,
+            retained_bytes: None,
+            host_bytes: None,
+        });
+    }
+
     fn finish(mut self) -> ArchitectureDescriptor {
+        routed_components::declare_captures(&mut self);
+        let inputs: Vec<_> = self
+            .descriptor
+            .components
+            .iter()
+            .chain(
+                self.descriptor
+                    .component_scopes
+                    .iter()
+                    .flat_map(|scope| &scope.components),
+            )
+            .filter_map(|group| {
+                group.write_input.as_ref().map(|path| {
+                    let mut shape = axes(group.count);
+                    shape[2].name = "component".into();
+                    (group.node_id.clone(), path.clone(), shape)
+                })
+            })
+            .collect();
+        for (node, path, shape) in inputs {
+            self.projection_input_observation(&node, path, shape);
+        }
+        let grouped: Vec<_> = self
+            .descriptor
+            .components
+            .iter()
+            .chain(
+                self.descriptor
+                    .component_scopes
+                    .iter()
+                    .flat_map(|scope| &scope.components),
+            )
+            .filter_map(|group| {
+                group
+                    .write_input_projection
+                    .as_ref()
+                    .map(|stage| (group.node_id.clone(), group.count, stage.clone()))
+            })
+            .collect();
+        for (node, count, stage) in grouped {
+            let Some(width) = stage.groups.checked_mul(stage.rank).filter(|n| *n > 0) else {
+                self.catalog_partial("invalid grouped write extent");
+                continue;
+            };
+            if count == 0 || !count.is_multiple_of(stage.groups) {
+                self.catalog_partial("invalid grouped component extent");
+                continue;
+            }
+            let mut input = axes(count / stage.groups);
+            input[2].name = "channel".into();
+            input.insert(
+                1,
+                TensorAxis {
+                    name: "group".into(),
+                    dimension: SymbolicDimension::Known(stage.groups),
+                },
+            );
+            self.projection_input_observation(&node, stage.input, input);
+            let mut output = axes(width);
+            output[2].name = "projection".into();
+            self.read_only_observation(
+                &node,
+                stage.output,
+                "Actual concatenated grouped projection output before final input transformation",
+                output.clone(),
+            );
+            self.projection_input_observation(&node, stage.final_input, output);
+        }
+        if let Some(readout) = &self.descriptor.component_readout {
+            if let Some(path) = readout.projection_input.clone() {
+                let shape = self
+                    .descriptor
+                    .observations
+                    .get(&readout.normalized)
+                    .and_then(|point| point.axes.clone())
+                    .expect("declared readout geometry");
+                self.projection_input_observation("output", path, shape);
+            }
+        }
+        let mut scope_inputs = Vec::new();
+        for scope in &self.descriptor.component_scopes {
+            if let Some(path) = &scope.readout.projection_input {
+                let point = self
+                    .descriptor
+                    .observations
+                    .get(&scope.readout.linear_scores)
+                    .expect("declared scoped head");
+                let shape = self
+                    .descriptor
+                    .observations
+                    .get(&scope.readout.normalized)
+                    .and_then(|point| point.axes.clone())
+                    .expect("declared scoped normalization");
+                scope_inputs.push((point.node_id.clone(), path.clone(), shape));
+            }
+            match &scope.residual_base {
+                eredu_core::component::ComponentResidualBase::Source { .. } => {}
+                eredu_core::component::ComponentResidualBase::LinearFusion {
+                    inputs,
+                    projection_input,
+                    output,
+                    ..
+                } => {
+                    let point = self
+                        .descriptor
+                        .observations
+                        .get(output)
+                        .expect("declared fusion output");
+                    let width = inputs
+                        .iter()
+                        .map(|input| input.columns.end)
+                        .max()
+                        .expect("fusion inputs");
+                    scope_inputs.push((
+                        point.node_id.clone(),
+                        projection_input.clone(),
+                        axes(width),
+                    ));
+                }
+                eredu_core::component::ComponentResidualBase::ProjectedSum { inputs, .. } => {
+                    for input in inputs {
+                        let point = self
+                            .descriptor
+                            .observations
+                            .get(&input.output)
+                            .expect("declared projected fusion output");
+                        let shape = self
+                            .descriptor
+                            .observations
+                            .get(&input.normalized)
+                            .and_then(|point| point.axes.clone())
+                            .expect("declared projected fusion input geometry");
+                        scope_inputs.push((
+                            point.node_id.clone(),
+                            input.projection_input.clone(),
+                            shape,
+                        ));
+                    }
+                }
+            }
+        }
+        for (node, path, shape) in scope_inputs {
+            self.projection_input_observation(&node, path, shape);
+        }
+        self.scope_requirements();
         self.descriptor
             .observations
             .points
             .sort_by(|a, b| a.path.cmp(&b.path));
         self.descriptor
+    }
+
+    fn scope_requirements(&mut self) {
+        let scoped: std::collections::BTreeSet<_> = self
+            .descriptor
+            .nodes
+            .iter()
+            .filter(|node| {
+                let mut current = Some(*node);
+                while let Some(node) = current {
+                    if let Some(binding) = self
+                        .descriptor
+                        .speculative_invocations
+                        .iter()
+                        .find(|binding| binding.node_id == node.id)
+                    {
+                        return binding.scope
+                            != eredu_core::speculative::SpeculativeCaptureScope::Target;
+                    }
+                    if self
+                        .descriptor
+                        .component_scopes
+                        .iter()
+                        .any(|scope| scope.node_id == node.id)
+                    {
+                        return true;
+                    }
+                    current = node
+                        .parent
+                        .as_ref()
+                        .and_then(|parent| self.descriptor.node(parent));
+                }
+                false
+            })
+            .map(|node| node.id.clone())
+            .collect();
+        for point in &mut self.descriptor.observations.points {
+            if scoped.contains(&point.node_id)
+                && !point
+                    .requirements
+                    .contains(&ObservationRequirement::PredictionExecution)
+            {
+                point
+                    .requirements
+                    .push(ObservationRequirement::PredictionExecution);
+            }
+        }
     }
 }
 
@@ -597,6 +914,7 @@ fn attention(heads: i32, kv: i32, dim: i32, policy: AttentionPolicy) -> Attentio
         recurrent: Some(false),
         causal: Some(true),
         positional_encoding: Some(PositionalEncoding::Rotary),
+        sink_logits: None,
     }
 }
 

@@ -1,4 +1,10 @@
 use super::*;
+
+mod partition_capture;
+mod speculative_capture;
+pub(in crate::composition::mlx) use speculative_capture::SpeculativePartitionBinding;
+#[cfg(test)]
+mod partition_capture_tests;
 use eredu_core::{BackendFailure, BackendFailureKind};
 use std::{
     cell::{Cell, RefCell},
@@ -8,8 +14,12 @@ use std::{
 use super::recovery::{Probe, Recovery, Retention, Status};
 use crate::backend::ordinary_retirement::{self, OrdinaryRetirement};
 
+#[path = "parameters.rs"]
+mod parameters;
+
 pub(super) struct SessionPayload {
     model: Executable,
+    parameter_state: parameters::NativeParameterState,
     target: crate::backend::MlxPreparedTarget,
     distributed: Option<MlxDistributedSession>,
     #[cfg(any(feature = "image", feature = "audio"))]
@@ -175,6 +185,9 @@ impl<P: Probe> ResourceOperation<P> {
         recovery.seal();
         let status = recovery.progress();
         if status.failed || status.blocked {
+            if let Err(error) = result {
+                return Err(error);
+            }
             return Err(Error::ArchitectureModel(
                 "native resource operation failed or is unobservable".into(),
             ));
@@ -259,8 +272,9 @@ impl<P: Probe> SessionOperation<'_, P> {
         recovery.seal();
         let status = recovery.progress();
         if status.failed || status.blocked {
-            if let Err(error) = &result {
-                self.session.record_failure(error);
+            if let Err(error) = result {
+                self.session.record_failure(&error);
+                return Err(error);
             }
             return Err(Error::ArchitectureModel(
                 "native session execution failed or became unobservable; session is poisoned"
@@ -528,7 +542,15 @@ pub struct MlxModelSession {
     authority: RefCell<SessionAuthority>,
     floating_state_dtype_bytes: std::num::NonZeroU8,
     capabilities: eredu_core::SessionCapabilities,
-    capture_discovery: Option<eredu_architectures::prepared_sources::PreparedModelDiscovery>,
+    capture_discovery:
+        Option<std::sync::Arc<eredu_architectures::prepared_sources::PreparedModelDiscovery>>,
+    speculative_capture_layouts: speculative_capture::LayoutsCell,
+    partition_capture: std::cell::OnceCell<
+        Result<
+            std::sync::Arc<partition_capture::LoadedPartitionCapture>,
+            eredu_core::capture::CaptureError,
+        >,
+    >,
     intervention_session_identity: String,
     state_residency: CacheResidencyPolicy,
 }
@@ -584,7 +606,13 @@ impl MlxModelSession {
         #[cfg(any(feature = "image", feature = "audio"))]
         let processor = model.take_processor();
         let distributed = model.take_distributed();
-        let capture_discovery = model.take_capture_discovery();
+        let mut parameter_state = parameters::NativeParameterState::default();
+        parameter_state.model_identity = distributed
+            .as_ref()
+            .map(MlxDistributedSession::register_parameter_model)
+            .transpose()?
+            .flatten();
+        let capture_discovery = model.take_capture_discovery().map(std::sync::Arc::new);
         let intervention_session_identity =
             eredu_core::intervention::new_intervention_session_identity();
         let (executable, target) = model.into_execution_parts();
@@ -597,6 +625,7 @@ impl MlxModelSession {
             // unlocked host boundary.
             payload: Rc::new(OrdinaryRetirement::new(SessionPayload {
                 model: executable,
+                parameter_state,
                 target,
                 distributed,
                 #[cfg(any(feature = "image", feature = "audio"))]
@@ -610,6 +639,8 @@ impl MlxModelSession {
             floating_state_dtype_bytes,
             capabilities: realized_capabilities,
             capture_discovery,
+            speculative_capture_layouts: Default::default(),
+            partition_capture: std::cell::OnceCell::new(),
             intervention_session_identity,
             state_residency,
         };
@@ -617,10 +648,13 @@ impl MlxModelSession {
         Ok(session)
     }
 
-    pub(in crate::composition::mlx) const fn floating_state_dtype_bytes(
-        &self,
-    ) -> std::num::NonZeroU8 {
-        self.floating_state_dtype_bytes
+    pub(in crate::composition::mlx) fn floating_state_dtype_bytes(&self) -> std::num::NonZeroU8 {
+        self.payload
+            .parameter_state
+            .floating_state_dtype_bytes
+            .map_or(self.floating_state_dtype_bytes, |edited| {
+                edited.max(self.floating_state_dtype_bytes)
+            })
     }
 
     fn begin_submission(
@@ -686,9 +720,11 @@ impl MlxModelSession {
         };
         if !status.settled || status.failed || status.blocked {
             owner.reject_unresolved();
-            return Err(Error::ArchitectureModel(
-                "native observation or sampling failed or remains unresolved".into(),
-            ));
+            return Err(result.err().unwrap_or_else(|| {
+                Error::ArchitectureModel(
+                    "native observation or sampling failed or remains unresolved".into(),
+                )
+            }));
         }
         if result.is_err() {
             owner.reject_unresolved();
@@ -754,6 +790,37 @@ impl MlxModelSession {
         self.payload.model.speculative_capability()
     }
 
+    pub(in crate::composition::mlx) fn speculative_activation_discovery(
+        &self,
+    ) -> Result<
+        eredu_core::speculative::SpeculativeActivationDiscovery,
+        eredu_core::capture::CaptureError,
+    > {
+        use eredu_core::capture::CaptureError;
+        if let Some(binding) = self.speculative_partition_binding() {
+            return binding.discovery();
+        }
+        let prepared = self.capture_discovery.as_ref().ok_or_else(|| {
+            CaptureError::Unsupported("session has no retained activation catalog".into())
+        })?;
+        let execution = self
+            .payload
+            .model
+            .erased()
+            .speculative_activation_execution()
+            .ok_or_else(|| {
+                CaptureError::Unsupported(
+                    "selected prediction executor has no complete internal activation path".into(),
+                )
+            })?;
+        prepared.speculative_activations(
+            &execution,
+            &super::intervention::mechanisms(),
+            &self.intervention_session_identity,
+            self.payload.parameter_state.active.as_deref(),
+        )
+    }
+
     /// Installs causal observers on this session's selected embedded-prediction executor.
     pub fn install_embedded_prediction_observers<TensorObserver, LogitsObserver>(
         &mut self,
@@ -764,16 +831,30 @@ impl MlxModelSession {
         TensorObserver: RuntimeActivationObserver<MlxTensor, Exception> + 'static,
         LogitsObserver: RuntimeActivationObserver<Array, Exception> + 'static,
     {
+        self.install_embedded_prediction_observer_set(
+            eredu_architectures::speculative_execution::EmbeddedPredictionObservers::new(
+                tensors, logits,
+            ),
+        )
+    }
+
+    /// Installs outer observers and optional phase-aware internal observation authority.
+    /// This native binding consumes the architecture-owned observer set; portable
+    /// capture admission and record delivery remain the caller's responsibility.
+    pub fn install_embedded_prediction_observer_set(
+        &mut self,
+        observers: eredu_architectures::speculative_execution::EmbeddedPredictionObservers<
+            MlxTensor,
+            Array,
+            Exception,
+        >,
+    ) -> Result<(), Error> {
         self.ensure_no_submission_in_flight()?;
         if !self.payload.model.erased().has_embedded_prediction() {
             return Err(Error::ArchitectureModel(
                 "session has no selected embedded-prediction executor".into(),
             ));
         }
-        let observers =
-            eredu_architectures::speculative_execution::EmbeddedPredictionObservers::new(
-                tensors, logits,
-            );
         self.with_model_operation(|model| {
             if model.install_embedded_prediction_observers(observers) {
                 Ok(())
@@ -783,6 +864,40 @@ impl MlxModelSession {
                 ))
             }
         })
+    }
+
+    /// Moves one already charged internal speculative record after execution.
+    /// This performs no native work and does not imply proposal acceptance.
+    /// A live completion retaining the payload returns a neutral busy failure.
+    pub fn take_speculative_activation_capture(
+        &mut self,
+    ) -> Result<
+        Option<eredu_core::speculative::SpeculativeActivationCapture>,
+        eredu_core::BackendFailure,
+    > {
+        let payload = Rc::get_mut(&mut self.payload).ok_or_else(|| {
+            eredu_core::BackendFailure::from_error(eredu_core::SessionAuthorityError::Busy)
+        })?;
+        Ok(payload
+            .model
+            .erased_mut()
+            .take_speculative_activation_capture())
+    }
+
+    /// Drains an original portable capture or native transformation failure.
+    /// Requires exclusive payload ownership even when the session is poisoned;
+    /// reading this host evidence does not settle or recover native work.
+    pub fn take_speculative_activation_error(
+        &mut self,
+    ) -> Result<Option<eredu_core::speculative::SpeculativeControlError>, eredu_core::BackendFailure>
+    {
+        let payload = Rc::get_mut(&mut self.payload).ok_or_else(|| {
+            eredu_core::BackendFailure::from_error(eredu_core::SessionAuthorityError::Busy)
+        })?;
+        Ok(payload
+            .model
+            .erased_mut()
+            .take_speculative_activation_error())
     }
 
     /// Returns bounded parameter-residency telemetry when available.
@@ -811,6 +926,7 @@ impl MlxModelSession {
     pub fn prompt_cache_model_identity(
         &self,
     ) -> Result<eredu_core::cache::PromptCacheModelIdentity, Error> {
+        self.ensure_parameter_cache_compatible()?;
         self.payload
             .model
             .prompt_cache_model_identity()
@@ -824,12 +940,14 @@ impl MlxModelSession {
         self.payload.model.architecture_capability_estimate()
     }
 
-    pub(in crate::composition::mlx) fn prepared_input_part_plan(
+    pub(in crate::composition::mlx) fn prepared_input_plans(
         &self,
-        input: &crate::backend::runtime::media::input::InputPart,
-    ) -> Result<eredu_architectures::media_plan::PreparedInputPartPlan, eredu_core::CapabilityError>
-    {
-        self.payload.model.prepared_input_part_plan(input)
+        input: crate::backend::runtime::media::input::ModelInput<'_>,
+    ) -> Result<
+        Vec<eredu_architectures::media_plan::PreparedInputPartPlan>,
+        eredu_core::CapabilityError,
+    > {
+        self.payload.model.prepared_input_plans(input)
     }
 
     #[cfg(test)]
@@ -886,9 +1004,16 @@ impl MlxModelSession {
     ) -> Result<Submission<MlxModelOutput, MlxSessionCompletion>, Error> {
         let mut operation = self.begin_submission(backend)?;
         let token_validation_scope = TokenValidationScope::begin()?;
-        let output = input()
-            .map_err(Error::before_model_mutation)
-            .and_then(|input| decode_model(operation.model(), &input, backend.stream()));
+        let input = input();
+        let input = match input {
+            Ok(ref input) => Ok(input),
+            Err(error) => Err(error),
+        };
+        let output = operation.model().erased_mut().decode_result_with_observer(
+            input,
+            backend.stream(),
+            &mut eredu_runtime::NoopObserver,
+        );
         let public_output = operation.model().erased().partition_public_output();
         let (output, owner, recovery) = operation.finish_execution(output)?;
         Ok(owned_model_submission(
@@ -919,6 +1044,7 @@ impl MlxModelSession {
         prefix_token_ids: &[u32],
         options: &PromptCacheOptions,
     ) -> Result<PromptCacheManifest, Error> {
+        self.ensure_parameter_cache_compatible()?;
         self.validate_backend(backend)?;
         self.ensure_no_submission_in_flight()?;
         let root = root.as_ref();
@@ -953,6 +1079,7 @@ impl MlxModelSession {
         expected: &PromptCacheDescriptor,
         prefix_token_ids: &[u32],
     ) -> Result<PromptCacheManifest, Error> {
+        self.ensure_parameter_cache_compatible()?;
         self.validate_backend(backend)?;
         self.ensure_no_submission_in_flight()?;
         let root = root.as_ref();
@@ -993,6 +1120,7 @@ impl MlxModelSession {
         prefix_token_ids: &[u32],
         input: &MlxModelInput,
     ) -> Result<PromptCacheManifest, Error> {
+        self.ensure_parameter_cache_compatible()?;
         self.validate_backend(backend)?;
         self.ensure_no_submission_in_flight()?;
         let identity = input.cache_identity.clone().ok_or_else(|| {
@@ -1110,18 +1238,46 @@ impl MlxModelSession {
         &mut self,
         backend: &MlxBackend<'_>,
         input: MlxModelInput,
-        observer: &mut impl RuntimeActivationObserver<MlxTensor, Exception>,
+        observer: &mut impl RuntimeActivationObserver<MlxTensor, Error>,
+    ) -> Result<Submission<Array, MlxSessionCompletion>, Error> {
+        self.submit_prefill_result_with_observer(backend, Ok(input), None, observer)
+    }
+
+    fn submit_prefill_result_with_observer(
+        &mut self,
+        backend: &MlxBackend<'_>,
+        input: Result<MlxModelInput, Error>,
+        capture_geometry: Option<eredu_core::capture::CaptureRequestShape>,
+        observer: &mut impl RuntimeActivationObserver<MlxTensor, Error>,
     ) -> Result<Submission<Array, MlxSessionCompletion>, Error> {
         let mut operation = self.begin_submission(backend)?;
         let token_validation_scope = TokenValidationScope::begin()?;
-        let output = input.with_borrowed(|input| {
-            operation.model().erased_mut().prefill_with_observer(
-                input,
+        let output = match input {
+            Ok(input) => input.with_borrowed(|input| {
+                operation.model().erased_mut().prefill_result_with_observer(
+                    Ok(input),
+                    None,
+                    capture_geometry,
+                    backend.stream(),
+                    &mut ArrayObserverAdapter {
+                        inner: observer,
+                        routed_path: None,
+                        routed_invocation_active: false,
+                    },
+                )
+            }),
+            Err(error) => operation.model().erased_mut().prefill_result_with_observer(
+                Err(error),
                 None,
+                capture_geometry,
                 backend.stream(),
-                &mut ArrayObserverAdapter { inner: observer },
-            )
-        });
+                &mut ArrayObserverAdapter {
+                    inner: observer,
+                    routed_path: None,
+                    routed_invocation_active: false,
+                },
+            ),
+        };
         let output = output.and_then(|output| {
             observer.finish()?;
             Ok(output)
@@ -1138,15 +1294,24 @@ impl MlxModelSession {
     fn submit_decode_with_observer(
         &mut self,
         backend: &MlxBackend<'_>,
-        input: Array,
-        observer: &mut impl RuntimeActivationObserver<MlxTensor, Exception>,
+        input: impl FnOnce() -> Result<Array, Error>,
+        observer: &mut impl RuntimeActivationObserver<MlxTensor, Error>,
     ) -> Result<Submission<Array, MlxSessionCompletion>, Error> {
         let mut operation = self.begin_submission(backend)?;
         let token_validation_scope = TokenValidationScope::begin()?;
-        let output = operation.model().erased_mut().decode_with_observer(
-            &input,
+        let input = input();
+        let input = match input {
+            Ok(ref input) => Ok(input),
+            Err(error) => Err(error),
+        };
+        let output = operation.model().erased_mut().decode_result_with_observer(
+            input,
             backend.stream(),
-            &mut ArrayObserverAdapter { inner: observer },
+            &mut ArrayObserverAdapter {
+                inner: observer,
+                routed_path: None,
+                routed_invocation_active: false,
+            },
         );
         let output = output.and_then(|output| {
             observer.finish()?;
@@ -1251,7 +1416,7 @@ impl<'a> InspectableBackendSession<MlxBackend<'a>> for MlxModelSession {
         request: &ObservationRequest,
     ) -> Result<InspectedOutput<Self::Output>, Error> {
         let mut collector = InspectionCollector::new(request);
-        let submission = self.submit_decode_with_observer(backend, input, &mut collector)?;
+        let submission = self.submit_decode_with_observer(backend, || Ok(input), &mut collector)?;
         let logits = submission.wait()?;
         let output = if self.payload.model.erased().partition_public_output() {
             MlxModelOutput::new(Some(MlxTensor::from_array(logits)))
@@ -1268,6 +1433,44 @@ impl<'a> InspectableBackendSession<MlxBackend<'a>> for MlxModelSession {
 }
 
 impl<'a> TextGenerationBackend for MlxBackend<'a> {
+    fn agree_text_preparation(
+        runtime: &ModelRuntime<Self>,
+        stage: eredu_core::run_preparation::TextPreparationStage,
+        status: eredu_core::run_preparation::TextPreparationStatus,
+    ) -> Result<eredu_core::run_preparation::TextPreparationOutcome, BackendFailure> {
+        use eredu_core::run_preparation::{
+            TextPreparationOutcome as Outcome, TextPreparationStatus as Status,
+        };
+        let session = runtime.session();
+        let valid = session
+            .validate_backend(runtime.backend())
+            .and_then(|()| session.ensure_no_submission_in_flight());
+        let status = if valid.is_err() {
+            Status::Failed
+        } else {
+            status
+        };
+        let agreed = match &session.payload.distributed {
+            Some(transport) => transport.agree_text_preparation(stage, status),
+            None => Ok(match status {
+                Status::Ready => Outcome::Ready,
+                Status::Cancelled => Outcome::Cancelled,
+                Status::Failed => Outcome::Rejected { rank: 0 },
+            }),
+        };
+        valid.map_err(|error| session.lifecycle_failure(error))?;
+        agreed
+    }
+
+    fn text_preparation_usage(
+        runtime: &ModelRuntime<Self>,
+    ) -> Result<eredu_core::run_preparation::TextPreparationUsage, BackendFailure> {
+        match &runtime.session().payload.distributed {
+            Some(transport) => transport.text_preparation_usage(),
+            None => Ok(Default::default()),
+        }
+    }
+
     fn reset_session(backend: &Self, session: &mut Self::Session) -> Result<(), BackendFailure> {
         session
             .validate_backend(backend)
@@ -1281,6 +1484,13 @@ impl<'a> TextGenerationBackend for MlxBackend<'a> {
         session
             .validate_backend(backend)
             .map_err(|error| BackendFailure::new(BackendFailureKind::InvalidSession, error))?;
+        // A failed collective may still own quarantined native work. Do not
+        // enter an unbounded queue wait after its communication owner is fenced.
+        if let Some(transport) = &session.payload.distributed {
+            eredu_runtime::run_preparation::TextPreparationTransport::ensure_preparation_active(
+                transport,
+            )?;
+        }
         backend
             .weights_stream()
             .synchronize()
@@ -1292,7 +1502,8 @@ impl<'a> TextGenerationBackend for MlxBackend<'a> {
         // recovery after a failed/cancelled operation has safely retired.
         session
             .ensure_no_submission_in_flight()
-            .map_err(|error| session.lifecycle_failure(error))
+            .map_err(|error| session.lifecycle_failure(error))?;
+        Ok(())
     }
 
     fn text_sampling_control_support(
@@ -1323,9 +1534,21 @@ impl<'a> TextGenerationBackend for MlxBackend<'a> {
                 "session has no retained intervention catalog".into(),
             )
         })?;
-        let mut discovery = prepared.intervention(&super::intervention::mechanisms())?;
+        let mechanisms = super::intervention::mechanisms();
+        let mut discovery = prepared.intervention(&mechanisms)?;
+        if let Some(partition) = session.loaded_partition_capture()? {
+            discovery = eredu_runtime::inspection::intervention_support(
+                discovery.points,
+                &partition.discovery,
+                &mechanisms,
+            );
+        }
         discovery.session_identity = Some(session.intervention_session_identity.clone());
         Ok(discovery)
+    }
+
+    fn active_parameter_overlay(runtime: &ModelRuntime<Self>) -> Option<&str> {
+        runtime.session().payload.parameter_state.active.as_deref()
     }
 
     fn validate_text_interventions(
@@ -1333,15 +1556,9 @@ impl<'a> TextGenerationBackend for MlxBackend<'a> {
         capture: &eredu_core::capture::AdmittedCapturePlan,
         plan: &eredu_core::intervention::AdmittedInterventionPlan,
     ) -> Result<(), eredu_core::capture::CaptureError> {
-        use eredu_core::capture::*;
         Self::validate_text_capture(runtime, capture)?;
         if plan.is_empty() {
             return Ok(());
-        }
-        if runtime.session().payload.distributed.is_some() {
-            return Err(CaptureError::Unsupported(
-                "interventions require ordinary single-rank text generation".into(),
-            ));
         }
         eredu_runtime::intervention::validate_session(
             capture,
@@ -1365,12 +1582,24 @@ impl<'a> TextGenerationBackend for MlxBackend<'a> {
                 plan,
                 std::sync::Arc::new(super::intervention::NativeInterventionEstimator),
             )),
-        )
+        )?;
+        if let (Some(capture), Some(partition)) = (
+            state.capture.as_mut(),
+            runtime.session().loaded_partition_capture()?,
+        ) {
+            capture.ensure_partition_capture(
+                partition.identity(runtime.session().payload.parameter_state.active.as_deref())?,
+            )?;
+        }
+        Ok(())
     }
 
     fn capture_discovery(
         runtime: &ModelRuntime<Self>,
     ) -> Result<eredu_core::capture::CaptureDiscovery, eredu_core::capture::CaptureError> {
+        if let Some(partition) = runtime.session().loaded_partition_capture()? {
+            return Ok(partition.discovery.clone());
+        }
         runtime
             .session()
             .capture_discovery
@@ -1389,7 +1618,16 @@ impl<'a> TextGenerationBackend for MlxBackend<'a> {
         plan: eredu_core::capture::AdmittedCapturePlan,
     ) -> Result<(), eredu_core::capture::CaptureError> {
         Self::validate_text_capture(runtime, &plan)?;
-        eredu_runtime::intervention::install_session(&mut state.capture, plan, None)
+        eredu_runtime::intervention::install_session(&mut state.capture, plan, None)?;
+        if let (Some(capture), Some(partition)) = (
+            &mut state.capture,
+            runtime.session().loaded_partition_capture()?,
+        ) {
+            capture.ensure_partition_capture(
+                partition.identity(Self::active_parameter_overlay(runtime))?,
+            )?;
+        }
+        Ok(())
     }
 
     fn validate_text_capture(
@@ -1400,10 +1638,9 @@ impl<'a> TextGenerationBackend for MlxBackend<'a> {
         if plan.is_empty() {
             return Ok(());
         }
-        if runtime.session().payload.distributed.is_some() || plan.request().batch != 1 {
+        if plan.request().batch != 1 {
             return Err(CaptureError::Unsupported(
-                "bounded capture requires ordinary single-rank, single-sequence text generation"
-                    .into(),
+                "bounded capture requires single-sequence text generation".into(),
             ));
         }
         eredu_runtime::capture::validate_session(
@@ -1427,6 +1664,10 @@ impl<'a> TextGenerationBackend for MlxBackend<'a> {
         config: TextGenerationConfig,
     ) -> Result<Self::TextGenerationState, Error> {
         super::recovery::detached(Vec::new(), || {
+            #[cfg(test)]
+            if let Some(error) = TEST_SAMPLING_FAILURE.with(|slot| slot.borrow_mut().take()) {
+                return Err(error);
+            }
             let sampling = config.sampling();
             let prng = if sampling.temperature == 0.0 {
                 None
@@ -1446,6 +1687,7 @@ impl<'a> TextGenerationBackend for MlxBackend<'a> {
                     prng,
                     sampler,
                     next_prediction: 0,
+                    parameter_epoch: None,
                 },
                 capture: None,
             })
@@ -1496,49 +1738,60 @@ impl<'a> TextGenerationBackend for MlxBackend<'a> {
         decision: &eredu_core::TokenSamplingDecision<'_>,
         state: &mut Self::TextGenerationState,
     ) -> Result<Submission<Self::Token, Self::TextCompletion>, Error> {
+        let prepared = runtime
+            .session()
+            .validate_parameter_epoch(&mut state.sampling.parameter_epoch);
         let filter = decision.filter();
         let stream = runtime.backend().stream().clone();
+        let prepared = prepared.map(|()| prompt);
         if let Some(capture) = &mut state.capture {
-            if prompt.with_borrowed(|input| {
-                input
-                    .parts
-                    .iter()
-                    .any(|part| part.modality() != InputModality::Text)
-            }) {
-                return Err(Error::ArchitectureModel("capture/interventions require ordinary text input; media execution is unsupported".into()));
-            }
-            let request = capture.plan().request();
-            let aligned = prompt.with_borrowed(|input| {
-                if input.parts.len() != 1 {
-                    return false;
-                }
-                let input::InputPayload::TokenIds(tokens) = input.parts[0].payload() else {
-                    return false;
-                };
-                let shape = tokens.shape();
-                shape.len() == 2
-                    && u64::try_from(shape[0]) == Ok(request.batch)
-                    && u64::try_from(shape[1]) == Ok(request.prompt_tokens)
-            });
-            if !aligned {
-                return Err(Error::ArchitectureModel("capture/interventions require one token-ID prompt matching admitted batch and prompt length".into()));
-            }
-            capture
-                .begin_step(eredu_core::capture::CapturePhase::Prefill, 0)
-                .map_err(|e| Error::ArchitectureModel(e.to_string()))?;
+            let capture_geometry = Some(capture.plan().request());
             let (backend, session) = runtime.parts_mut();
-            let submission = session.submit_prefill_with_observer(
-                backend,
-                prompt,
-                &mut super::bounded_capture::observer(capture, &stream, decision.capture_domain()),
+            let public_output = session.payload.model.erased().partition_public_output();
+            let submission = partition_capture::with_observer(
+                session,
+                capture,
+                &stream,
+                decision.capture_domain(),
+                0,
+                |session, observer| {
+                    session.submit_prefill_result_with_observer(
+                        backend,
+                        prepared,
+                        capture_geometry,
+                        &mut eredu_runtime::BorrowedActivationObserver(observer),
+                    )
+                },
             )?;
             let submission = Submission {
-                output: MlxModelOutput::new(Some(MlxTensor::from_array(submission.output))),
+                output: MlxModelOutput::new(
+                    public_output.then(|| MlxTensor::from_array(submission.output)),
+                ),
                 completion: submission.completion,
             };
             return sample_text_submission(runtime.session(), submission, filter, state, stream);
         }
-        let submission = runtime.prefill(prompt)?;
+        let submission = match prepared {
+            // Keep the core's exact admission check and retained target proof
+            // on the ordinary successful prefill path.
+            Ok(prompt) => runtime.prefill(prompt)?,
+            Err(error) => {
+                let (backend, session) = runtime.parts_mut();
+                let public_output = session.payload.model.erased().partition_public_output();
+                let submission = session.submit_prefill_result_with_observer(
+                    backend,
+                    Err(error),
+                    None,
+                    &mut eredu_runtime::NoopObserver,
+                )?;
+                Submission {
+                    output: MlxModelOutput::new(
+                        public_output.then(|| MlxTensor::from_array(submission.output)),
+                    ),
+                    completion: submission.completion,
+                }
+            }
+        };
         sample_text_submission(runtime.session(), submission, filter, state, stream)
     }
 
@@ -1562,36 +1815,45 @@ impl<'a> TextGenerationBackend for MlxBackend<'a> {
         decision: &eredu_core::TokenSamplingDecision<'_>,
         state: &mut Self::TextGenerationState,
     ) -> Result<Submission<Self::Token, Self::TextCompletion>, Error> {
+        let prepared = runtime
+            .session()
+            .validate_parameter_epoch(&mut state.sampling.parameter_epoch);
         let filter = decision.filter();
         let stream = runtime.backend().stream().clone();
         if let Some(capture) = &mut state.capture {
-            capture
-                .begin_step(
-                    eredu_core::capture::CapturePhase::Decode,
-                    state.sampling.next_prediction,
-                )
-                .map_err(|e| Error::ArchitectureModel(e.to_string()))?;
             let (backend, session) = runtime.parts_mut();
-            // Input framing belongs to the existing session recovery boundary.
-            let input = session.with_shared_operation(|| {
-                token
-                    .value
-                    .try_index_device((.., NewAxis), &stream)
-                    .map_err(Into::into)
-            })?;
-            let submission = session.submit_decode_with_observer(
-                backend,
-                input,
-                &mut super::bounded_capture::observer(capture, &stream, decision.capture_domain()),
+            let public_output = session.payload.model.erased().partition_public_output();
+            let submission = partition_capture::with_observer(
+                session,
+                capture,
+                &stream,
+                decision.capture_domain(),
+                state.sampling.next_prediction,
+                |session, observer| {
+                    session.submit_decode_with_observer(
+                        backend,
+                        || {
+                            prepared?;
+                            token
+                                .value
+                                .try_index_device((.., NewAxis), &stream)
+                                .map_err(Into::into)
+                        },
+                        &mut eredu_runtime::BorrowedActivationObserver(observer),
+                    )
+                },
             )?;
             let submission = Submission {
-                output: MlxModelOutput::new(Some(MlxTensor::from_array(submission.output))),
+                output: MlxModelOutput::new(
+                    public_output.then(|| MlxTensor::from_array(submission.output)),
+                ),
                 completion: submission.completion,
             };
             return sample_text_submission(runtime.session(), submission, filter, state, stream);
         }
         let (backend, session) = runtime.parts_mut();
         let submission = session.submit_decode_input(backend, || {
+            prepared?;
             #[cfg(test)]
             crate::tests::support::path_instrumentation::session_input_creation_attempt();
             token
@@ -1600,6 +1862,31 @@ impl<'a> TextGenerationBackend for MlxBackend<'a> {
                 .map_err(Into::into)
         })?;
         sample_text_submission(runtime.session(), submission, filter, state, stream)
+    }
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static TEST_SAMPLING_FAILURE: std::cell::RefCell<Option<Error>> = const { std::cell::RefCell::new(None) };
+}
+#[cfg(test)]
+pub(crate) struct TestSamplingFailure;
+#[cfg(test)]
+impl Drop for TestSamplingFailure {
+    fn drop(&mut self) {
+        TEST_SAMPLING_FAILURE.with(|slot| {
+            slot.borrow_mut().take();
+        });
+    }
+}
+#[cfg(test)]
+impl MlxBackend<'_> {
+    pub(crate) fn fail_next_sampling_for_test(error: Error) -> TestSamplingFailure {
+        TEST_SAMPLING_FAILURE.with(|slot| {
+            assert!(slot.borrow().is_none());
+            *slot.borrow_mut() = Some(error);
+        });
+        TestSamplingFailure
     }
 }
 

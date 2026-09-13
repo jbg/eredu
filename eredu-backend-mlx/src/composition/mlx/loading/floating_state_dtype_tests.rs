@@ -512,7 +512,74 @@ fn mlx_processor_consumes_retained_qwen_plan_after_sidecar_removal() {
         architecture_plan.model_kind(),
         eredu_architectures::ModelKind::Qwen3Vl
     );
-    assert!(crate::composition::mlx::ModelProcessor::from_plan(&architecture_plan).is_some());
+    let processor = crate::composition::mlx::ModelProcessor::from_plan(&architecture_plan).unwrap();
+    let request = eredu_core::MultimodalRequest::new(vec![
+        eredu_core::MultimodalSegment::TokenIds(vec![7]),
+        eredu_core::MultimodalSegment::Media(eredu_core::Media::Image(
+            eredu_core::RgbImage::new((0..48).map(|index| (index * 5 + 8) as u8).collect(), 4, 4)
+                .unwrap(),
+        )),
+    ])
+    .unwrap()
+    .tokenize::<std::convert::Infallible>(|_| unreachable!())
+    .unwrap();
+    let prepare = || {
+        processor
+            .prepare_portable_input(&request, &mut |_| {
+                Ok::<_, std::convert::Infallible>(Vec::new())
+            })
+            .unwrap()
+    };
+    let baseline = prepare();
+    let pixels = |prepared: &crate::backend::runtime::media::PreparedModelInput| {
+        prepared
+            .input_parts()
+            .iter()
+            .find(|part| part.modality() == eredu_core::InputModality::Image)
+            .unwrap()
+            .payload()
+            .value()
+            .evaluated()
+            .unwrap()
+            .try_to_vec::<f32>()
+            .unwrap()
+    };
+    let expected = pixels(&baseline);
+    assert!(expected.iter().all(|value| value.is_finite()));
+    assert!(expected.iter().any(|value| *value > 0.1));
+    struct RejectPixels(bool);
+    impl eredu_runtime::ActivationObserver<safemlx::Array, safemlx::error::Exception> for RejectPixels {
+        fn observe(
+            &mut self,
+            _: &str,
+            value: &safemlx::Array,
+        ) -> Result<(), safemlx::error::Exception> {
+            if value.dtype() == safemlx::Dtype::Float32 {
+                self.0 = true;
+                value.evaluated()?;
+                return Err(safemlx::error::Exception::custom(
+                    "original native processor observer cause",
+                ));
+            }
+            Ok(())
+        }
+    }
+    let mut observer = RejectPixels(false);
+    let error = processor
+        .prepare_portable_input_with_observer(
+            &request,
+            &mut |_| Ok::<_, std::convert::Infallible>(Vec::new()),
+            &mut observer,
+        )
+        .err()
+        .expect("native observer failure must remain visible");
+    assert!(observer.0);
+    assert!(
+        matches!(error, crate::backend::runtime::media::ProcessorPreparationError::Backend(
+        crate::backend::error::Error::Exception(ref cause)
+    ) if cause.what() == "original native processor observer cause")
+    );
+    assert_eq!(pixels(&prepare()), expected);
 }
 
 #[test]

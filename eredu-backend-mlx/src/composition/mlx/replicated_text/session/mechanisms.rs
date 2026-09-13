@@ -14,6 +14,22 @@ where
         state.isolated_snapshot_estimate()
     }
 
+    fn estimate_reset_state(
+        &self,
+        state: &S,
+    ) -> Option<eredu_core::execution_control::SnapshotEstimate> {
+        // The snapshot metadata bound covers empty role maps and the selected
+        // layout. Growth at zero includes every declared fixed component and
+        // cache capacity, even when its tensor is currently absent. Fresh MLX
+        // realization uses that same geometry and starts with no token history.
+        let metadata = state.isolated_snapshot_estimate()?;
+        let initial = state.isolated_snapshot_growth(0)?;
+        Some(eredu_core::execution_control::SnapshotEstimate {
+            retained_bytes: metadata.retained_bytes.checked_add(initial)?,
+            copy_bytes: metadata.copy_bytes.checked_add(initial)?,
+        })
+    }
+
     fn estimate_snapshot_growth(&self, state: &S, additional: u64) -> Option<u64> {
         state.isolated_snapshot_growth(additional)
     }
@@ -47,6 +63,9 @@ where
 {
     store: Arc<dyn CheckpointSource>,
     prepared_bindings: Option<PreparedExactBindings>,
+    prediction_residency: super::super::prediction::parameters::PredictionResidency,
+    prepared_parameters: Vec<eredu_runtime::parameter_operations::PreparedParameterSlot>,
+    parameter_declarations: Vec<eredu_nn::ParameterMetadata>,
     resident_report: Option<ResidencyReport>,
     materialization: Option<eredu_runtime::WeightMaterializationReport>,
     stream: Stream,
@@ -61,6 +80,7 @@ where
 
 pub(in crate::composition::mlx::replicated_text) struct PreparedExactBindings {
     layout: eredu_runtime::ExecutionUnitLayout,
+    addresses: Vec<eredu_runtime::ExecutionUnitAddress>,
     static_bindings: Vec<WeightBinding>,
     unit_bindings: Vec<Vec<WeightBinding>>,
     excluded_parameters: std::collections::BTreeSet<String>,
@@ -70,23 +90,6 @@ pub(in crate::composition::mlx::replicated_text) struct PreparedExactBindings {
 pub(in crate::composition::mlx::replicated_text) struct MlxPromptCacheSaveTransaction {
     publication: eredu_runtime::ReversiblePromptCachePublication,
     manifest: PromptCacheManifest,
-}
-
-pub(in crate::composition::mlx::replicated_text) fn shard_unmaterialized_bindings(
-    bindings: Vec<WeightBinding>,
-    store: &dyn CheckpointSource,
-    layout: &eredu_runtime::LocalModelLayout,
-    locally_materialized: &std::collections::BTreeSet<String>,
-) -> Result<Vec<WeightBinding>, Error> {
-    let mut output = Vec::with_capacity(bindings.len());
-    for binding in bindings {
-        if locally_materialized.contains(binding.name()) {
-            output.push(binding);
-        } else {
-            output.extend(shard_layer_bindings(vec![binding], store, layout)?);
-        }
-    }
-    Ok(output)
 }
 
 impl<A, S> MlxReplicatedTextMechanisms<A, S>
@@ -102,6 +105,9 @@ where
         Self {
             store,
             prepared_bindings: None,
+            prediction_residency: Default::default(),
+            prepared_parameters: Vec::new(),
+            parameter_declarations: Vec::new(),
             resident_report: None,
             materialization: None,
             stream: stream.clone(),
@@ -113,6 +119,13 @@ where
             state_global_layer_start: 0,
             state: PhantomData,
         }
+    }
+
+    pub(super) fn set_prediction_residency(
+        &mut self,
+        residency: super::super::prediction::parameters::PredictionResidency,
+    ) {
+        self.prediction_residency = residency;
     }
 
     pub(super) fn set_parallel_layout(&mut self, layout: eredu_runtime::LocalModelLayout) {
@@ -256,6 +269,8 @@ where
             .map(|name| name.as_ref().to_owned())
             .filter(|name| !selected_static_parameters.contains(name))
             .collect::<std::collections::BTreeSet<_>>();
+        #[cfg(test)]
+        let excluded_static_parameters = excluded_parameters.len();
         excluded_parameters.extend(addressable_parameters.iter().cloned());
         let static_bindings = build_mlx_exact_replicated_text_bindings(
             architecture.static_modules(),
@@ -267,7 +282,7 @@ where
         #[cfg(test)]
         crate::tests::support::path_instrumentation::local_static_materialization(
             static_bindings.len(),
-            excluded_parameters.len(),
+            excluded_static_parameters,
         );
         let unit_bindings = units
             .iter()
@@ -297,8 +312,18 @@ where
             .collect::<Vec<_>>();
         let layout = eredu_runtime::ExecutionUnitLayout::new(&graph, counts)
             .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+        (self.prepared_parameters, self.parameter_declarations) =
+            super::prepared_parameters::collect::<A, S>(
+                architecture,
+                units,
+                addresses,
+                &static_bindings,
+                &unit_bindings,
+                self.store.as_ref(),
+            )?;
         self.prepared_bindings = Some(PreparedExactBindings {
             layout,
+            addresses: addresses.to_vec(),
             static_bindings,
             unit_bindings,
             excluded_parameters,
@@ -326,6 +351,7 @@ where
         (
             MlxLayerwisePolicy<A::Unit, MlxSelectiveUnitPopulator>,
             eredu_runtime::ExecutionUnitLayout,
+            Vec<eredu_runtime::ExecutionUnitAddress>,
         ),
         Error,
     >
@@ -337,6 +363,13 @@ where
         })?;
         let layout = prepared.layout.clone();
         let mut ignored_sources = self.ignored_checkpoint_sources.clone();
+        ignored_sources.extend(
+            selected
+                .requirements()
+                .parameters()
+                .iter()
+                .flat_map(|parameter| parameter.admitted_redundant_sources().iter().cloned()),
+        );
         for parameter in selected
             .requirements()
             .parameters()
@@ -358,7 +391,7 @@ where
                 ignored_sources.extend(recipe.source_keys().into_iter().map(str::to_owned));
             }
         }
-        let (policy, _) = prepare_layerwise_policy_from_bindings(
+        let (policy, _) = prepare_layerwise_policy_with_supplementary_bindings(
             Arc::clone(&self.store),
             architecture,
             MlxSelectiveUnitPopulator::new(prepared.excluded_parameters.clone()),
@@ -370,8 +403,11 @@ where
             prepared.layout,
             prepared.static_bindings,
             prepared.unit_bindings,
+            std::mem::take(&mut self.prediction_residency.units),
         )?;
-        Ok((policy, layout))
+        self.prediction_residency
+            .install(policy.residency_manager())?;
+        Ok((policy, layout, prepared.addresses))
     }
 }
 
@@ -391,6 +427,16 @@ where
     type StateReport = MlxStateReport;
     type ExecutionReport = MlxExecutionReport;
     type Error = Error;
+
+    fn parameter_declarations(&self) -> &[eredu_nn::ParameterMetadata] {
+        &self.parameter_declarations
+    }
+
+    fn prepared_parameter_slots(
+        &self,
+    ) -> &[eredu_runtime::parameter_operations::PreparedParameterSlot] {
+        &self.prepared_parameters
+    }
 
     fn take_materialization_report(
         &mut self,
@@ -510,8 +556,25 @@ where
             })
             .collect::<Result<Vec<_>, _>>()?;
 
+        let addresses = (0..target_layout.len())
+            .map(|ordinal| {
+                target_layout
+                    .address(ordinal)
+                    .expect("validated selected layout")
+            })
+            .collect::<Vec<_>>();
+        (self.prepared_parameters, self.parameter_declarations) =
+            super::prepared_parameters::collect::<A, S>(
+                architecture,
+                target_units,
+                &addresses,
+                &static_bindings,
+                &unit_bindings,
+                self.store.as_ref(),
+            )?;
         self.prepared_bindings = Some(PreparedExactBindings {
             layout: target_layout.clone(),
+            addresses,
             static_bindings,
             unit_bindings,
             excluded_parameters: addressable_parameters,
@@ -535,10 +598,10 @@ where
         selected: &SelectedReplicatedTextRealization,
         context: &Stream,
     ) -> Result<Self::ResidentPolicy, Self::Error> {
-        let (policy, _) = self.take_prepared_policy(architecture, selected)?;
+        let (policy, layout, addresses) = self.take_prepared_policy(architecture, selected)?;
         let resident = policy.into_resident_units(units, context)?;
         self.resident_report = Some(resident.residency_report()?);
-        Ok(MlxSelectedLayerwisePolicy::resident(resident))
+        MlxSelectedLayerwisePolicy::resident(resident, &layout, &addresses)
     }
 
     fn bounded_policy(
@@ -548,7 +611,9 @@ where
         _context: &Stream,
     ) -> Result<Self::BoundedPolicy, Self::Error> {
         self.take_prepared_policy(architecture, selected)
-            .map(|(policy, layout)| MlxSelectedLayerwisePolicy::bounded(policy, &layout))
+            .and_then(|(policy, layout, addresses)| {
+                MlxSelectedLayerwisePolicy::bounded(policy, &layout, &addresses)
+            })
     }
 
     fn index_text_output(

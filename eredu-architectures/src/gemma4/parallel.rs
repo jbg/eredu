@@ -303,19 +303,41 @@ fn expected_partition_static_roles(
     geometry: &PartitionLocalGeometry,
 ) -> Vec<String> {
     let mut roles = Vec::new();
-    if geometry
-        .vision_units
-        .as_ref()
-        .is_some_and(|range| range.start == 0)
-    {
-        roles.extend(["vision".into(), "vision_projection".into()]);
-    }
-    if geometry
-        .audio_units
-        .as_ref()
-        .is_some_and(|range| range.start == 0)
-    {
-        roles.extend(["audio".into(), "audio_projection".into()]);
+    for (group, units, count) in [
+        (
+            0,
+            geometry.vision_units.as_ref(),
+            args.vision
+                .as_ref()
+                .map_or(0, |v| v.num_hidden_layers as usize),
+        ),
+        (
+            1,
+            geometry.audio_units.as_ref(),
+            args.audio
+                .as_ref()
+                .map_or(0, |a| a.num_hidden_layers as usize),
+        ),
+    ] {
+        let Some(units) = units else {
+            continue;
+        };
+        let transport = super::pipeline::media_transport(args, group);
+        for role in transport
+            .first_owner_static_roles
+            .into_iter()
+            .filter(|_| units.start == 0)
+            .chain(
+                transport
+                    .last_owner_static_roles
+                    .into_iter()
+                    .filter(|_| units.end == count),
+            )
+        {
+            if !roles.contains(&role) {
+                roles.push(role);
+            }
+        }
     }
     if geometry.text_units.start == 0 {
         roles.extend([
@@ -682,6 +704,12 @@ fn partition_local_geometry_impl(
                 .ok_or_else(|| invalid(format!("Gemma 4 has no local text block {global}")))
         })
         .collect::<Result<Vec<_>, _>>()?;
+    let complete_state_layout = super::pipeline::partition_state_layout(
+        &args.text,
+        &complete.state_layout,
+        text_units.clone(),
+    )
+    .map_err(|error| invalid(error.to_string()))?;
     let geometry = PartitionLocalGeometry {
         vision_units,
         audio_units,
@@ -690,7 +718,7 @@ fn partition_local_geometry_impl(
         embedding_range: complete.embedding_range.clone(),
         output_range: complete.output_range.clone(),
         per_layer_range: complete.per_layer_range.clone(),
-        complete_state_layout: complete.state_layout.clone(),
+        complete_state_layout,
         static_roles: ownership.static_roles().to_vec(),
         architecture_fingerprint: complete.architecture_fingerprint.clone(),
     };

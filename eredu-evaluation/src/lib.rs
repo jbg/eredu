@@ -4,6 +4,8 @@
 #![warn(missing_docs)]
 
 mod checkpoint;
+/// Host reference arithmetic for signed component reconstruction.
+pub mod component_attribution;
 mod distribution;
 mod evidence;
 pub mod execution_control;

@@ -137,6 +137,8 @@ impl ParameterBankEntry {
 /// Lowers generic selected storage members into MLX residency entries.
 /// MLX entry bindings paired with exact per-binding transformation selections.
 pub struct SelectedAddressableEntries {
+    /// Exact logical destinations, including companions created by selected transforms.
+    pub parameter_targets: BTreeMap<(ParameterBankKey, String), String>,
     /// Source-backed entry catalog, before selected load-time transformations.
     pub entries: Vec<ParameterBankEntry>,
     /// Packed format keyed by the exact entry and local binding to transform.
@@ -161,11 +163,36 @@ pub fn entries_from_selected_members(
     members: &[eredu_runtime::AddressableBankMember],
     store: &dyn eredu_checkpoint::store::CheckpointSource,
 ) -> Result<SelectedAddressableEntries, Error> {
+    let mut parameter_targets = BTreeMap::new();
+    for member in members {
+        for parameter in member.parameters() {
+            parameter_targets.insert(
+                (member.key(), parameter.binding_name().to_owned()),
+                parameter.task().name().to_owned(),
+            );
+            if let Some(bindings) = parameter.quantization_companions() {
+                for companion in parameter.task().output_companions() {
+                    let name = match companion.role() {
+                        eredu_nn::LinearCompanionRole::Scale => bindings.scale(),
+                        eredu_nn::LinearCompanionRole::AffineBias => {
+                            bindings.affine_bias().ok_or_else(|| {
+                                Error::ArchitectureModel(
+                                    "missing selected companion binding".into(),
+                                )
+                            })?
+                        }
+                    };
+                    parameter_targets
+                        .insert((member.key(), name.to_owned()), companion.name().to_owned());
+                }
+            }
+        }
+    }
     let plans =
         eredu_runtime::plan_addressable_bank_bindings(members, store, |_task, recipe, source| {
             crate::backend::runtime::checkpoint::recipe::lower_mxfp4_recipe(recipe, source)
         })
-        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+        .map_err(|error| Error::Other(Box::new(error)))?;
     let mut entries = Vec::with_capacity(plans.len());
     let mut transformations = BTreeMap::new();
     let mut expected_bytes = BTreeMap::new();
@@ -198,6 +225,7 @@ pub fn entries_from_selected_members(
         placements.insert(key, placement);
     }
     Ok(SelectedAddressableEntries {
+        parameter_targets,
         entries,
         transformations,
         expected_bytes,

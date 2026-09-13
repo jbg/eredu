@@ -5,6 +5,7 @@
 #include "mlx/c/distributed_group.h"
 #include "mlx/c/error.h"
 #include "mlx/c/private/mlx.h"
+#include "mlx/distributed/distributed_impl.h"
 
 extern "C" mlx_distributed_group mlx_distributed_group_new(void) {
   try {
@@ -56,6 +57,20 @@ extern "C" int mlx_distributed_group_size(mlx_distributed_group group) {
   } catch (std::exception& e) {
     mlx_error(e.what());
     return 0;
+  }
+}
+
+extern "C" int mlx_distributed_group_communication_stream(
+    mlx_stream* res,
+    mlx_distributed_group group) {
+  try {
+    mlx_stream_set_(
+        *res,
+        mlx_distributed_group_get_(group).raw_group()->communication_stream());
+    return 0;
+  } catch (std::exception& e) {
+    mlx_error(e.what());
+    return 1;
   }
 }
 

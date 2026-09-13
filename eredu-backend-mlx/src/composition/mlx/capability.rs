@@ -2,7 +2,7 @@
 
 use std::num::NonZeroU8;
 
-use eredu_architectures::media_plan::{self, MediaShapePlan, PreparedInputPartPlan};
+use eredu_architectures::media_plan::{MediaShapePlan, PreparedInputPartPlan};
 use eredu_core::{
     estimate_runtime_state, AvailableMemory, CapabilityError, InputMetadataKey, InputModality,
     InputTokenCount, ModelCapabilities, ModelCapabilityBackend, ModelRuntime, ObservationKind,
@@ -57,15 +57,11 @@ fn estimate_mlx_runtime_state(
 }
 
 impl Executable {
-    pub(super) fn prepared_input_part_plan(
+    pub(super) fn prepared_input_plans(
         &self,
-        input: &input::InputPart,
-    ) -> Result<PreparedInputPartPlan, CapabilityError> {
-        media_plan::text_only_input_part(
-            self.effective_model_type(),
-            input,
-            &input::MlxInputInspector,
-        )
+        input: input::ModelInput<'_>,
+    ) -> Result<Vec<PreparedInputPartPlan>, CapabilityError> {
+        self.erased().prepared_input_plans(input)
     }
 
     pub(super) fn architecture_capability_estimate(
@@ -155,8 +151,14 @@ pub fn count_prepared_input(
     let mut media_positions = 0u64;
     let mut media_execution_workspace_bytes = 0u64;
     let mut media_execution_workspace_kind = ObservationKind::Exact;
-    for part in prepared.parts {
-        match session.prepared_input_part_plan(part)? {
+    let plans = session.prepared_input_plans(prepared)?;
+    if plans.len() != prepared.parts.len() {
+        return Err(CapabilityError::Observation(
+            "prepared input accounting plan count differs from input parts".into(),
+        ));
+    }
+    for (part, plan) in prepared.parts.iter().zip(plans) {
+        match plan {
             PreparedInputPartPlan::Text { positions } => {
                 text_tokens = checked_add(text_tokens, positions, "prepared text-token total")?;
             }

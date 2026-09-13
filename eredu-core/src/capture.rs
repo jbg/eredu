@@ -10,7 +10,13 @@ use sha2::{Digest, Sha256};
 
 #[cfg(test)]
 mod candidate_tests;
+mod invocation;
+#[cfg(test)]
+mod prepared_geometry_tests;
+pub use invocation::{CaptureInvocationBounds, CaptureInvocationShape};
+mod routed;
 mod tensor_wire;
+pub use routed::*;
 
 use crate::{
     ObservationCatalog, ObservationPoint, ObservationSupportReport, ObservationSupportStatus,
@@ -19,6 +25,17 @@ use crate::{
 
 /// Wire version for capture plans and records.
 pub const CAPTURE_SCHEMA_VERSION: u32 = 1;
+
+/// Cold facts about a deferred observation source. Its borrowed prototype gives
+/// geometry only; it need not have the factory's actual element type.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GeneratedCaptureSource {
+    /// Conservative native storage bound for creating the source and temporaries.
+    pub creation_bytes: u64,
+    /// Actual output type promised by the source mechanism, checked when generated.
+    /// Unknown sources cannot supply empty raw captures without creating a value.
+    pub source_dtype: Option<crate::checkpoint::TensorDtype>,
+}
 
 /// One ordinary forward operation. Prediction zero is prefill; decode starts at one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -100,6 +117,37 @@ impl CaptureSchedule {
         Ok(Some((add(steps, 1)?, add(first, mul(steps, self.every)?)?)))
     }
 
+    /// Counts eligible prediction coordinates for independently invoked phases.
+    /// A coordinate may be invoked repeatedly; this is not an execution count.
+    pub fn count_coordinates(
+        &self,
+        phase: CapturePhase,
+        next: u64,
+        maximum: u64,
+    ) -> Result<Option<(u64, u64)>, CaptureError> {
+        if self.every == 0 {
+            return Err(CaptureError::Invalid("zero capture frequency".into()));
+        }
+        if !match phase {
+            CapturePhase::Prefill => self.prefill,
+            CapturePhase::Decode => self.decode,
+        } {
+            return Ok(None);
+        }
+        let end = self.end_prediction.unwrap_or(maximum).min(maximum);
+        let lower = self.first_prediction.max(next);
+        if lower >= end {
+            return Ok(None);
+        }
+        let offset = (lower - self.first_prediction).div_ceil(self.every);
+        let first = add(self.first_prediction, mul(offset, self.every)?)?;
+        if first >= end {
+            return Ok(None);
+        }
+        let steps = (end - 1 - first) / self.every;
+        Ok(Some((add(steps, 1)?, add(first, mul(steps, self.every)?)?)))
+    }
+
     /// Whether a phase and prediction are selected by this schedule.
     pub fn includes(&self, phase: CapturePhase, prediction: u64) -> bool {
         (match phase {
@@ -129,6 +177,9 @@ pub struct CaptureSlice {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum CaptureTransform {
+    /// Raw selected expert units with original token/route/expert/coefficient
+    /// identity. Only valid at a declared sparse routed-unit boundary.
+    RoutedUnits,
     /// Row-major prefix; omitted values are explicitly reported as truncated.
     Preview {
         /// Maximum row-major values to materialize.
@@ -150,12 +201,19 @@ pub enum CaptureTransform {
         /// Maximum candidate count, bounded by the vocabulary extent.
         count: u64,
     },
+    /// Selected raw scores and full-model-vocabulary reductions for the last row.
+    TokenScores {
+        /// Unique model output IDs; at most 64. No vocabulary slicing or filtering.
+        token_ids: Vec<u32>,
+    },
 }
 
 /// Portable transformation categories used by capability discovery.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CaptureTransformKind {
+    /// Sparse routed-unit values and original participation coordinates.
+    RoutedUnits,
     /// Bounded row-major tensor prefix.
     Preview,
     /// Axis-selected tensor values.
@@ -168,18 +226,22 @@ pub enum CaptureTransformKind {
     Histogram,
     /// Bounded raw model-score candidates before sampler processing.
     TopCandidates,
+    /// Selected-token score, strongest alternative, full log probability and rank.
+    TokenScores,
 }
 
 impl CaptureTransform {
     /// Transformation category for capability matching.
     pub fn kind(&self) -> CaptureTransformKind {
         match self {
+            Self::RoutedUnits => CaptureTransformKind::RoutedUnits,
             Self::Preview { .. } => CaptureTransformKind::Preview,
             Self::Slice => CaptureTransformKind::Slice,
             Self::FullTensor => CaptureTransformKind::FullTensor,
             Self::Summary => CaptureTransformKind::Summary,
             Self::Histogram { .. } => CaptureTransformKind::Histogram,
             Self::TopCandidates { .. } => CaptureTransformKind::TopCandidates,
+            Self::TokenScores { .. } => CaptureTransformKind::TokenScores,
         }
     }
 }
@@ -321,6 +383,36 @@ impl CapturePlan {
         capabilities: &CaptureCapabilities,
         request: CaptureRequestShape,
     ) -> Result<AdmittedCapturePlan, CaptureError> {
+        self.admit_geometry(catalog, support, capabilities, request, None)
+    }
+
+    /// Admits independently shaped forwards under one cumulative capture budget.
+    /// Exact geometry must be supplied for each invocation before execution.
+    pub fn admit_invocations(
+        self,
+        catalog: &ObservationCatalog,
+        support: &ObservationSupportReport,
+        capabilities: &CaptureCapabilities,
+        bounds: CaptureInvocationBounds,
+    ) -> Result<AdmittedCapturePlan, CaptureError> {
+        bounds.maximum()?;
+        self.admit_geometry(
+            catalog,
+            support,
+            capabilities,
+            bounds.request(),
+            Some(bounds),
+        )
+    }
+
+    fn admit_geometry(
+        self,
+        catalog: &ObservationCatalog,
+        support: &ObservationSupportReport,
+        capabilities: &CaptureCapabilities,
+        request: CaptureRequestShape,
+        invocation_bounds: Option<CaptureInvocationBounds>,
+    ) -> Result<AdmittedCapturePlan, CaptureError> {
         if self.schema_version != CAPTURE_SCHEMA_VERSION
             || catalog.schema_version != crate::DISCOVERY_SCHEMA_VERSION
             || support.schema_version != crate::DISCOVERY_SCHEMA_VERSION
@@ -337,7 +429,9 @@ impl CapturePlan {
                 "batch, prompt, and prediction limits must be positive".into(),
             ));
         }
-        add(request.prompt_tokens, request.max_predictions)?;
+        if invocation_bounds.is_none() {
+            add(request.prompt_tokens, request.max_predictions)?;
+        }
         mul(request.batch, request.prompt_tokens)?;
         let mut ids = std::collections::BTreeSet::new();
         let mut points = Vec::new();
@@ -350,6 +444,18 @@ impl CapturePlan {
             let point = catalog
                 .get(&selection.path)
                 .ok_or_else(|| CaptureError::MissingPath(selection.path.clone()))?;
+            let sparse = matches!(
+                point.value_type,
+                crate::ObservationValueType::RoutedUnits { .. }
+            );
+            if sparse != matches!(selection.transform, CaptureTransform::RoutedUnits) {
+                return Err(CaptureError::Unsupported(
+                    "routed-unit boundaries require the routed_units transform".into(),
+                ));
+            }
+            if let crate::ObservationValueType::RoutedUnits { geometry, .. } = &point.value_type {
+                geometry.components()?;
+            }
             if !capabilities
                 .transformations
                 .contains(&selection.transform.kind())
@@ -378,7 +484,13 @@ impl CapturePlan {
                 (selection.schedule.prefill, &phase_support.prefill),
                 (selection.schedule.decode, &phase_support.decode),
             ] {
-                if enabled && !matches!(status, ObservationSupportStatus::Supported) {
+                if enabled
+                    && !matches!(
+                        status,
+                        ObservationSupportStatus::Supported
+                            | ObservationSupportStatus::Conditional(_)
+                    )
+                {
                     return Err(CaptureError::Unsupported(format!(
                         "{}: {status:?}",
                         selection.path
@@ -429,6 +541,36 @@ impl CapturePlan {
                     }
                 }
             }
+            if let CaptureTransform::TokenScores { token_ids } = &selection.transform {
+                let unique: std::collections::BTreeSet<_> = token_ids.iter().collect();
+                if token_ids.is_empty()
+                    || token_ids.len() > 64
+                    || unique.len() != token_ids.len()
+                    || selection.path != crate::MODEL_LOGITS_OBSERVATION_PATH
+                    || !selection.slices.is_empty()
+                {
+                    return Err(CaptureError::Invalid(
+                        "token scoring requires 1..=64 unique IDs and unsliced model.logits".into(),
+                    ));
+                }
+                if request.batch != 1 {
+                    return Err(CaptureError::Unsupported(
+                        "token scoring requires batch one".into(),
+                    ));
+                }
+                if let Some(SymbolicDimension::Known(vocabulary)) = point
+                    .axes
+                    .as_ref()
+                    .and_then(|axes| axes.last())
+                    .map(|axis| &axis.dimension)
+                {
+                    if token_ids.iter().any(|id| *id as usize >= *vocabulary) {
+                        return Err(CaptureError::Invalid(
+                            "selected score ID exceeds model vocabulary".into(),
+                        ));
+                    }
+                }
+            }
             let mut axes = std::collections::BTreeSet::new();
             for slice in &selection.slices {
                 if slice.stride == 0 || slice.start > slice.end || !axes.insert(&slice.axis) {
@@ -450,10 +592,16 @@ impl CapturePlan {
             // Resolve every known shape before execution, and defer only genuinely
             // runtime-dependent dimensions. Unknown never becomes a zero extent.
             for phase in [CapturePhase::Prefill, CapturePhase::Decode] {
-                if let Some((count, last)) = selection
-                    .schedule
-                    .count_and_last(phase, request.max_predictions)?
-                {
+                let range = if invocation_bounds.is_some() {
+                    selection
+                        .schedule
+                        .count_coordinates(phase, 0, request.max_predictions)?
+                } else {
+                    selection
+                        .schedule
+                        .count_and_last(phase, request.max_predictions)?
+                };
+                if let Some((count, last)) = range {
                     let first = last - mul(count - 1, selection.schedule.every)?;
                     for prediction in [first, last] {
                         for slice in &selection.slices {
@@ -462,8 +610,12 @@ impl CapturePlan {
                                 .as_ref()
                                 .and_then(|axes| axes.iter().find(|axis| axis.name == slice.axis))
                                 .expect("axis was validated");
-                            if request
-                                .extent(&axis.dimension, phase, prediction)?
+                            let geometry = match invocation_bounds {
+                                Some(bounds) => bounds.maximum()?,
+                                None => request.invocation_shape(phase, prediction)?,
+                            };
+                            if geometry
+                                .extent(&axis.dimension)?
                                 .is_some_and(|extent| slice.end > extent)
                             {
                                 return Err(CaptureError::Invalid(format!(
@@ -472,7 +624,11 @@ impl CapturePlan {
                                 )));
                             }
                         }
-                        if let Some(shape) = request.resolve(point, phase, prediction)? {
+                        let geometry = match invocation_bounds {
+                            Some(bounds) => bounds.maximum()?,
+                            None => request.invocation_shape(phase, prediction)?,
+                        };
+                        if let Some(shape) = geometry.resolve(point)? {
                             resolve_slice(point, selection, &shape)?;
                         }
                     }
@@ -481,8 +637,11 @@ impl CapturePlan {
             points.push(point.clone());
         }
         // Identity includes catalog semantics and request shape, not just caller labels.
-        let bytes = serde_json::to_vec(&(&self, &points, request))
-            .map_err(|e| CaptureError::Invalid(e.to_string()))?;
+        let bytes = match invocation_bounds {
+            Some(bounds) => serde_json::to_vec(&("invocation", &self, &points, bounds)),
+            None => serde_json::to_vec(&(&self, &points, request)),
+        }
+        .map_err(|e| CaptureError::Invalid(e.to_string()))?;
         let identity = Sha256::digest(bytes)
             .iter()
             .map(|byte| format!("{byte:02x}"))
@@ -491,6 +650,7 @@ impl CapturePlan {
             plan: self,
             points,
             request,
+            invocation_bounds,
             identity,
         })
     }
@@ -509,29 +669,35 @@ pub struct CaptureRequestShape {
 }
 
 impl CaptureRequestShape {
-    fn extent(
+    /// Checks the architecture-admitted decoder input before executing prefill.
+    /// Media positions count after assembly, not as raw patches or text IDs alone.
+    pub fn validate_prefill(self, batch: u64, sequence: u64) -> Result<(), CaptureError> {
+        if batch == 0 || sequence == 0 || batch != self.batch || sequence != self.prompt_tokens {
+            return Err(CaptureError::Invalid(format!(
+                "prepared prefill geometry [{batch}, {sequence}] differs from admitted [{}, {}]",
+                self.batch, self.prompt_tokens,
+            )));
+        }
+        Ok(())
+    }
+
+    /// Physical geometry of an ordinary prompt or single-row cached forward.
+    pub fn invocation_shape(
         self,
-        dimension: &SymbolicDimension,
         phase: CapturePhase,
         prediction: u64,
-    ) -> Result<Option<u64>, CaptureError> {
-        let sequence = if phase == CapturePhase::Prefill {
-            self.prompt_tokens
-        } else {
-            1
-        };
-        Ok(match dimension {
-            SymbolicDimension::Known(n) => {
-                Some(u64::try_from(*n).map_err(|_| CaptureError::Overflow)?)
-            }
-            SymbolicDimension::Batch => Some(self.batch),
-            SymbolicDimension::Sequence => Some(sequence),
-            SymbolicDimension::TokenRows => Some(mul(self.batch, sequence)?),
-            SymbolicDimension::Context => Some(add(self.prompt_tokens, prediction)?),
-            SymbolicDimension::MediaPositions | SymbolicDimension::Unknown => None,
+    ) -> Result<CaptureInvocationShape, CaptureError> {
+        Ok(CaptureInvocationShape {
+            batch: self.batch,
+            sequence: if phase == CapturePhase::Prefill {
+                self.prompt_tokens
+            } else {
+                1
+            },
+            context: Some(add(self.prompt_tokens, prediction)?),
         })
     }
-    /// Checks every known or request-resolved axis, even when another axis is unknown.
+    /// Checks every known or request-resolved axis, including partially known shapes.
     pub fn validate_actual(
         self,
         point: &ObservationPoint,
@@ -539,50 +705,17 @@ impl CaptureRequestShape {
         prediction: u64,
         shape: &[u64],
     ) -> Result<(), CaptureError> {
-        let Some(axes) = &point.axes else {
-            if shape.len() > 32 {
-                return Err(CaptureError::Unsupported(
-                    "capture rank exceeds the 32-axis metadata bound".into(),
-                ));
-            }
-            return elements(shape).map(|_| ());
-        };
-        if axes.len() != shape.len() {
-            return Err(CaptureError::Invalid(
-                "runtime rank differs from the catalog".into(),
-            ));
-        }
-        for (axis, actual) in axes.iter().zip(shape) {
-            let expected = self.extent(&axis.dimension, phase, prediction)?;
-            if expected.is_some_and(|expected| expected != *actual) {
-                return Err(CaptureError::Invalid(format!(
-                    "runtime extent for {} differs from catalog/request",
-                    axis.name
-                )));
-            }
-        }
-        elements(shape).map(|_| ())
+        self.invocation_shape(phase, prediction)?
+            .validate_actual(point, shape)
     }
-
-    /// Resolves symbolic axes against the request; an unknown extent returns None.
+    /// Resolves symbolic axes against ordinary request geometry.
     pub fn resolve(
         self,
         point: &ObservationPoint,
         phase: CapturePhase,
         prediction: u64,
     ) -> Result<Option<Vec<u64>>, CaptureError> {
-        let Some(axes) = &point.axes else {
-            return Ok(None);
-        };
-        let mut shape = Vec::with_capacity(axes.len());
-        for axis in axes {
-            let Some(extent) = self.extent(&axis.dimension, phase, prediction)? else {
-                return Ok(None);
-            };
-            shape.push(extent);
-        }
-        elements(&shape)?;
-        Ok(Some(shape))
+        self.invocation_shape(phase, prediction)?.resolve(point)
     }
 }
 
@@ -592,6 +725,7 @@ pub struct AdmittedCapturePlan {
     plan: CapturePlan,
     points: Vec<ObservationPoint>,
     request: CaptureRequestShape,
+    invocation_bounds: Option<CaptureInvocationBounds>,
     identity: String,
 }
 
@@ -612,11 +746,65 @@ impl AdmittedCapturePlan {
     pub fn request(&self) -> CaptureRequestShape {
         self.request
     }
+    /// Explicit invocation bounds; absence retains ordinary prompt/decode geometry.
+    pub fn invocation_bounds(&self) -> Option<CaptureInvocationBounds> {
+        self.invocation_bounds
+    }
+    /// Resolves one forward's physical axes under this exact geometry authority.
+    /// An invocation plan requires explicit axes; an ordinary request rejects them.
+    pub fn geometry_at(
+        &self,
+        phase: CapturePhase,
+        prediction: u64,
+        invocation: Option<CaptureInvocationShape>,
+    ) -> Result<CaptureInvocationShape, CaptureError> {
+        match (self.invocation_bounds, invocation) {
+            (Some(bounds), Some(shape)) => {
+                bounds.validate(shape, prediction)?;
+                Ok(shape)
+            }
+            (None, None) => self.request.invocation_shape(phase, prediction),
+            _ => Err(CaptureError::Invalid(
+                "capture invocation authority/geometry mismatch".into(),
+            )),
+        }
+    }
+    /// Revalidates this same geometry authority against current selected discovery.
+    pub fn readmit(&self, discovery: &CaptureDiscovery) -> Result<Self, CaptureError> {
+        self.plan.clone().admit_geometry(
+            &discovery.catalog,
+            &discovery.support,
+            &discovery.support.capture,
+            self.request,
+            self.invocation_bounds,
+        )
+    }
+    /// Static maximum shape for an enabled schedule, preserving ordinary identities.
+    pub fn estimate_shape(
+        &self,
+        point: &ObservationPoint,
+        phase: CapturePhase,
+        prediction: u64,
+    ) -> Result<Option<Vec<u64>>, CaptureError> {
+        match self.invocation_bounds {
+            Some(bounds) => bounds.maximum()?.resolve(point),
+            None => self.request.resolve(point, phase, prediction),
+        }
+    }
     /// Whether this plan captures no observation points.
     pub fn is_empty(&self) -> bool {
         self.plan.selections.is_empty()
     }
 }
+
+mod partition;
+pub use partition::{CaptureFragmentGeometry, CaptureSlicePartition};
+mod partition_wire;
+pub use partition_wire::{
+    PartitionCaptureCombination, PartitionCaptureContext, PartitionCaptureContributionRecord,
+    PartitionCaptureEvidence, PartitionCaptureFragmentRecord, PartitionCaptureProducerRecord,
+    PartitionCaptureRegion, PARTITION_CAPTURE_SCHEMA_VERSION,
+};
 
 /// Numeric axis slices resolved against an actual tensor before any retention/copy.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -727,6 +915,43 @@ pub enum CapturePayload {
     Histogram(CaptureHistogram),
     /// Native top-k extraction with an explicit score-processing stage.
     Candidates(CaptureCandidates),
+    /// Full-distribution reductions; probabilities are never inferred from top-k.
+    TokenScores(CaptureTokenScores),
+    /// Selected routed units with explicit participation; absent experts are not zeros.
+    RoutedUnits(RoutedUnitCapture),
+}
+
+/// One selected token evaluated against the complete raw model distribution.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CaptureTokenScore {
+    /// Exact selected ID and raw F32 score, with separate sampling-domain membership.
+    pub target: CaptureCandidate,
+    /// `score - log(sum(exp(all model scores)))`, using stable full-vocabulary reduction.
+    pub log_probability: f64,
+    /// One plus the count of strictly greater scores. Ties share competition rank.
+    pub rank: u64,
+    /// Highest-scoring different ID, absent only for a vocabulary of one.
+    /// Equal maxima follow native argmax order.
+    pub strongest_alternative: Option<CaptureCandidate>,
+}
+
+/// Bounded selected scores for the final sequence row, before sampler processing.
+/// Normalization includes every model output ID, including tokenizer holes/padding.
+/// Domain membership is evidence only; it does not alter this distribution.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CaptureTokenScores {
+    /// Explicit raw score stage; nonlinear architecture output transforms have already run.
+    pub stage: CandidateScoreStage,
+    /// Original/effective position at this hook, not at earlier component hooks.
+    pub source: CandidateLogitsSource,
+    /// Actual complete model vocabulary width.
+    pub vocabulary: u64,
+    /// Stable log partition over the entire model vocabulary.
+    pub log_partition: f64,
+    /// Results in requested ID order.
+    pub scores: Vec<CaptureTokenScore>,
+    /// Optional tokenizer/constraint information, separate from normalization.
+    pub domain: Option<CandidateDomain>,
 }
 
 /// The processing stage represented by a candidate score.
@@ -891,6 +1116,8 @@ pub enum CaptureFailureReason {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum CaptureSkipReason {
+    /// The selected point does not belong to this explicitly selected invocation.
+    NotInvoked,
     /// The current phase or prediction is not selected.
     Schedule,
     /// A value reservation exceeded its budget.
@@ -918,6 +1145,11 @@ pub struct CaptureRecord {
     pub position: crate::ObservationPosition,
     /// Actual source extents, absent if this point was never reached.
     pub source_shape: Option<Vec<u64>>,
+    /// Actual tensor precision before slicing or host conversion. Floating payloads
+    /// may be exported as F32 even when this is F16/BF16. Absent when unavailable,
+    /// including a deferred observation that was never generated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_dtype: Option<crate::checkpoint::TensorDtype>,
     /// Actual extents after semantic axis slicing.
     pub selected_shape: Option<Vec<u64>>,
     /// Distinguishes captured, truncated, skipped, missing, and failed values.
@@ -926,6 +1158,67 @@ pub struct CaptureRecord {
     pub payload: Option<CapturePayload>,
     /// Conservative reservation charged before capture. Not allocator telemetry.
     pub charged: CaptureUsage,
+}
+
+/// A reservation-only view of capture accounting. Mechanisms cannot reset a step,
+/// replace a ledger, or recover previously consumed credits through this contract.
+pub trait CaptureReservation {
+    /// Reserves work before allocation, evaluation, or transport.
+    fn reserve(&mut self, usage: CaptureUsage) -> Result<Option<CaptureSkipReason>, CaptureError>;
+
+    /// Prepays a move-only allowance. Dropping unused credits never refunds the
+    /// parent. A skipped parent reservation grants no child authority.
+    fn reserve_quota(&mut self, limit: CaptureUsage) -> Result<CaptureQuota, CaptureError> {
+        match self.reserve(limit)? {
+            None => (),
+            Some(CaptureSkipReason::Limit { budget, cumulative }) => {
+                return Err(CaptureError::Limit { budget, cumulative });
+            }
+            Some(_) => {
+                return Err(CaptureError::Invalid(
+                    "invalid quota reservation outcome".into(),
+                ))
+            }
+        }
+        Ok(CaptureQuota {
+            limit,
+            used: CaptureUsage::default(),
+        })
+    }
+}
+
+/// Move-only prepaid capture credits. Sub-reservations consume this allowance;
+/// they never charge or reset the parent ledger a second time. There is no reset,
+/// serialization, cloning, or refund operation, including after failed work.
+#[derive(Debug)]
+pub struct CaptureQuota {
+    limit: CaptureUsage,
+    used: CaptureUsage,
+}
+
+impl CaptureQuota {
+    /// Full nonrefundable charge made to the parent at admission.
+    pub const fn limit(&self) -> CaptureUsage {
+        self.limit
+    }
+    /// Credits consumed by mechanisms or further move-only allowances.
+    pub const fn used(&self) -> CaptureUsage {
+        self.used
+    }
+}
+
+impl CaptureReservation for CaptureQuota {
+    fn reserve(&mut self, usage: CaptureUsage) -> Result<Option<CaptureSkipReason>, CaptureError> {
+        let used = self.used.checked_add(usage)?;
+        if let Some(budget) = used.exceeded(self.limit) {
+            return Err(CaptureError::Limit {
+                budget,
+                cumulative: false,
+            });
+        }
+        self.used = used;
+        Ok(None)
+    }
 }
 
 /// Monotone per-run ledger. Reservations cannot be refunded after work begins.
@@ -1001,6 +1294,12 @@ impl CaptureLedger {
     }
 }
 
+impl CaptureReservation for CaptureLedger {
+    fn reserve(&mut self, usage: CaptureUsage) -> Result<Option<CaptureSkipReason>, CaptureError> {
+        CaptureLedger::reserve(self, usage)
+    }
+}
+
 /// Invalid, unsupported, or oversized capture requests.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum CaptureError {
@@ -1054,8 +1353,78 @@ pub trait CaptureBackend {
     type Tensor;
     /// Backend transformation error.
     type Error: std::error::Error + 'static;
+    /// Cold full-invocation bound for one partitioned sparse fragment, including
+    /// worst-case incoming routes from nonexporting source peers.
+    fn estimate_partition_routed_units(
+        &self,
+        _request: &PartitionRoutedUnitCaptureRequest<'_>,
+    ) -> Result<CaptureUsage, CaptureError> {
+        Err(CaptureError::Unsupported(
+            "partitioned routed-unit collector unavailable".into(),
+        ))
+    }
+    /// Performs one prepaid native chunk, preserving original source coordinates
+    /// and selecting only this fragment's global units from actual local columns.
+    fn capture_partition_routed_units(
+        &mut self,
+        _source: &PartitionRoutedUnitCaptureSource<'_, Self::Tensor>,
+        _request: &PartitionRoutedUnitCaptureRequest<'_>,
+    ) -> Option<Result<RoutedUnitCapture, Self::Error>> {
+        None
+    }
+    /// Cold full-invocation reservation for selected routed units and route
+    /// metadata. Runtime reserves once before any chunk is evaluated or copied.
+    fn estimate_routed_units(
+        &self,
+        _shape: &[u64],
+        _selection: &CaptureSelection,
+        _slice: &ResolvedCaptureSlice,
+    ) -> Result<CaptureUsage, CaptureError> {
+        Err(CaptureError::Unsupported(
+            "routed-unit collector unavailable".into(),
+        ))
+    }
+    /// Performs one prepaid native chunk. Returning None declares a missing
+    /// collector; no fallback may copy an unsliced expert-dense tensor.
+    fn capture_routed_units(
+        &mut self,
+        _source: &RoutedUnitCaptureSource<'_, Self::Tensor>,
+        _geometry: RoutedUnitGeometry,
+        _slice: &ResolvedCaptureSlice,
+    ) -> Option<Result<RoutedUnitCapture, Self::Error>> {
+        None
+    }
     /// Reads tensor shape without evaluation, copying, or retaining the tensor.
     fn shape(&self, tensor: &Self::Tensor) -> Result<Vec<u64>, Self::Error>;
+    /// Reads actual source precision without evaluation, copying, or retention.
+    /// Unknown precision must remain absent, rather than inferred from host output.
+    fn source_dtype(&self, _tensor: &Self::Tensor) -> Option<crate::checkpoint::TensorDtype> {
+        None
+    }
+    /// Cold bound for completing an ordinary source's dependencies on every
+    /// executing partition, including replicas that export no fragment. Includes
+    /// retained source storage and completion resources, but no host tensor copy.
+    /// The default is suitable only for eager backends. Lazy backends must override
+    /// this and `prepare_partition_source` and reject unsupported wait policies.
+    fn estimate_partition_source(
+        &self,
+        _shape: &[u64],
+        _wait: crate::BoundedCompletionWait,
+    ) -> Result<CaptureUsage, CaptureError> {
+        Ok(CaptureUsage::default())
+    }
+    /// Completes prepaid ordinary source dependencies without exporting values.
+    /// For generated capture, runtime supplies the ordinary prototype and never
+    /// invokes a nonexporting replica's factory. On error or deadline, native
+    /// resources and enclosing submission authority must survive until safe
+    /// completion, terminal failure or teardown. A polling error is not completion.
+    fn prepare_partition_source(
+        &mut self,
+        _tensor: &Self::Tensor,
+        _wait: crate::BoundedCompletionWait,
+    ) -> Result<crate::BoundedCompletionOutcome, Self::Error> {
+        Ok(crate::BoundedCompletionOutcome::Completed)
+    }
     /// Computes a conservative reservation without evaluating or retaining the tensor.
     fn estimate(
         &self,
@@ -1063,6 +1432,18 @@ pub trait CaptureBackend {
         selection: &CaptureSelection,
         slice: &ResolvedCaptureSlice,
     ) -> Result<CaptureUsage, CaptureError>;
+    /// Prices the generated tensor's transform using its cold source facts.
+    /// The prototype supplies geometry only. Dtype-dependent estimators must
+    /// override this default; creation storage is charged separately by runtime.
+    fn estimate_generated(
+        &self,
+        prototype: &Self::Tensor,
+        _source: &GeneratedCaptureSource,
+        selection: &CaptureSelection,
+        slice: &ResolvedCaptureSlice,
+    ) -> Result<CaptureUsage, CaptureError> {
+        self.estimate(prototype, selection, slice)
+    }
     /// Performs the reserved transformation without retaining native handles after return.
     fn transform(
         &mut self,
@@ -1072,16 +1453,41 @@ pub trait CaptureBackend {
     ) -> Result<CapturePayload, Self::Error>;
 }
 
-/// One completed step's bounded records. Timing is measured separately from native
-/// forward/sampling time; synchronous callback costs are included in end-to-end time.
+/// Outcome of the enclosing model forward, distinct from each capture operation.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CaptureStepOutcome {
+    /// A low-level caller or older serialized record supplied no transaction evidence.
+    #[default]
+    Untracked,
+    /// The model forward transaction committed. Subsequent sampling can still fail.
+    Committed,
+    /// The model forward transaction aborted. Earlier observations may have completed,
+    /// but they do not describe a committed prediction or authorize state reuse.
+    Aborted,
+}
+
+/// One drained step's bounded records, including diagnostics from aborted forwards.
+/// Timing is measured separately from native forward/sampling time; synchronous
+/// callback costs are included in end-to-end time.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CapturedStep {
+    /// Actual model transaction outcome; absence in older records is untracked.
+    #[serde(default)]
+    pub outcome: CaptureStepOutcome,
     /// Forward phase that produced these captures.
     pub phase: CapturePhase,
+    /// Explicit physical geometry for an independently admitted invocation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub invocation: Option<CaptureInvocationShape>,
     /// Run-relative prediction index; zero is predicted by prefill.
     pub prediction_index: u64,
     /// At most one record for each admitted selection.
     pub records: Vec<CaptureRecord>,
+    /// Verified global ownership and forward provenance for partitioned records.
+    /// Evidence is published only after the enclosing model transaction commits.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub partitions: Vec<PartitionCaptureEvidence>,
     /// Attributed intervention outcomes and optional evidence sharing these budgets.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub interventions: Vec<crate::intervention::InterventionRecord>,

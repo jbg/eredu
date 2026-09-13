@@ -5,15 +5,18 @@ use super::*;
 use eredu_core::{capture::*, intervention::*};
 use safemlx::ops::indexing::{ArrayIndex, IntoStrideBy, TryIndexMutOp};
 
+mod routed;
 #[cfg(test)]
 mod tests;
 
 pub(crate) fn mechanisms() -> InterventionMechanisms {
     InterventionMechanisms {
+        routed_units: true,
         operations: vec![
             InterventionKind::Zero,
             InterventionKind::Scale,
             InterventionKind::Mask,
+            InterventionKind::MaskComponents,
             InterventionKind::Replace,
             InterventionKind::Add,
             InterventionKind::MaskLogits,
@@ -38,6 +41,68 @@ pub(crate) fn mechanisms() -> InterventionMechanisms {
 /// Cold MLX bounds: the same estimator is used at admission and before execution.
 pub(crate) struct NativeInterventionEstimator;
 impl InterventionEstimator for NativeInterventionEstimator {
+    fn partition_routed_unit_usage(
+        &self,
+        geometry: RoutedUnitGeometry,
+        source_tokens: u64,
+        ownership: &RoutedUnitCaptureOwnership,
+        slice: &ResolvedCaptureSlice,
+        action: &InterventionAction,
+    ) -> Result<CaptureUsage, CaptureError> {
+        ownership.validate(geometry)?;
+        action.validate_activation_region(
+            action
+                .dtype()
+                .ok_or_else(|| CaptureError::Invalid("sparse routing action".into()))?,
+            &slice.shape,
+        )?;
+        let rows = ownership.maximum_source_rows(source_tokens, geometry.routes_per_token)?;
+        let routes = mul(
+            rows,
+            if ownership.source_peer.is_some() {
+                1
+            } else {
+                geometry.routes_per_token
+            },
+        )?;
+        let units = ownership.coordinates.units().local_count() as u64;
+        if rows > i32::MAX as u64 || mul(routes, units)? > i32::MAX as u64 {
+            return Err(CaptureError::Unsupported(
+                "MLX sparse partition edit exceeds signed indexing".into(),
+            ));
+        }
+        routed::usage(routes, units, action)
+    }
+    fn routed_unit_usage(
+        &self,
+        geometry: RoutedUnitGeometry,
+        source: &[u64],
+        slice: &ResolvedCaptureSlice,
+        action: &InterventionAction,
+    ) -> Result<CaptureUsage, CaptureError> {
+        if source.len() != 2 || source[1] != geometry.components()? {
+            return Err(CaptureError::Invalid(
+                "invalid sparse edit virtual shape".into(),
+            ));
+        }
+        // The virtual expert axis is never allocated. Native indexing applies to
+        // participating values; lowering and exact payload gathers are host work.
+        let routes = mul(source[0], geometry.routes_per_token)?;
+        let values = mul(routes, geometry.units_per_expert)?;
+        if values > i32::MAX as u64 || source[0] > i32::MAX as u64 {
+            return Err(CaptureError::Unsupported(
+                "MLX sparse edit indexing exceeds i32".into(),
+            ));
+        }
+        action.validate_activation_region(
+            action
+                .dtype()
+                .ok_or_else(|| CaptureError::Invalid("sparse routing action".into()))?,
+            &slice.shape,
+        )?;
+        routed::usage(routes, geometry.units_per_expert, action)
+    }
+
     fn validate_geometry(
         &self,
         source: &[u64],
@@ -56,6 +121,42 @@ impl InterventionEstimator for NativeInterventionEstimator {
             ));
         }
         Ok(())
+    }
+    fn activation_usage(
+        &self,
+        source: &[u64],
+        slice: &ResolvedCaptureSlice,
+        action: &InterventionAction,
+    ) -> Result<CaptureUsage, CaptureError> {
+        // Source/backing retention plus two full update arrays; selected views,
+        // index/update/where arithmetic and possible dtype upload temporaries.
+        let source_elements = elements(source)?;
+        let selected = elements(&slice.shape)?;
+        let width = *source
+            .last()
+            .ok_or_else(|| CaptureError::Invalid("scalar activation edit".into()))?;
+        let payload = match action {
+            InterventionAction::Replace { tensor } | InterventionAction::Add { tensor } => {
+                mul(tensor.values.len() as u64, 4)?
+            }
+            InterventionAction::Mask { keep, .. } => keep.len() as u64,
+            InterventionAction::MaskComponents { .. } | InterventionAction::MaskLogits { .. } => {
+                width
+            }
+            _ => 0,
+        };
+        Ok(CaptureUsage {
+            captures: 0,
+            retained_bytes: add(
+                4096,
+                add(
+                    mul(source_elements, 16)?,
+                    add(mul(selected, 32)?, mul(payload, 2)?)?,
+                )?,
+            )?,
+            host_bytes: add(payload, mul(source.len() as u64, 32)?)?,
+            encoded_bytes: 0,
+        })
     }
     fn capture_usage(
         &self,
@@ -139,14 +240,58 @@ fn native_dtype(dtype: InterventionDtype) -> Dtype {
 }
 
 impl InterventionBackend for NativeCapture<'_> {
-    fn intervention_dtype(&self, tensor: &MlxTensor) -> Result<InterventionDtype, Exception> {
+    fn partition_routed_unit_locations(
+        &mut self,
+        source: &PartitionRoutedUnitCaptureSource<'_, MlxTensor>,
+        geometry: RoutedUnitGeometry,
+    ) -> Option<Result<RoutedUnitLocations, Error>> {
+        Some(routed::partition_locations(source, geometry, self.stream))
+    }
+    fn routed_unit_locations(
+        &mut self,
+        source: &RoutedUnitCaptureSource<'_, MlxTensor>,
+        geometry: RoutedUnitGeometry,
+    ) -> Option<Result<RoutedUnitLocations, Error>> {
+        Some(routed::locations(source, geometry, self.stream))
+    }
+    fn select_elements(
+        &mut self,
+        source: &MlxTensor,
+        indices: &[u64],
+    ) -> Option<Result<MlxTensor, Error>> {
+        Some((|| {
+            let indices = routed::indices(indices)?;
+            Ok(MlxTensor::from_array(
+                source
+                    .as_array()
+                    .reshape(&[-1], self.stream)?
+                    .take(&indices, self.stream)?,
+            ))
+        })())
+    }
+    fn update_elements(
+        &mut self,
+        source: &MlxTensor,
+        indices: &[u64],
+        replacement: &MlxTensor,
+    ) -> Option<Result<MlxTensor, Error>> {
+        Some((|| {
+            let indices = routed::indices(indices)?;
+            let mut flat = source.as_array().reshape(&[-1], self.stream)?;
+            flat.try_index_mut_device(indices, replacement.as_array(), self.stream)?;
+            Ok(MlxTensor::from_array(
+                flat.reshape(source.shape(), self.stream)?,
+            ))
+        })())
+    }
+    fn intervention_dtype(&self, tensor: &MlxTensor) -> Result<InterventionDtype, Error> {
         match tensor.as_array().dtype() {
             Dtype::Float32 => Ok(InterventionDtype::Float32),
             Dtype::Float16 => Ok(InterventionDtype::Float16),
             Dtype::Bfloat16 => Ok(InterventionDtype::Bfloat16),
-            _ => Err(Exception::custom(
-                "activation intervention requires f32, f16, or bf16",
-            )),
+            _ => {
+                Err(Exception::custom("activation intervention requires f32, f16, or bf16").into())
+            }
         }
     }
     fn validate_intervention_geometry(
@@ -160,7 +305,7 @@ impl InterventionBackend for NativeCapture<'_> {
         &mut self,
         tensor: &MlxTensor,
         slice: &ResolvedCaptureSlice,
-    ) -> Result<MlxTensor, Exception> {
+    ) -> Result<MlxTensor, Error> {
         Ok(MlxTensor::from_array(tensor.as_array().try_index_device(
             indices(slice)?.as_slice(),
             self.stream,
@@ -171,7 +316,7 @@ impl InterventionBackend for NativeCapture<'_> {
         tensor: &MlxTensor,
         slice: &ResolvedCaptureSlice,
         replacement: &MlxTensor,
-    ) -> Result<MlxTensor, Exception> {
+    ) -> Result<MlxTensor, Error> {
         let mut output = tensor.as_array().clone();
         output.try_index_mut_device(
             indices(slice)?.as_slice(),
@@ -180,14 +325,14 @@ impl InterventionBackend for NativeCapture<'_> {
         )?;
         Ok(MlxTensor::from_array(output))
     }
-    fn zeros(&mut self, shape: &[u64], dtype: InterventionDtype) -> Result<MlxTensor, Exception> {
+    fn zeros(&mut self, shape: &[u64], dtype: InterventionDtype) -> Result<MlxTensor, Error> {
         Ok(MlxTensor::from_array(safemlx::ops::zeros_dtype(
             &native_shape(shape)?,
             native_dtype(dtype),
             self.stream,
         )?))
     }
-    fn scale(&mut self, value: &MlxTensor, factor: f32) -> Result<MlxTensor, Exception> {
+    fn scale(&mut self, value: &MlxTensor, factor: f32) -> Result<MlxTensor, Error> {
         Ok(MlxTensor::from_array(value.as_array().multiply(
             Array::from(factor).as_dtype(value.as_array().dtype(), self.stream)?,
             self.stream,
@@ -198,7 +343,7 @@ impl InterventionBackend for NativeCapture<'_> {
         value: &MlxTensor,
         keep: &[bool],
         fill: f32,
-    ) -> Result<MlxTensor, Exception> {
+    ) -> Result<MlxTensor, Error> {
         let mask = Array::from_slice(keep, value.shape());
         Ok(MlxTensor::from_array(safemlx::ops::r#where(
             mask,
@@ -207,7 +352,33 @@ impl InterventionBackend for NativeCapture<'_> {
             self.stream,
         )?))
     }
-    fn realize_tensor(&mut self, tensor: &InterventionTensor) -> Result<MlxTensor, Exception> {
+    fn mask_components(
+        &mut self,
+        value: &MlxTensor,
+        ids: &[u32],
+        keep_selected: bool,
+    ) -> Result<MlxTensor, Error> {
+        let width = *value
+            .shape()
+            .last()
+            .ok_or_else(|| Exception::custom("component mask needs a final axis"))?;
+        let mut keep = vec![!keep_selected; width as usize];
+        for id in ids {
+            keep[*id as usize] = keep_selected;
+        }
+        let mask = safemlx::ops::broadcast_to(
+            Array::from_slice(&keep, &[width]),
+            value.shape(),
+            self.stream,
+        )?;
+        Ok(MlxTensor::from_array(safemlx::ops::r#where(
+            mask,
+            value.as_array(),
+            Array::from(0.0f32).as_dtype(value.as_array().dtype(), self.stream)?,
+            self.stream,
+        )?))
+    }
+    fn realize_tensor(&mut self, tensor: &InterventionTensor) -> Result<MlxTensor, Error> {
         let shape = native_shape(&tensor.shape)?;
         let array = match &tensor.values {
             InterventionValues::Float32(values) => Array::from_slice(values, &shape),
@@ -230,7 +401,7 @@ impl InterventionBackend for NativeCapture<'_> {
         };
         Ok(MlxTensor::from_array(array))
     }
-    fn add(&mut self, left: &MlxTensor, right: &MlxTensor) -> Result<MlxTensor, Exception> {
+    fn add(&mut self, left: &MlxTensor, right: &MlxTensor) -> Result<MlxTensor, Error> {
         Ok(MlxTensor::from_array(
             left.as_array().add(right.as_array(), self.stream)?,
         ))
@@ -240,7 +411,7 @@ impl InterventionBackend for NativeCapture<'_> {
         value: &MlxTensor,
         ids: &[u32],
         fill: f32,
-    ) -> Result<MlxTensor, Exception> {
+    ) -> Result<MlxTensor, Error> {
         let vocabulary = *value
             .shape()
             .last()

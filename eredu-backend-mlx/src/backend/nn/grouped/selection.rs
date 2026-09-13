@@ -389,35 +389,16 @@ impl TopKGroupSelector {
         let logits = self.project_logits(hidden_states, stream)?;
         let scores = self.apply_scores(logits, hidden_states.dtype(), stream)?;
         let group_indices = group_indices.reshape(&[-1, self.top_k], stream)?;
-        let mut weights = take_along_axis(scores, &group_indices, -1, stream)?;
-        if self.score_function == TopKGroupScoring::SelectedSoftmax {
-            weights = softmax_axis(&weights, -1, true, stream)?;
-        }
-        let selected_scores = weights.clone();
-        if self.norm_topk_prob {
-            let denominator = weights
-                .sum_axis(-1, true, stream)?
-                .add(Array::from_f32(self.normalization_epsilon), stream)?;
-            weights = weights.divide(denominator, stream)?;
-        }
-        if self.coefficient_scale != 1.0 {
-            weights = weights.multiply(Array::from_f32(self.coefficient_scale), stream)?;
-        }
-        if let Some(scale) = self.learned_coefficient_scale.as_ref() {
-            weights = weights.multiply(scale.take_axis(&group_indices, 0, stream)?, stream)?;
-        }
-        Ok(GroupSelectionOutput {
-            indices: group_indices,
-            scores: selected_scores,
-            weights: weights.as_dtype(
-                routing_dtype(
-                    self.arithmetic.coefficients,
-                    hidden_states.dtype(),
-                    weights.dtype(),
-                ),
-                stream,
-            )?,
-        })
+        let mut output = self.weights_for_indices(&scores, group_indices, stream)?;
+        output.weights = output.weights.as_dtype(
+            routing_dtype(
+                self.arithmetic.coefficients,
+                hidden_states.dtype(),
+                output.weights.dtype(),
+            ),
+            stream,
+        )?;
+        Ok(output)
     }
 
     fn apply_scores(
@@ -437,7 +418,11 @@ impl TopKGroupSelector {
 
     fn project_logits(&self, hidden_states: &Array, stream: &Stream) -> Result<Array, Exception> {
         let flat = self.transform_input(hidden_states, stream)?;
-        let logits = if let Some(iquant) = self.iquant {
+        let floating = matches!(
+            self.weight.as_ref().dtype(),
+            Dtype::Float32 | Dtype::Float16 | Dtype::Bfloat16
+        );
+        let logits = if let Some(iquant) = self.iquant.filter(|_| !floating) {
             let (ggml_type, endian) = iquant.gguf_iquant().expect("IQ selector format");
             NativeQuantizedTensor::from_iq_array(
                 self.weight.value.clone(),
@@ -446,7 +431,7 @@ impl TopKGroupSelector {
                 endian,
             )?
             .linear(&flat, true, stream)?
-        } else if let Some(scales) = self.scales.as_ref() {
+        } else if let Some(scales) = self.scales.as_ref().as_ref().filter(|_| !floating) {
             let input = if self.arithmetic.projection == RoutingPrecision::Float32 {
                 flat.as_dtype(Dtype::Float32, stream)?
             } else {
@@ -510,11 +495,7 @@ impl TopKGroupSelector {
         }
         let selected_scores = top_k_weights.clone();
         if self.norm_topk_prob {
-            let mut denominator =
-                match super::super::normalization::f32_sum_last(&top_k_weights, stream)? {
-                    Some(value) => value,
-                    None => sum_axis(&top_k_weights, -1, true, stream)?,
-                };
+            let mut denominator = routing_sum_last(&top_k_weights, stream)?;
             if self.normalization_epsilon != 0.0 {
                 denominator =
                     denominator.add(Array::from_f32(self.normalization_epsilon), stream)?;
@@ -703,6 +684,22 @@ fn routing_dtype(precision: RoutingPrecision, input: Dtype, current: Dtype) -> D
         RoutingPrecision::Input => input,
         RoutingPrecision::Float32 => Dtype::Float32,
     }
+}
+
+fn routing_sum_last(input: &Array, stream: &Stream) -> Result<Array, Exception> {
+    let dtype = input.dtype();
+    // Reduced-precision normalization rounds the completed reduction, rather
+    // than every internal addition. The following epsilon/division boundaries
+    // still consume the architecture-selected score dtype.
+    let work = match dtype {
+        Dtype::Bfloat16 | Dtype::Float16 => input.as_dtype(Dtype::Float32, stream)?,
+        _ => input.clone(),
+    };
+    let sum = match super::super::normalization::f32_sum_last(&work, stream)? {
+        Some(value) => value,
+        None => sum_axis(&work, -1, true, stream)?,
+    };
+    sum.as_dtype(dtype, stream)
 }
 
 #[test]

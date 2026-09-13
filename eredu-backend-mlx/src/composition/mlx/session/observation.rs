@@ -2,6 +2,8 @@ use super::*;
 
 pub(super) struct ArrayObserverAdapter<'a, O: ?Sized> {
     pub(super) inner: &'a mut O,
+    pub(super) routed_path: Option<String>,
+    pub(super) routed_invocation_active: bool,
 }
 
 pub(super) struct InspectionCollector<'a> {
@@ -31,22 +33,35 @@ impl<'a> InspectionCollector<'a> {
                     path,
                     ObservationValue::Tensor(observe_tensor(&value, stream)?),
                 )
-                .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+                .map_err(Error::observation)?;
         }
         Ok(observations)
     }
 }
 
-impl RuntimeActivationObserver<MlxTensor, Exception> for InspectionCollector<'_> {
-    fn observe(&mut self, path: &str, value: &MlxTensor) -> Result<(), Exception> {
+impl RuntimeActivationObserver<MlxTensor, Error> for InspectionCollector<'_> {
+    fn observe(&mut self, path: &str, value: &MlxTensor) -> Result<(), Error> {
         self.capture(path, value);
+        Ok(())
+    }
+
+    fn observe_generated(
+        &mut self,
+        path: &str,
+        _: &MlxTensor,
+        _: &eredu_core::capture::GeneratedCaptureSource,
+        generate: &mut dyn FnMut() -> Result<MlxTensor, Error>,
+    ) -> Result<(), Error> {
+        if self.request.matches(path) {
+            self.capture(path, &generate()?);
+        }
         Ok(())
     }
 
     fn observe_routing(
         &mut self,
         routing: eredu_runtime::RoutingObservation<'_, MlxTensor>,
-    ) -> Result<(), Exception> {
+    ) -> Result<(), Error> {
         routing.for_each_tensor(|path, value| self.capture(&path, value));
         Ok(())
     }
@@ -87,8 +102,7 @@ pub(super) fn observe_tensor(
                 ))
             }
         };
-        return TensorObservation::new(shape, data)
-            .map_err(|error| Error::ArchitectureModel(error.to_string()));
+        return TensorObservation::new(shape, data).map_err(Error::observation);
     }
     let data = match value.as_array().dtype() {
         Dtype::Bool => {
@@ -169,18 +183,58 @@ pub(super) fn observe_tensor(
             ))
         }
     };
-    TensorObservation::new(shape, data).map_err(|error| Error::ArchitectureModel(error.to_string()))
+    TensorObservation::new(shape, data).map_err(Error::observation)
 }
 
-impl<O> RuntimeActivationObserver<Array, Exception> for ArrayObserverAdapter<'_, O>
+impl<O> RuntimeActivationObserver<Array, Error> for ArrayObserverAdapter<'_, O>
 where
-    O: RuntimeActivationObserver<MlxTensor, Exception> + ?Sized,
+    O: RuntimeActivationObserver<MlxTensor, Error> + ?Sized,
 {
+    fn routed_unit_observer(
+        &mut self,
+        path: &str,
+    ) -> Result<Option<&mut dyn eredu_runtime::RoutedUnitObserver<Array>>, Error> {
+        let Some(observer) = self.inner.routed_unit_observer(path)? else {
+            self.routed_path = None;
+            self.routed_invocation_active = false;
+            return Ok(None);
+        };
+        self.routed_invocation_active = observer.invocation_active();
+        if self.routed_path.as_deref() != Some(path) {
+            self.routed_path = Some(path.into());
+        }
+        Ok(Some(self))
+    }
+    fn transactional(&self) -> bool {
+        self.inner.transactional()
+    }
+    fn prepare_transaction(
+        &mut self,
+        epoch: eredu_core::DistributedCommitEpoch,
+        pass: eredu_runtime::ExpertPass,
+    ) -> Result<(), Error> {
+        self.inner.prepare_transaction(epoch, pass)
+    }
+    fn coordinate_transaction(
+        &mut self,
+        epoch: eredu_core::DistributedCommitEpoch,
+    ) -> Result<(), Error> {
+        self.inner.coordinate_transaction(epoch)
+    }
+    fn complete_transaction(
+        &mut self,
+        epoch: eredu_core::DistributedCommitEpoch,
+    ) -> Result<(), Error> {
+        self.inner.complete_transaction(epoch)
+    }
+    fn finish_transaction(&mut self, epoch: eredu_core::DistributedCommitEpoch, committed: bool) {
+        self.inner.finish_transaction(epoch, committed)
+    }
     fn routing_control(
         &mut self,
         path: &str,
         rows: u64,
-    ) -> Result<Option<eredu_nn::routing_intervention::GroupSelectionControl>, Exception> {
+    ) -> Result<Option<eredu_nn::routing_intervention::GroupSelectionControl>, Error> {
         self.inner.routing_control(path, rows)
     }
 
@@ -189,7 +243,7 @@ where
         path: &str,
         original: Option<eredu_runtime::RoutingDecision<'_, Array>>,
         effective: eredu_runtime::RoutingDecision<'_, Array>,
-    ) -> Result<(), Exception> {
+    ) -> Result<(), Error> {
         self.inner.routing_applied(
             path,
             original.map(|value| eredu_runtime::RoutingDecision {
@@ -207,11 +261,27 @@ where
         self.inner.routing_failed(path, message);
     }
 
-    fn observe(&mut self, path: &str, value: &Array) -> Result<(), Exception> {
+    fn observe(&mut self, path: &str, value: &Array) -> Result<(), Error> {
         self.inner.observe(path, MlxTensor::ref_cast(value))
     }
+    fn observe_replica(&mut self, path: &str, value: &Array) -> Result<(), Error> {
+        self.inner.observe_replica(path, MlxTensor::ref_cast(value))
+    }
 
-    fn intervene(&mut self, path: &str, value: &Array) -> Result<Option<Array>, Exception> {
+    fn observe_generated(
+        &mut self,
+        path: &str,
+        prototype: &Array,
+        source: &eredu_core::capture::GeneratedCaptureSource,
+        generate: &mut dyn FnMut() -> Result<Array, Error>,
+    ) -> Result<(), Error> {
+        self.inner
+            .observe_generated(path, MlxTensor::ref_cast(prototype), source, &mut || {
+                generate().map(MlxTensor::from_array)
+            })
+    }
+
+    fn intervene(&mut self, path: &str, value: &Array) -> Result<Option<Array>, Error> {
         self.inner
             .intervene(path, MlxTensor::ref_cast(value))
             .map(|replacement| replacement.map(MlxTensor::into_array))
@@ -220,7 +290,7 @@ where
     fn observe_routing(
         &mut self,
         routing: eredu_runtime::RoutingObservation<'_, Array>,
-    ) -> Result<(), Exception> {
+    ) -> Result<(), Error> {
         self.inner
             .observe_routing(eredu_runtime::RoutingObservation {
                 path: routing.path,
@@ -236,3 +306,105 @@ where
             })
     }
 }
+
+impl<O: RuntimeActivationObserver<MlxTensor, Error> + ?Sized>
+    eredu_runtime::RoutedUnitObserver<Array> for ArrayObserverAdapter<'_, O>
+{
+    fn begin_invocation(
+        &mut self,
+        invocation: &eredu_runtime::RoutedUnitInvocation<'_, Array>,
+    ) -> Result<(), eredu_nn::Error> {
+        self.routed_invocation_active = true;
+        let path = self
+            .routed_path
+            .as_deref()
+            .ok_or_else(|| eredu_nn::Error::backend("missing array routed observer path"))?;
+        match self
+            .inner
+            .routed_unit_observer(path)
+            .map_err(eredu_nn::Error::backend_source)?
+        {
+            Some(observer) => observer.begin_invocation(&eredu_runtime::RoutedUnitInvocation {
+                input: MlxTensor::ref_cast(invocation.input),
+                origins: invocation.origins,
+                unit_coordinates: invocation.unit_coordinates,
+            }),
+            None => Ok(()),
+        }
+    }
+    fn finish_invocation(&mut self, success: bool) -> Result<(), eredu_nn::Error> {
+        self.routed_invocation_active = false;
+        let path = self
+            .routed_path
+            .as_deref()
+            .ok_or_else(|| eredu_nn::Error::backend("missing array routed observer path"))?;
+        match self
+            .inner
+            .routed_unit_observer(path)
+            .map_err(eredu_nn::Error::backend_source)?
+        {
+            Some(observer) => observer.finish_invocation(success),
+            None => Ok(()),
+        }
+    }
+    fn invocation_active(&self) -> bool {
+        self.routed_invocation_active
+    }
+    fn observe(
+        &mut self,
+        batch: &eredu_runtime::RoutedUnitBatch<'_, Array>,
+    ) -> Result<(), eredu_nn::Error> {
+        let path = self
+            .routed_path
+            .as_deref()
+            .ok_or_else(|| eredu_nn::Error::backend("missing array routed observer path"))?;
+        match self
+            .inner
+            .routed_unit_observer(path)
+            .map_err(eredu_nn::Error::backend_source)?
+        {
+            Some(observer) => observer.observe(&batch.map_tensors(MlxTensor::ref_cast)),
+            None => Ok(()),
+        }
+    }
+    fn intervene(
+        &mut self,
+        batch: &eredu_runtime::RoutedUnitBatch<'_, Array>,
+    ) -> Result<Option<Array>, eredu_nn::Error> {
+        let path = self
+            .routed_path
+            .as_deref()
+            .ok_or_else(|| eredu_nn::Error::backend("missing array routed observer path"))?;
+        match self
+            .inner
+            .routed_unit_observer(path)
+            .map_err(eredu_nn::Error::backend_source)?
+        {
+            Some(observer) => observer
+                .intervene(&batch.map_tensors(MlxTensor::ref_cast))
+                .map(|value| value.map(MlxTensor::into_array)),
+            None => Ok(None),
+        }
+    }
+    fn observe_effective(
+        &mut self,
+        batch: &eredu_runtime::RoutedUnitBatch<'_, Array>,
+    ) -> Result<(), eredu_nn::Error> {
+        let path = self
+            .routed_path
+            .as_deref()
+            .ok_or_else(|| eredu_nn::Error::backend("missing array routed observer path"))?;
+        match self
+            .inner
+            .routed_unit_observer(path)
+            .map_err(eredu_nn::Error::backend_source)?
+        {
+            Some(observer) => observer.observe_effective(&batch.map_tensors(MlxTensor::ref_cast)),
+            None => Ok(()),
+        }
+    }
+}
+
+#[cfg(test)]
+#[path = "observation/tests.rs"]
+mod tests;

@@ -141,15 +141,9 @@ impl PartitionLocalGeometry {
             expected_roles.push("embedding".into());
         }
         if self.text_units.end == text_count {
-            expected_roles.push("norm".into());
-            let output = if args.text.tie_word_embeddings {
-                "embedding"
-            } else {
-                "output"
-            };
-            if !expected_roles.iter().any(|role| role == output) {
-                expected_roles.push(output.into());
-            }
+            // Roles describe execution consumers. A tied readout still owns
+            // the output role; its parameter group aliases the embedding.
+            expected_roles.extend(["norm".into(), "output".into()]);
         }
         if self.static_roles != expected_roles {
             return Err(invalid(format!(

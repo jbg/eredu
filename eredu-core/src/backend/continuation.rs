@@ -227,9 +227,15 @@ impl<'a, B: TextGenerationBackend> TextGenerationDriver<'a, B> {
         &mut self,
         state: &mut TextGenerationContinuation<B, C>,
         plan: crate::capture::AdmittedCapturePlan,
-    ) -> Result<(), crate::capture::CaptureError> {
-        self.validate_installation(state)?;
-        B::configure_text_capture(self.runtime, &mut state.inner.backend_state, plan)
+    ) -> Result<(), crate::run_preparation::TextCaptureSetupError> {
+        let local = self.validate_installation(state).and_then(|()| {
+            B::configure_text_capture(self.runtime, &mut state.inner.backend_state, plan)
+        });
+        self.runtime.finish_text_preparation(
+            crate::run_preparation::TextPreparationStage::Instrumentation,
+            local.map_err(crate::run_preparation::TextCaptureSetupError::Capture),
+            crate::run_preparation::TextCaptureSetupError::Preparation,
+        )
     }
 
     /// Installs immutable observation/intervention admissions before execution.
@@ -238,9 +244,20 @@ impl<'a, B: TextGenerationBackend> TextGenerationDriver<'a, B> {
         state: &mut TextGenerationContinuation<B, C>,
         capture: crate::capture::AdmittedCapturePlan,
         plan: crate::intervention::AdmittedInterventionPlan,
-    ) -> Result<(), crate::capture::CaptureError> {
-        self.validate_installation(state)?;
-        B::configure_text_interventions(self.runtime, &mut state.inner.backend_state, capture, plan)
+    ) -> Result<(), crate::run_preparation::TextCaptureSetupError> {
+        let local = self.validate_installation(state).and_then(|()| {
+            B::configure_text_interventions(
+                self.runtime,
+                &mut state.inner.backend_state,
+                capture,
+                plan,
+            )
+        });
+        self.runtime.finish_text_preparation(
+            crate::run_preparation::TextPreparationStage::Instrumentation,
+            local.map_err(crate::run_preparation::TextCaptureSetupError::Capture),
+            crate::run_preparation::TextCaptureSetupError::Preparation,
+        )
     }
 
     fn validate_installation<C: TokenFilterController>(

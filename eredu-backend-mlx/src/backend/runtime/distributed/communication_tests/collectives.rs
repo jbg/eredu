@@ -3,8 +3,26 @@ use super::*;
 #[test]
 #[ignore = "spawns four local Ring ranks and opens loopback sockets; run explicitly"]
 fn ring_overlapping_tp_pp_subgroups_use_exact_logical_membership() {
+    run_subgroup_workers(
+        4,
+        "backend::runtime::distributed::communication_tests::subgroup_wave_worker",
+        SUBGROUP_WAVE_WORKER_RANK,
+    );
+}
+
+#[test]
+#[ignore = "spawns eight local Ring ranks and opens loopback sockets; run explicitly"]
+fn ring_logical_world_collectives_preserve_order_across_independent_branches() {
+    run_subgroup_workers(
+        8,
+        "backend::runtime::distributed::communication_tests::ordered_wave::worker",
+        ordered_wave::WORKER_RANK,
+    );
+}
+
+fn run_subgroup_workers(world: usize, worker: &str, worker_rank: &str) {
     assert!(distributed::is_available(Backend::Ring));
-    let sockets = (0..4)
+    let sockets = (0..world)
         .map(|_| TcpListener::bind(("127.0.0.1", 0)).unwrap())
         .collect::<Vec<_>>();
     let ports = sockets
@@ -15,25 +33,24 @@ fn ring_overlapping_tp_pp_subgroups_use_exact_logical_membership() {
     let hostfile = ring.path().join("ring-hosts.json");
     std::fs::write(
         &hostfile,
-        format!(
-            "[[\"127.0.0.1:{}\"],[\"127.0.0.1:{}\"],[\"127.0.0.1:{}\"],[\"127.0.0.1:{}\"]]",
-            ports[0], ports[1], ports[2], ports[3]
-        ),
+        serde_json::to_vec(
+            &ports
+                .iter()
+                .map(|port| vec![format!("127.0.0.1:{port}")])
+                .collect::<Vec<_>>(),
+        )
+        .unwrap(),
     )
     .unwrap();
     drop(sockets);
 
     let executable = std::env::current_exe().unwrap();
-    let mut children = Children(Vec::with_capacity(4));
-    for rank in 0..4 {
+    let mut children = Children(Vec::with_capacity(world));
+    for rank in 0..world {
         children.0.push(
             Command::new(&executable)
-                .args([
-                    "--exact",
-                    "backend::runtime::distributed::communication_tests::subgroup_wave_worker",
-                    "--nocapture",
-                ])
-                .env(SUBGROUP_WAVE_WORKER_RANK, rank.to_string())
+                .args(["--exact", worker, "--nocapture"])
+                .env(worker_rank, rank.to_string())
                 .env("MLX_RANK", rank.to_string())
                 .env("MLX_HOSTFILE", &hostfile)
                 .env_remove("MLX_RING_VERBOSE")
@@ -82,7 +99,7 @@ fn ring_overlapping_tp_pp_subgroups_use_exact_logical_membership() {
         .collect::<Vec<_>>();
     assert!(
         failures.is_empty() && !timed_out,
-        "four-process overlapping subgroup Ring failed (timed_out={timed_out}):\n{}",
+        "{world}-process overlapping subgroup Ring failed (timed_out={timed_out}):\n{}",
         failures.join("\n\n")
     );
 }

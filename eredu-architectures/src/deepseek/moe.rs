@@ -31,6 +31,7 @@ pub struct MoePolicy {
     pub expert_groups: i32,
     pub selected_groups: i32,
     pub router_weight: String,
+    pub router_format: LinearFormat,
     pub correction_bias: Option<String>,
     pub expert_gate_up: String,
     pub expert_down: String,
@@ -69,6 +70,8 @@ pub struct RoutedPlusShared<B: GroupedNeuralBackend + eredu_nn::DistributedNeura
     shared_down: B::Linear,
     #[parameter(skip)]
     shared_limit: Option<GatedProductPolicy>,
+    #[parameter(skip)]
+    resident_unit_coordinates: Option<(eredu_core::component::ComponentCoordinateMap, bool)>,
 }
 
 #[allow(missing_docs)]
@@ -100,7 +103,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> RoutedPlusSha
             parameter(&policy.router_weight)?,
             crate::linear_format::standard_linear_format(
                 &policy.router_weight,
-                eredu_checkpoint::LinearFormat::Dense,
+                policy.router_format,
             )?,
             routing,
         )?;
@@ -150,7 +153,17 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> RoutedPlusSha
                 policy.shared_down_format,
             )?,
             shared_limit: policy.shared_limit,
+            resident_unit_coordinates: None,
         })
+    }
+
+    /// Binds the scalar order compiled for an independently resident prediction bank.
+    pub(crate) fn bind_resident_unit_coordinates(
+        &mut self,
+        coordinates: eredu_core::component::ComponentCoordinateMap,
+        partitioned: bool,
+    ) {
+        self.resident_unit_coordinates = Some((coordinates, partitioned));
     }
 
     pub fn forward(
@@ -209,6 +222,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> RoutedPlusSha
             .forward_grouped_tensor_parallel(
                 &mut self.experts,
                 RoutedExpertRequest {
+                    unit_observer: None,
                     bank: eredu_runtime::RoutedBankId::new(0),
                     layer: self.layer,
                     input,
@@ -218,11 +232,26 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> RoutedPlusSha
                 1,
                 context,
             )
-            .map_err(Error::backend)?;
-        let gate = self.shared_gate.forward(input, context)?;
-        let up = self.shared_up.forward(input, context)?;
-        let shared = B::gated_product(gate, up, self.shared_limit.unwrap_or_default(), context)?;
-        let shared = self.shared_down.forward(&shared, context)?;
+            .map_err(Error::backend_source)?;
+        let shared = self.forward_shared(
+            input,
+            context,
+            &mut crate::decoder::ComponentInstrumentation::disabled(),
+        )?;
+        Self::combine_tensor_parallel(routed, shared, context, &mut reduce)
+    }
+
+    // Keep the ordinary fused reduction and literal post-reduction bias identical
+    // for observed and unobserved execution.
+    fn combine_tensor_parallel<F>(
+        routed: eredu_runtime::RoutedExpertTensorParallelOutput<B::Tensor>,
+        shared: B::Tensor,
+        context: &<B::Tensor as Tensor>::Context,
+        reduce: &mut F,
+    ) -> Result<B::Tensor, Error>
+    where
+        F: FnMut(B::Tensor, &<B::Tensor as Tensor>::Context) -> Result<B::Tensor, Error>,
+    {
         match routed {
             eredu_runtime::RoutedExpertTensorParallelOutput::Complete(routed) => {
                 routed.add(&reduce(shared, context)?, context)
@@ -236,6 +265,146 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> RoutedPlusSha
                 }
             }
         }
+    }
+
+    /// Observes actual routed units and shared scalar/write terms before the
+    /// ordinary fused TP reduction. Shared write/output callbacks are additive
+    /// terms, as declared by the architecture placement. The combined output is
+    /// complete. No separately reduced routed/shared diagnostic tensor is made.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_tensor_parallel_with_provider_observed<P, O, F>(
+        &mut self,
+        path: &str,
+        input: &B::Tensor,
+        source: RouteSource<'_, B::Tensor>,
+        pass: ExpertPass,
+        provider: &mut P,
+        context: &<B::Tensor as Tensor>::Context,
+        observer: &mut O,
+        reduce: F,
+    ) -> Result<B::Tensor, Error>
+    where
+        P: TensorParallelRoutedExpertProvider<B>,
+        P::Error: std::fmt::Display,
+        O: ActivationObserver<B::Tensor, Error> + ?Sized,
+        F: FnMut(B::Tensor, &<B::Tensor as Tensor>::Context) -> Result<B::Tensor, Error>,
+    {
+        self.forward_tensor_parallel_observed(
+            path,
+            input,
+            source,
+            pass,
+            context,
+            observer,
+            reduce,
+            |experts, request| {
+                provider.forward_grouped_tensor_parallel(experts, request, 1, context)
+            },
+        )
+    }
+
+    /// Observes the ordinary resident-bank TP equation without requiring the
+    /// separate provider TP mechanism. The ordinary local expert output joins
+    /// the shared term before the same single reduction used by that path.
+    pub(crate) fn forward_tensor_parallel_resident_observed<O, F>(
+        &mut self,
+        path: &str,
+        input: &B::Tensor,
+        source: RouteSource<'_, B::Tensor>,
+        pass: ExpertPass,
+        context: &<B::Tensor as Tensor>::Context,
+        observer: &mut O,
+        reduce: F,
+    ) -> Result<B::Tensor, Error>
+    where
+        O: ActivationObserver<B::Tensor, Error> + ?Sized,
+        F: FnMut(B::Tensor, &<B::Tensor as Tensor>::Context) -> Result<B::Tensor, Error>,
+    {
+        self.forward_tensor_parallel_observed(
+            path,
+            input,
+            source,
+            pass,
+            context,
+            observer,
+            reduce,
+            |experts, request| {
+                <ResidentExpertProvider as RoutedExpertProvider<B>>::forward_grouped(
+                    &mut ResidentExpertProvider,
+                    experts,
+                    request,
+                    context,
+                )
+                .map(|value| {
+                    eredu_runtime::RoutedExpertTensorParallelOutput::Partial(
+                        eredu_nn::TensorParallelGroupedOutput::new(value, None),
+                    )
+                })
+            },
+        )
+    }
+
+    fn forward_tensor_parallel_observed<O, F, E>(
+        &mut self,
+        path: &str,
+        input: &B::Tensor,
+        source: RouteSource<'_, B::Tensor>,
+        pass: ExpertPass,
+        context: &<B::Tensor as Tensor>::Context,
+        observer: &mut O,
+        mut reduce: F,
+        execute: impl FnOnce(
+            &mut B::GatedProductGroups,
+            RoutedExpertRequest<'_, '_, B::Tensor>,
+        )
+            -> Result<eredu_runtime::RoutedExpertTensorParallelOutput<B::Tensor>, E>,
+    ) -> Result<B::Tensor, Error>
+    where
+        O: ActivationObserver<B::Tensor, Error> + ?Sized,
+        F: FnMut(B::Tensor, &<B::Tensor as Tensor>::Context) -> Result<B::Tensor, Error>,
+        E: std::error::Error + Send + Sync + 'static,
+    {
+        let routes = match source {
+            RouteSource::Learned => eredu_runtime::select_routes_with_observer(
+                &mut self.router,
+                input,
+                context,
+                path,
+                observer,
+            )?,
+            RouteSource::Selected(ids) => self.router.select_indices(input, ids, context)?,
+        };
+        let routed = eredu_runtime::with_routed_unit_observer(
+            observer,
+            path,
+            RoutedExpertRequest {
+                unit_observer: None,
+                bank: eredu_runtime::RoutedBankId::new(0),
+                layer: self.layer,
+                input,
+                routes: &routes,
+                pass,
+            },
+            |request| {
+                eredu_runtime::with_resident_unit_coordinates(
+                    self.resident_unit_coordinates.as_ref(),
+                    request,
+                    |request| execute(&mut self.experts, request),
+                )
+            },
+        )
+        .map_err(eredu_runtime::ObservedExpertProviderError::into_neural_error)?;
+        let shared = {
+            let path = format!("{path}.shared");
+            let mut borrowed = eredu_runtime::BorrowedActivationObserver(observer);
+            let mut instrumentation =
+                crate::decoder::ComponentInstrumentation::new(&path, &mut borrowed);
+            let shared = self.forward_shared(input, context, &mut instrumentation)?;
+            let shared = instrumentation.apply("write", shared)?;
+            instrumentation.apply("output", shared)?
+        };
+        let combined = Self::combine_tensor_parallel(routed, shared, context, &mut reduce)?;
+        observe_and_intervene(observer, &format!("{path}.output"), &combined)
     }
 
     /// Executes routed/shared experts with normalized route observation and a
@@ -266,23 +435,35 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> RoutedPlusSha
             )?,
             RouteSource::Selected(ids) => self.router.select_indices(input, ids, context)?,
         };
-        let routed = provider
-            .forward_grouped(
-                &mut self.experts,
-                RoutedExpertRequest {
-                    bank: eredu_runtime::RoutedBankId::new(0),
-                    layer: self.layer,
-                    input,
-                    routes: &routes,
-                    pass,
-                },
-                context,
-            )
-            .map_err(Error::backend)?;
-        let gate = self.shared_gate.forward(input, context)?;
-        let up = self.shared_up.forward(input, context)?;
-        let shared = B::gated_product(gate, up, self.shared_limit.unwrap_or_default(), context)?;
-        let shared = self.shared_down.forward(&shared, context)?;
+        let routed = eredu_runtime::with_routed_unit_observer(
+            observer,
+            path,
+            RoutedExpertRequest {
+                unit_observer: None,
+                bank: eredu_runtime::RoutedBankId::new(0),
+                layer: self.layer,
+                input,
+                routes: &routes,
+                pass,
+            },
+            |request| {
+                eredu_runtime::with_resident_unit_coordinates(
+                    self.resident_unit_coordinates.as_ref(),
+                    request,
+                    |request| provider.forward_grouped(&mut self.experts, request, context),
+                )
+            },
+        )
+        .map_err(eredu_runtime::ObservedExpertProviderError::into_neural_error)?;
+        let shared = {
+            let path = format!("{path}.shared");
+            let mut borrowed = eredu_runtime::BorrowedActivationObserver(observer);
+            let mut instrumentation =
+                crate::decoder::ComponentInstrumentation::new(&path, &mut borrowed);
+            let shared = self.forward_shared(input, context, &mut instrumentation)?;
+            let shared = instrumentation.apply("write", shared)?;
+            instrumentation.apply("output", shared)?
+        };
         let combined = routed.add(&shared, context)?;
         observer.observe_routing(RoutingObservation {
             path,
@@ -297,6 +478,23 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> RoutedPlusSha
             expert_count: self.expert_count,
         })?;
         observe_and_intervene(observer, &format!("{path}.output"), &combined)
+    }
+
+    // A TP caller owns reduction of this write. The scalar and actual-input
+    // seams are shared with local execution; no partial write is presented as
+    // a complete residual contribution.
+    fn forward_shared(
+        &mut self,
+        input: &B::Tensor,
+        context: &<B::Tensor as Tensor>::Context,
+        instrumentation: &mut crate::decoder::ComponentInstrumentation<'_, B::Tensor>,
+    ) -> Result<B::Tensor, Error> {
+        let input = instrumentation.apply("input", input.clone())?;
+        let gate = self.shared_gate.forward(&input, context)?;
+        let up = self.shared_up.forward(&input, context)?;
+        let units = B::gated_product(gate, up, self.shared_limit.unwrap_or_default(), context)?;
+        let units = instrumentation.apply("units", units)?;
+        instrumentation.project::<B>("write_input", &mut self.shared_down, &units, None, context)
     }
 }
 

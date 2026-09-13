@@ -133,6 +133,9 @@ fn default_activation() -> String {
 #[derive(Debug, Clone)]
 pub struct ModelArgs {
     pub(crate) value_output_start: i32,
+    // Shared and routed projections can have different encoding alignments and
+    // therefore different local widths, even when their global widths agree.
+    pub(crate) local_shared_intermediate_size: Option<i32>,
     pub(crate) fields: Configuration,
     pub(crate) schedule: LayerSchedule<AttentionPolicy>,
     pub(crate) dense_layers: BTreeSet<usize>,
@@ -364,6 +367,7 @@ pub fn model_args_from_config_value(value: &serde_json::Value) -> Result<ModelAr
     .map_err(|e| ConfigError::Invalid(e.to_string()))?;
     let mut args = ModelArgs {
         value_output_start: 0,
+        local_shared_intermediate_size: None,
         dense_layers: fields
             .mlp_only_layers
             .as_deref()
@@ -516,6 +520,14 @@ impl Config for ModelArgs {
     }
     fn external_attention_value(&self, layer: usize) -> bool {
         self.is_mova_layer(layer)
+    }
+    fn attention_value_format(&self, layer: usize) -> LinearFormat {
+        let field = if self.is_mova_layer(layer) {
+            "v_experts"
+        } else {
+            "v_proj"
+        };
+        self.linear_format_for(&format!("model.layers.{layer}.self_attn.{field}.weight"))
     }
     fn attention_output_gate(&self) -> Option<(&str, OutputGateActivation)> {
         self.attention_gate_func.as_deref().map(|activation| {

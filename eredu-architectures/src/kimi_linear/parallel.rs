@@ -787,16 +787,7 @@ fn exact_logical_range(
     let tensor = layout
         .tensor(target)
         .ok_or_else(|| ParallelPlanError::InvalidTensor(format!("missing {target}")))?;
-    if tensor.logical_units() != Some(global) {
-        return Err(ParallelPlanError::InvalidTensor(format!(
-            "{target} has wrong semantic width"
-        )));
-    }
-    tensor
-        .logical_range()
-        .cloned()
-        .filter(|range| !range.is_empty() && range.end <= global)
-        .ok_or_else(|| ParallelPlanError::InvalidTensor(format!("{target} has no exact TP range")))
+    tensor.expanded_logical_range(global)
 }
 
 fn validate_realization(
@@ -896,7 +887,13 @@ where
             .map_err(|_| ParallelPlanError::InvalidGroup("Kimi head count exceeds usize".into()))?,
         &block.mixer,
         |metadata, shape| {
-            let name = metadata.id.as_str();
+            // Quantization companions carry their primary projection identity.
+            // They follow the same semantic head or output-column partition.
+            let name = metadata
+                .linear_companion_of
+                .as_ref()
+                .unwrap_or(&metadata.id)
+                .as_str();
             if name.ends_with("q_proj.weight")
                 || name.ends_with("k_proj.weight")
                 || name.ends_with("v_proj.weight")

@@ -1,4 +1,5 @@
 use super::*;
+use std::{cell::OnceCell, rc::Rc};
 
 #[cfg(test)]
 use std::cell::Cell;
@@ -39,6 +40,7 @@ pub(super) fn record_native_collective_submission(_group: &Group) {
 #[derive(Clone)]
 pub struct Group {
     pub(super) native: native::Group,
+    transport_stream: Rc<OnceCell<Stream>>,
     pub(super) logical: Option<LogicalSubgroup>,
     pub(super) contract: Option<ManifestGroupContract>,
     pub(super) completion: Option<CommunicationCompletionPolicy>,
@@ -69,6 +71,7 @@ impl Group {
     pub fn uncontracted(group: &native::Group) -> Self {
         Self {
             native: group.clone(),
+            transport_stream: Rc::new(OnceCell::new()),
             logical: None,
             contract: None,
             completion: None,
@@ -77,6 +80,31 @@ impl Group {
 
     pub(crate) fn shares_native_world(&self, other: &Self) -> bool {
         self.native.shares_native_handle(&other.native)
+    }
+
+    /// Keeps the communicator-selected stream alive through every group clone,
+    /// including groups retained by pending completion and recovery owners.
+    pub(super) fn communication_stream<'a>(&'a self, compute: &'a Stream) -> Result<&'a Stream> {
+        // Singleton collectives are identities and need no transport device.
+        // Avoid initializing the native fallback's unrelated default device.
+        if self.native.size() == 1 {
+            return Ok(compute);
+        }
+        if self.transport_stream.get().is_none() {
+            let stream = self.native.communication_stream()?;
+            let _ = self.transport_stream.set(stream);
+        }
+        let preferred = self
+            .transport_stream
+            .get()
+            .expect("transport stream initialized");
+        // Preserve caller ordering and device affinity when the communicator
+        // supports that device class (including a selected CUDA device).
+        if preferred.get_device()?.get_type()? == compute.get_device()?.get_type()? {
+            Ok(compute)
+        } else {
+            Ok(preferred)
+        }
     }
 
     pub(crate) fn with_completion_policy(
@@ -164,6 +192,7 @@ impl Group {
         }
         Ok(Self {
             native: self.native.split(color, key)?,
+            transport_stream: Rc::new(OnceCell::new()),
             logical: None,
             contract: None,
             completion: self.completion,
@@ -205,6 +234,7 @@ impl Group {
             })?;
         Ok(Self {
             native: self.native.clone(),
+            transport_stream: Rc::clone(&self.transport_stream),
             logical: Some(LogicalSubgroup {
                 global_ranks: global_ranks.to_vec(),
                 rank,

@@ -1329,6 +1329,12 @@ extern "C" {
     #[doc = " Get the group size."]
     pub fn mlx_distributed_group_size(group: mlx_distributed_group) -> ::std::os::raw::c_int;
 }
+unsafe extern "C" {
+    pub fn mlx_distributed_group_communication_stream(
+        res: *mut mlx_stream,
+        group: mlx_distributed_group,
+    ) -> ::std::os::raw::c_int;
+}
 extern "C" {
     #[doc = " Split the group."]
     pub fn mlx_distributed_group_split(

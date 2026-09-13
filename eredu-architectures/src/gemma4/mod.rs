@@ -10,6 +10,7 @@ pub mod ingress;
 pub mod media;
 pub mod model;
 pub mod parallel;
+pub(crate) mod pipeline;
 pub mod projector;
 /// Architecture-owned external-assistant speculative lifecycle.
 pub mod speculative;
@@ -24,8 +25,8 @@ pub use assistant::{
 pub use audio::{AudioConfig, AudioConfigError, AudioInput, AudioLayer, AudioStatic, AudioTower};
 pub use checkpoint::{
     expert_recipes, expert_residency_catalog, gguf_plan, load_time_quantization, mmproj_gguf_plan,
-    safetensors_plan, translate_gguf_weight_name, unit_recipes, with_checkpoint_formats,
-    Gemma4ArtifactConfig,
+    safetensors_plan, translate_family_gguf_weight_name, translate_gguf_weight_name, unit_recipes,
+    with_checkpoint_formats, Gemma4ArtifactConfig,
 };
 pub use config::{ConfigError, FeedForwardPolicy, LayerPolicy, ModelArgs};
 pub use family::{FamilyConfig, FamilyConfigError};

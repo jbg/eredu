@@ -14,7 +14,7 @@ thread_local! {
     };
 }
 
-/// One lazy device-side token-domain assertion.
+/// One lazy device-side index-domain assertion.
 pub struct TokenValidation {
     invalid: Array,
     message: String,
@@ -189,6 +189,45 @@ pub fn validate_token_domain(
         ),
     })?;
     range_tokens.as_type::<i32>(stream)
+}
+
+/// Retains a bounds assertion and returns safe native gather indices while an
+/// asynchronous submission has not yet completed its validation reductions.
+/// Negative signed indices retain ordinary wrap-from-end semantics.
+pub(crate) fn validate_take_indices(
+    indexes: &Array,
+    extent: i32,
+    stream: &Stream,
+) -> Result<Array, Exception> {
+    let signed = match indexes.dtype() {
+        Dtype::Int8 | Dtype::Int16 | Dtype::Int32 | Dtype::Int64 => true,
+        Dtype::Uint8 | Dtype::Uint16 | Dtype::Uint32 | Dtype::Uint64 => false,
+        dtype => {
+            return Err(Exception::custom(format!(
+                "gather indices must use integer storage, got {dtype:?}"
+            )))
+        }
+    };
+    if indexes.size() == 0 {
+        return Ok(indexes.clone());
+    }
+    if extent <= 0 {
+        return Err(Exception::custom("cannot gather from an empty axis"));
+    }
+    let minimum = if signed { -extent } else { 0 };
+    let valid = indexes
+        .ge(Array::from_int(minimum), stream)?
+        .logical_and(&indexes.lt(Array::from_int(extent), stream)?, stream)?;
+    register_token_validation(TokenValidation {
+        invalid: valid.logical_not(stream)?.any(false, stream)?,
+        message: format!("gather index is outside {minimum}..{extent}"),
+    })?;
+    safemlx::ops::r#where(
+        &valid,
+        indexes,
+        &safemlx::ops::zeros_like(indexes, stream)?,
+        stream,
+    )
 }
 
 #[allow(non_snake_case)]

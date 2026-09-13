@@ -1,4 +1,4 @@
-use super::collectives::{logical_direct_exchange, pack_logical_value};
+use super::collectives::{logical_direct_exchange, ordered_world_sum, pack_logical_value};
 use super::*;
 
 fn checked_peer(peer: usize, group: &Group, role: &str) -> Result<()> {
@@ -30,7 +30,12 @@ pub fn send(
         setup.check()?;
     }
     if group.logical.is_none() {
-        return native::send(input, destination, &group.native, stream);
+        return native::send(
+            input,
+            destination,
+            &group.native,
+            group.communication_stream(stream.as_ref())?,
+        );
     }
     let stream = stream.as_ref();
     if let Some(exchanged) = logical_direct_exchange(input, group, stream)? {
@@ -44,7 +49,7 @@ pub fn send(
     }
     let source_global = logical.global_ranks[logical.rank];
     let packed = pack_logical_value(input, source_global, group.native.size(), stream)?;
-    native::all_sum(&packed, &group.native, stream)?.try_index_device(
+    ordered_world_sum(&packed, group, stream)?.try_index_device(
         i32::try_from(source_global)
             .map_err(|_| Exception::custom("logical source rank does not fit in i32"))?,
         stream,
@@ -66,7 +71,13 @@ pub fn recv(
         setup.check()?;
     }
     if group.logical.is_none() {
-        return native::recv(shape, dtype, source, &group.native, stream);
+        return native::recv(
+            shape,
+            dtype,
+            source,
+            &group.native,
+            group.communication_stream(stream.as_ref())?,
+        );
     }
     let stream = stream.as_ref();
     let empty = zeros_dtype(shape, dtype, stream)?;
@@ -87,7 +98,12 @@ pub(crate) fn recv_like(
         setup.check()?;
     }
     if group.logical.is_none() {
-        return native::recv_like(like, source, &group.native, stream);
+        return native::recv_like(
+            like,
+            source,
+            &group.native,
+            group.communication_stream(stream.as_ref())?,
+        );
     }
     let stream = stream.as_ref();
     if let Some(exchanged) = logical_direct_exchange(like, group, stream)? {
@@ -101,7 +117,7 @@ pub(crate) fn recv_like(
     }
     let source_global = logical.global_ranks[source];
     let packed = pack_logical_value(like, source_global, group.native.size(), stream)?;
-    native::all_sum(&packed, &group.native, stream)?.try_index_device(
+    ordered_world_sum(&packed, group, stream)?.try_index_device(
         i32::try_from(source_global)
             .map_err(|_| Exception::custom("logical source rank does not fit in i32"))?,
         stream,

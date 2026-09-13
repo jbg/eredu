@@ -437,6 +437,21 @@ impl MlxStateMechanisms for MlxHybridState {
 }
 
 impl MlxStateMechanisms for MlxPoolingAttentionState {
+    fn supports_isolated_snapshot(&self) -> bool {
+        MlxPoolingAttentionStateFactory::supports_isolated_snapshot(self)
+    }
+    fn isolated_snapshot(&self, stream: &Stream) -> Result<Self, Exception> {
+        MlxPoolingAttentionStateFactory::isolated_snapshot(self, stream)
+    }
+    fn isolated_snapshot_auxiliary_bytes(&self) -> Option<u64> {
+        MlxPoolingAttentionStateFactory::isolated_snapshot_auxiliary_bytes(self)
+    }
+    fn isolated_snapshot_auxiliary_growth(&self, additional: u64) -> Option<u64> {
+        MlxPoolingAttentionStateFactory::isolated_snapshot_auxiliary_growth(self, additional)
+    }
+    fn continuation_capacity_bound(&self, additional: u64) -> Option<u64> {
+        MlxPoolingAttentionStateFactory::continuation_capacity_bound(self, additional)
+    }
     fn offset(&self) -> i32 {
         self.as_ref().first().map_or(0, |layer| layer.offset())
     }
@@ -557,8 +572,10 @@ impl MlxStateMechanisms for MlxPoolingAttentionState {
     }
 
     fn deep_checkpoint(&self) -> Result<Self, Exception> {
-        eredu_runtime::DeviceState::create(self.layout().clone(), |layer, _| {
-            self.as_ref()[layer].deep_clone_state()
+        // Pooling updates replace arrays. Retain exact views and the paged
+        // sliding history that speculative verification could otherwise discard.
+        Self::create(self.layout().clone(), |layer, _| {
+            self.as_ref()[layer].checkpoint_clone_state()
         })
     }
 

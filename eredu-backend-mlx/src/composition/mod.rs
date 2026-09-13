@@ -1,6 +1,5 @@
 //! Cold-path architecture/backend composition selected by public loaders.
 
-use safemlx::error::Exception;
 use safemlx::Array;
 
 pub(crate) use crate::backend::nn::shared::MlxNeuralBackend;
@@ -20,20 +19,79 @@ impl From<eredu_runtime::ParameterBankLoadOptions>
 
 /// Adapts public MLX-array observation to the neutral tensor/error contract.
 pub(crate) struct NeutralActivationObserver<'a> {
-    inner: &'a mut dyn eredu_runtime::ActivationObserver<Array, Exception>,
+    inner: &'a mut dyn eredu_runtime::ActivationObserver<Array, crate::backend::error::Error>,
+    routed_path: Option<String>,
+    routed_invocation_active: bool,
 }
 
 impl<'a> NeutralActivationObserver<'a> {
     pub(crate) fn new(
-        inner: &'a mut dyn eredu_runtime::ActivationObserver<Array, Exception>,
+        inner: &'a mut dyn eredu_runtime::ActivationObserver<Array, crate::backend::error::Error>,
     ) -> Self {
-        Self { inner }
+        Self {
+            inner,
+            routed_path: None,
+            routed_invocation_active: false,
+        }
     }
 }
 
 impl eredu_runtime::ActivationObserver<crate::MlxTensor, eredu_nn::Error>
     for NeutralActivationObserver<'_>
 {
+    fn routed_unit_observer(
+        &mut self,
+        path: &str,
+    ) -> Result<Option<&mut dyn eredu_runtime::RoutedUnitObserver<crate::MlxTensor>>, eredu_nn::Error>
+    {
+        let Some(observer) = self
+            .inner
+            .routed_unit_observer(path)
+            .map_err(eredu_nn::Error::backend_source)?
+        else {
+            self.routed_path = None;
+            self.routed_invocation_active = false;
+            return Ok(None);
+        };
+        // The mutable getter lends the inner scope. Retain only its nesting flag
+        // so the immutable query below requires neither a second borrow nor work.
+        self.routed_invocation_active = observer.invocation_active();
+        if self.routed_path.as_deref() != Some(path) {
+            self.routed_path = Some(path.into());
+        }
+        Ok(Some(self))
+    }
+    fn transactional(&self) -> bool {
+        self.inner.transactional()
+    }
+    fn prepare_transaction(
+        &mut self,
+        epoch: eredu_core::DistributedCommitEpoch,
+        pass: eredu_runtime::ExpertPass,
+    ) -> Result<(), eredu_nn::Error> {
+        self.inner
+            .prepare_transaction(epoch, pass)
+            .map_err(eredu_nn::Error::backend_source)
+    }
+    fn coordinate_transaction(
+        &mut self,
+        epoch: eredu_core::DistributedCommitEpoch,
+    ) -> Result<(), eredu_nn::Error> {
+        self.inner
+            .coordinate_transaction(epoch)
+            .map_err(eredu_nn::Error::backend_source)
+    }
+    fn complete_transaction(
+        &mut self,
+        epoch: eredu_core::DistributedCommitEpoch,
+    ) -> Result<(), eredu_nn::Error> {
+        self.inner
+            .complete_transaction(epoch)
+            .map_err(eredu_nn::Error::backend_source)
+    }
+    fn finish_transaction(&mut self, epoch: eredu_core::DistributedCommitEpoch, committed: bool) {
+        self.inner.finish_transaction(epoch, committed)
+    }
     fn routing_control(
         &mut self,
         path: &str,
@@ -42,7 +100,7 @@ impl eredu_runtime::ActivationObserver<crate::MlxTensor, eredu_nn::Error>
     {
         self.inner
             .routing_control(path, rows)
-            .map_err(eredu_nn::Error::backend)
+            .map_err(eredu_nn::Error::backend_source)
     }
 
     fn routing_applied(
@@ -63,7 +121,7 @@ impl eredu_runtime::ActivationObserver<crate::MlxTensor, eredu_nn::Error>
                     coefficients: effective.coefficients.as_array(),
                 },
             )
-            .map_err(eredu_nn::Error::backend)
+            .map_err(eredu_nn::Error::backend_source)
     }
 
     fn routing_failed(&mut self, path: &str, message: &str) {
@@ -73,7 +131,32 @@ impl eredu_runtime::ActivationObserver<crate::MlxTensor, eredu_nn::Error>
     fn observe(&mut self, path: &str, value: &crate::MlxTensor) -> Result<(), eredu_nn::Error> {
         self.inner
             .observe(path, value.as_array())
-            .map_err(|error| eredu_nn::Error::backend(error.to_string()))
+            .map_err(eredu_nn::Error::backend_source)
+    }
+    fn observe_replica(
+        &mut self,
+        path: &str,
+        value: &crate::MlxTensor,
+    ) -> Result<(), eredu_nn::Error> {
+        self.inner
+            .observe_replica(path, value.as_array())
+            .map_err(eredu_nn::Error::backend_source)
+    }
+
+    fn observe_generated(
+        &mut self,
+        path: &str,
+        prototype: &crate::MlxTensor,
+        source: &eredu_core::capture::GeneratedCaptureSource,
+        generate: &mut dyn FnMut() -> Result<crate::MlxTensor, eredu_nn::Error>,
+    ) -> Result<(), eredu_nn::Error> {
+        self.inner
+            .observe_generated(path, prototype.as_array(), source, &mut || {
+                generate()
+                    .map(crate::MlxTensor::into_array)
+                    .map_err(crate::backend::error::Error::from)
+            })
+            .map_err(eredu_nn::Error::backend_source)
     }
 
     fn intervene(
@@ -84,7 +167,7 @@ impl eredu_runtime::ActivationObserver<crate::MlxTensor, eredu_nn::Error>
         self.inner
             .intervene(path, value.as_array())
             .map(|value| value.map(crate::MlxTensor::from_array))
-            .map_err(|error| eredu_nn::Error::backend(error.to_string()))
+            .map_err(eredu_nn::Error::backend_source)
     }
 
     fn observe_routing(
@@ -106,7 +189,105 @@ impl eredu_runtime::ActivationObserver<crate::MlxTensor, eredu_nn::Error>
                 combined_output: routing.combined_output.map(crate::MlxTensor::as_array),
                 expert_count: routing.expert_count,
             })
-            .map_err(|error| eredu_nn::Error::backend(error.to_string()))
+            .map_err(eredu_nn::Error::backend_source)
+    }
+}
+
+impl eredu_runtime::RoutedUnitObserver<crate::MlxTensor> for NeutralActivationObserver<'_> {
+    fn begin_invocation(
+        &mut self,
+        invocation: &eredu_runtime::RoutedUnitInvocation<'_, crate::MlxTensor>,
+    ) -> Result<(), eredu_nn::Error> {
+        self.routed_invocation_active = true;
+        let path = self
+            .routed_path
+            .as_deref()
+            .ok_or_else(|| eredu_nn::Error::backend("missing neutral routed observer path"))?;
+        match self
+            .inner
+            .routed_unit_observer(path)
+            .map_err(eredu_nn::Error::backend_source)?
+        {
+            Some(observer) => observer.begin_invocation(&eredu_runtime::RoutedUnitInvocation {
+                input: invocation.input.as_array(),
+                origins: invocation.origins,
+                unit_coordinates: invocation.unit_coordinates,
+            }),
+            None => Ok(()),
+        }
+    }
+    fn finish_invocation(&mut self, success: bool) -> Result<(), eredu_nn::Error> {
+        self.routed_invocation_active = false;
+        let path = self
+            .routed_path
+            .as_deref()
+            .ok_or_else(|| eredu_nn::Error::backend("missing neutral routed observer path"))?;
+        match self
+            .inner
+            .routed_unit_observer(path)
+            .map_err(eredu_nn::Error::backend_source)?
+        {
+            Some(observer) => observer.finish_invocation(success),
+            None => Ok(()),
+        }
+    }
+    fn invocation_active(&self) -> bool {
+        self.routed_invocation_active
+    }
+    fn observe(
+        &mut self,
+        batch: &eredu_runtime::RoutedUnitBatch<'_, crate::MlxTensor>,
+    ) -> Result<(), eredu_nn::Error> {
+        let path = self
+            .routed_path
+            .as_deref()
+            .ok_or_else(|| eredu_nn::Error::backend("missing neutral routed observer path"))?;
+        match self
+            .inner
+            .routed_unit_observer(path)
+            .map_err(eredu_nn::Error::backend_source)?
+        {
+            Some(observer) => observer.observe(&batch.map_tensors(crate::MlxTensor::as_array)),
+            None => Ok(()),
+        }
+    }
+    fn intervene(
+        &mut self,
+        batch: &eredu_runtime::RoutedUnitBatch<'_, crate::MlxTensor>,
+    ) -> Result<Option<crate::MlxTensor>, eredu_nn::Error> {
+        let path = self
+            .routed_path
+            .as_deref()
+            .ok_or_else(|| eredu_nn::Error::backend("missing neutral routed observer path"))?;
+        match self
+            .inner
+            .routed_unit_observer(path)
+            .map_err(eredu_nn::Error::backend_source)?
+        {
+            Some(observer) => observer
+                .intervene(&batch.map_tensors(crate::MlxTensor::as_array))
+                .map(|value| value.map(crate::MlxTensor::from_array)),
+            None => Ok(None),
+        }
+    }
+    fn observe_effective(
+        &mut self,
+        batch: &eredu_runtime::RoutedUnitBatch<'_, crate::MlxTensor>,
+    ) -> Result<(), eredu_nn::Error> {
+        let path = self
+            .routed_path
+            .as_deref()
+            .ok_or_else(|| eredu_nn::Error::backend("missing neutral routed observer path"))?;
+        match self
+            .inner
+            .routed_unit_observer(path)
+            .map_err(eredu_nn::Error::backend_source)?
+        {
+            Some(observer) => {
+                observer.observe_effective(&batch.map_tensors(crate::MlxTensor::as_array))
+            }
+            None => Ok(()),
+        }
     }
 }
 
@@ -208,3 +389,7 @@ mod expert_selection_tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "tests/neutral_observer.rs"]
+mod neutral_observer_tests;

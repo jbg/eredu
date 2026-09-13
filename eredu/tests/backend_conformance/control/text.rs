@@ -74,6 +74,58 @@ fn collect(
 }
 
 #[test]
+fn observed_literal_text_matches_controlled_text_for_unrecognized_templates_and_plans() {
+    for mode in 0..4 {
+        let (mut model, chat, settings, _) = text_setup();
+        let prepared = prepare(&model, &chat, settings, mode);
+        let mut ordinary = vec![];
+        let output = model
+            .generate_observed_text(prepared, &[], Default::default(), |record| {
+                ordinary.push(record);
+                ControlFlow::Continue(())
+            })
+            .unwrap();
+        model.reset().unwrap();
+        let prepared = prepare(&model, &chat, settings, mode);
+        let mut controlled = vec![];
+        let mut run = model
+            .start_controlled_text(prepared, &[], Default::default(), collect(&mut controlled))
+            .unwrap();
+        run.run(collect(&mut controlled)).unwrap();
+        assert_eq!(run.token_ids(), output.token_ids);
+        assert_eq!(run.finish_reason(), Some(output.finish_reason));
+        let events: Vec<_> = ordinary
+            .iter()
+            .filter_map(|r| match &r.event {
+                ObservedGenerationEvent::Semantic { event, .. } => Some(event.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(events, semantic(&controlled));
+        let evidence = |record: &eredu::api::ObservedGenerationRecord| match &record.event {
+            ObservedGenerationEvent::Token {
+                forced, captures, ..
+            } => {
+                assert!(!forced);
+                Some(
+                    captures
+                        .as_ref()
+                        .map(|step| (step.records.clone(), step.interventions.clone())),
+                )
+            }
+            _ => None,
+        };
+        assert_eq!(
+            ordinary.iter().filter_map(evidence).collect::<Vec<_>>(),
+            controlled
+                .iter()
+                .filter_map(|r| evidence(&r.generation))
+                .collect::<Vec<_>>()
+        );
+    }
+}
+
+#[test]
 fn unrecognized_chat_stays_strict_while_text_retains_exact_prompt_admissions_and_controls() {
     for mode in 0..4 {
         let (mut model, chat, settings, first) = text_setup();

@@ -92,14 +92,14 @@ fn heterogeneous_generic_sessions_preserve_every_state_component_across_controls
         intervened: bool,
         stream: Stream,
     }
-    impl eredu_runtime::ActivationObserver<Array, Exception> for Observer {
-        fn observe(&mut self, path: &str, _value: &Array) -> Result<(), Exception> {
+    impl eredu_runtime::ActivationObserver<Array, Error> for Observer {
+        fn observe(&mut self, path: &str, _value: &Array) -> Result<(), Error> {
             self.logits |= path == eredu_core::MODEL_LOGITS_OBSERVATION_PATH;
             self.activation |= path != eredu_core::MODEL_LOGITS_OBSERVATION_PATH;
             Ok(())
         }
 
-        fn intervene(&mut self, path: &str, value: &Array) -> Result<Option<Array>, Exception> {
+        fn intervene(&mut self, path: &str, value: &Array) -> Result<Option<Array>, Error> {
             if path == eredu_core::MODEL_LOGITS_OBSERVATION_PATH {
                 self.intervened = true;
                 Ok(Some(safemlx::ops::zeros_like(value, &self.stream)?))
@@ -380,14 +380,14 @@ fn generic_controls_cover_residency_cache_persistence_and_observation() {
         intervened: bool,
         stream: Stream,
     }
-    impl eredu_runtime::ActivationObserver<Array, Exception> for Observer {
-        fn observe(&mut self, path: &str, _value: &Array) -> Result<(), Exception> {
+    impl eredu_runtime::ActivationObserver<Array, Error> for Observer {
+        fn observe(&mut self, path: &str, _value: &Array) -> Result<(), Error> {
             self.logits |= path == eredu_core::MODEL_LOGITS_OBSERVATION_PATH;
             self.activation |= path != eredu_core::MODEL_LOGITS_OBSERVATION_PATH;
             Ok(())
         }
 
-        fn intervene(&mut self, path: &str, value: &Array) -> Result<Option<Array>, Exception> {
+        fn intervene(&mut self, path: &str, value: &Array) -> Result<Option<Array>, Error> {
             if path == eredu_core::MODEL_LOGITS_OBSERVATION_PATH {
                 self.intervened = true;
                 Ok(Some(safemlx::ops::zeros_like(value, &self.stream)?))

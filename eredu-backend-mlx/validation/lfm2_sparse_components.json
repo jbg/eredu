@@ -1,0 +1,127 @@
+{
+  "accepted": true,
+  "controlled_required": true,
+  "bf16_logit_ulps": 1,
+  "atol": 0.001,
+  "rtol": 0.001,
+  "compared_values": 18971520,
+  "failures": [],
+  "exact_non_logit_values": 17660800,
+  "logit_values": 1310720,
+  "max_logit_abs": 0.03125,
+  "max_logit_rms": 0.00018568094451091907,
+  "logit_rounding_allowances": 49,
+  "controlled": {
+    "baseline": {
+      "ordinary_equal": true,
+      "cached_restore_equal": true,
+      "sibling_equal": true,
+      "parent_after_sibling_equal": true,
+      "predictions_checked": 14,
+      "snapshot_retained_limit": 4898947072
+    },
+    "deletion": {
+      "ordinary_equal": true,
+      "cached_restore_equal": true,
+      "sibling_equal": true,
+      "parent_after_sibling_equal": true,
+      "predictions_checked": 14,
+      "snapshot_retained_limit": 4898947072
+    },
+    "keep_only": {
+      "ordinary_equal": true,
+      "cached_restore_equal": true,
+      "sibling_equal": true,
+      "parent_after_sibling_equal": true,
+      "predictions_checked": 14,
+      "snapshot_retained_limit": 4898947072
+    },
+    "overlay": {
+      "ordinary_equal": true,
+      "cached_restore_equal": true,
+      "sibling_equal": true,
+      "parent_after_sibling_equal": true,
+      "predictions_checked": 14,
+      "snapshot_retained_limit": 4898947072
+    },
+    "restored": {
+      "ordinary_equal": true,
+      "cached_restore_equal": true,
+      "sibling_equal": true,
+      "parent_after_sibling_equal": true,
+      "predictions_checked": 14,
+      "snapshot_retained_limit": 4898947072
+    }
+  },
+  "generated": {
+    "baseline": [
+      4481,
+      856,
+      4481,
+      856
+    ],
+    "deletion": [
+      4481,
+      856,
+      4481,
+      856
+    ],
+    "keep_only": [
+      4481,
+      803,
+      4481,
+      803
+    ],
+    "overlay": [
+      4481,
+      856,
+      4481,
+      856
+    ],
+    "restored": [
+      4481,
+      856,
+      4481,
+      856
+    ]
+  },
+  "provenance": {
+    "repository": "LiquidAI/LFM2-8B-A1B",
+    "revision": "c1c44ff9fc00db3ebf4516970563f5f383d23670",
+    "path": "/private/tmp/eredu-lfm2-sparse-validation/hf-cache/models--LiquidAI--LFM2-8B-A1B/snapshots/c1c44ff9fc00db3ebf4516970563f5f383d23670",
+    "weights_sha256": {
+      "model-00001-of-00004.safetensors": "927feafae7d99f40046cd365e8780fe2c36c72ba207ce3024ba54bf884599600",
+      "model-00002-of-00004.safetensors": "e41140e9841cf338ed537fad0e0d0f16fbeebe0784719188ef7f2999b531d97e",
+      "model-00003-of-00004.safetensors": "3e3b6236812186ae90f27a3d074f802d5251eab54840b8eca5eea8b730b7a789",
+      "model-00004-of-00004.safetensors": "4f3cbb6a6a853785186b259fc7b23a5706cca8e53691ab3036a539596ffe38ea"
+    },
+    "remote_lfs_sha256": {
+      "model-00001-of-00004.safetensors": "927feafae7d99f40046cd365e8780fe2c36c72ba207ce3024ba54bf884599600",
+      "model-00002-of-00004.safetensors": "e41140e9841cf338ed537fad0e0d0f16fbeebe0784719188ef7f2999b531d97e",
+      "model-00003-of-00004.safetensors": "3e3b6236812186ae90f27a3d074f802d5251eab54840b8eca5eea8b730b7a789",
+      "model-00004-of-00004.safetensors": "4f3cbb6a6a853785186b259fc7b23a5706cca8e53691ab3036a539596ffe38ea"
+    }
+  },
+  "versions": {
+    "torch": "2.14.0",
+    "transformers": "5.16.1",
+    "safetensors": "0.8.0"
+  },
+  "seed": 17,
+  "prefix_ids": [
+    1098,
+    5706,
+    803,
+    4481,
+    856
+  ],
+  "execution": "resident native MLX Metal; ordinary and controlled",
+  "component_groups": 30,
+  "prefill_positions": 5,
+  "cached_decode_predictions": 3,
+  "ordinary_predictions": 20,
+  "controlled_predictions": 70,
+  "reference_sha256": "73fd10d08503978cea56ee43b4daa4c1d85878bffc3ba0aedea442e2ace63a7b",
+  "native_sha256": "1260cc83b1f51d249d39999a592648233a0c2a6a76ef652af6d5260d279879db",
+  "scope": "Exact original/effective dense, attention and routed components; coefficients; captured write vectors; head inputs; effective queries/projections and reversible coordinated edits. Full sparse signed-score reconstruction is a separate remaining workflow."
+}

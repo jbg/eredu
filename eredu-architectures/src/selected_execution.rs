@@ -104,6 +104,178 @@ pub struct SelectedExecution {
 }
 
 impl SelectedExecution {
+    /// Resolves effective parameter coordinates on one rank of this retained
+    /// execution. This is bounded descriptive geometry, not loaded authority.
+    pub fn parameter_partition_layout_for_rank(
+        &self,
+        parameters: &eredu_runtime::ArchitectureParameterDescription,
+        parameter: &str,
+        global_rank: usize,
+        reservation: &mut impl eredu_core::capture::CaptureReservation,
+    ) -> Result<
+        Option<crate::parameter_partition::ParameterPartitionLayout>,
+        eredu_core::parameters::ParameterError,
+    > {
+        self.parameter_partition_layout_with_index(
+            parameters,
+            parameter,
+            global_rank,
+            None,
+            reservation,
+        )
+    }
+
+    pub(crate) fn parameter_partition_layout_with_index(
+        &self,
+        parameters: &eredu_runtime::ArchitectureParameterDescription,
+        parameter: &str,
+        global_rank: usize,
+        index: Option<&crate::parameter_partition::ParameterMemberIndex>,
+        reservation: &mut impl eredu_core::capture::CaptureReservation,
+    ) -> Result<
+        Option<crate::parameter_partition::ParameterPartitionLayout>,
+        eredu_core::parameters::ParameterError,
+    > {
+        use crate::partitioned_execution::selected_parameter_layout_for_rank;
+        let tasks = self.text_realization().materialization_tasks();
+        match self.kind.as_ref() {
+            SelectedExecutionKind::PartitionedDense(selected) => {
+                selected_parameter_layout_for_rank(
+                    selected.requirements(),
+                    tasks,
+                    parameters,
+                    parameter,
+                    global_rank,
+                    index,
+                    reservation,
+                )
+                .map(Some)
+            }
+            SelectedExecutionKind::PartitionedRouted(selected) => {
+                selected_parameter_layout_for_rank(
+                    selected.requirements(),
+                    tasks,
+                    parameters,
+                    parameter,
+                    global_rank,
+                    index,
+                    reservation,
+                )
+                .map(Some)
+            }
+            SelectedExecutionKind::PartitionedComposite(selected) => {
+                selected_parameter_layout_for_rank(
+                    selected.requirements(),
+                    tasks,
+                    parameters,
+                    parameter,
+                    global_rank,
+                    index,
+                    reservation,
+                )
+                .map(Some)
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// Describes global scalar component coordinates for this retained partition.
+    /// A nonpartitioned execution returns `None`. This does not enable capture or
+    /// interventions: those require their own admitted budgets and delivery policy.
+    pub fn component_partition_layout(
+        &self,
+        descriptor: &eredu_core::ArchitectureDescriptor,
+        parameters: &eredu_runtime::ArchitectureParameterDescription,
+    ) -> Result<
+        Option<crate::component_partition::ComponentPartitionLayout>,
+        crate::component_partition::ComponentPartitionError,
+    > {
+        let Some(topology) = self.parallel_topology() else {
+            return Ok(None);
+        };
+        self.component_partition_layout_for_rank(descriptor, parameters, topology.global_rank())
+    }
+
+    /// Describes any rank in this same retained execution selection. Ownership is
+    /// compiled by the architecture's admission driver, not inferred from rank
+    /// adjacency, checkpoint aliases or a backend's local native tensor shapes.
+    /// The supplied descriptor/parameters must be those retained with this model.
+    pub fn component_partition_layout_for_rank(
+        &self,
+        descriptor: &eredu_core::ArchitectureDescriptor,
+        parameters: &eredu_runtime::ArchitectureParameterDescription,
+        global_rank: usize,
+    ) -> Result<
+        Option<crate::component_partition::ComponentPartitionLayout>,
+        crate::component_partition::ComponentPartitionError,
+    > {
+        use crate::partitioned_execution::selected_component_layout_for_rank;
+        match self.kind.as_ref() {
+            SelectedExecutionKind::PartitionedDense(selected) => {
+                selected_component_layout_for_rank(
+                    selected.requirements(),
+                    descriptor,
+                    parameters,
+                    global_rank,
+                    self.routed_realization(),
+                )
+                .map(Some)
+            }
+            SelectedExecutionKind::PartitionedRouted(selected) => {
+                selected_component_layout_for_rank(
+                    selected.requirements(),
+                    descriptor,
+                    parameters,
+                    global_rank,
+                    self.routed_realization(),
+                )
+                .map(Some)
+            }
+            SelectedExecutionKind::PartitionedComposite(selected) => {
+                selected_component_layout_for_rank(
+                    selected.requirements(),
+                    descriptor,
+                    parameters,
+                    global_rank,
+                    self.routed_realization(),
+                )
+                .map(Some)
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// Compiles one reusable set of component layouts for the whole retained
+    /// topology. The rank bound is checked before allocating or deriving layouts.
+    /// Reuse the result across selections and forwards; it contains no native state.
+    pub fn component_partition_layouts(
+        &self,
+        descriptor: &eredu_core::ArchitectureDescriptor,
+        parameters: &eredu_runtime::ArchitectureParameterDescription,
+        max_ranks: usize,
+    ) -> Result<
+        Option<crate::component_partition::ComponentPartitionLayouts>,
+        crate::component_partition::ComponentPartitionError,
+    > {
+        let Some(topology) = self.parallel_topology() else {
+            return Ok(None);
+        };
+        if topology.world_size() > max_ranks {
+            return Err(eredu_core::capture::CaptureError::Invalid(
+                "component rank count exceeds its bound".into(),
+            )
+            .into());
+        }
+        let layouts = (0..topology.world_size())
+            .map(|rank| {
+                self.component_partition_layout_for_rank(descriptor, parameters, rank)
+                    .map(|layout| layout.expect("retained partition selection"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        crate::component_partition::ComponentPartitionLayouts::new(topology.topology(), layouts)
+            .map(Some)
+    }
+
     pub(crate) fn partition_groups(
         &self,
     ) -> Option<&[crate::partitioned_execution::PartitionedGroupRequirements]> {
@@ -532,7 +704,9 @@ impl SelectedExecution {
         Ok(result)
     }
 
-    /// Exact cold TP/PP/EP output sizes from the family's physical topology.
+    /// Exact cold TP/PP/EP output sizes from the family's complete physical topology.
+    /// Prediction parameters use tensor placement and remain replicated over the
+    /// target's pipeline and expert axes, independently of target storage ownership.
     pub fn partition_parameter_resources(
         &self,
         parameters: &eredu_runtime::ArchitectureParameterDescription,
@@ -563,7 +737,7 @@ impl SelectedExecution {
                 .filter(|group| {
                     group
                         .owner()
-                        .is_owned_by(requirements.ownership(), |group, unit| {
+                        .is_stored_by(requirements.ownership(), |group, unit| {
                             requirements.groups().iter().any(|owned| {
                                 owned.group() == group && owned.units().contains(&unit)
                             })
@@ -581,7 +755,7 @@ impl SelectedExecution {
             )
             .map_err(|e| e.to_string())
         }
-        let resources = match self.kind.as_ref() {
+        let mut resources = match self.kind.as_ref() {
             SelectedExecutionKind::PartitionedDense(selected) => {
                 size(selected, parameters, &layout, &routed, &independent)?
             }
@@ -593,6 +767,47 @@ impl SelectedExecution {
             }
             _ => unreachable!("partition topology requires a partitioned selection"),
         };
+        let auxiliary = self.text_realization().auxiliary_materialization_tasks();
+        if !auxiliary.is_empty() {
+            let prediction_rank = crate::prediction_extension::tensor_rank(rank)
+                .map_err(|error| error.to_string())?;
+            let prediction_layout = crate::partitioned_execution::derive_partitioned_local_layout(
+                parameters,
+                prediction_rank,
+            )?;
+            let owned = parameters
+                .groups()
+                .iter()
+                .flat_map(|group| group.members())
+                .map(|member| member.target().to_owned())
+                .collect();
+            let auxiliary = eredu_runtime::selected_parameter_resources_for_layout(
+                auxiliary,
+                &prediction_layout,
+                &owned,
+                &routed,
+                &BTreeSet::new(),
+            )
+            .map_err(|error| error.to_string())?;
+            resources.parameter_bytes = resources
+                .parameter_bytes
+                .checked_add(auxiliary.parameter_bytes)
+                .ok_or("rank parameter size overflow")?;
+            resources.expert_bytes = resources
+                .expert_bytes
+                .checked_add(auxiliary.expert_bytes)
+                .ok_or("rank expert size overflow")?;
+            resources.pinned_bytes = resources
+                .pinned_bytes
+                .checked_add(auxiliary.pinned_bytes)
+                .ok_or("rank pinned size overflow")?;
+            resources.largest_unit_bytes = resources
+                .largest_unit_bytes
+                .max(auxiliary.largest_unit_bytes);
+            resources.largest_adjacent_units_bytes = resources
+                .largest_adjacent_units_bytes
+                .max(auxiliary.largest_adjacent_units_bytes);
+        }
         Ok(Some((resources, layout)))
     }
 

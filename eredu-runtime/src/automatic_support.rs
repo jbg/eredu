@@ -41,14 +41,38 @@ pub fn selected_text_bounded_requirement(
     selected: &SelectedReplicatedTextRealization,
     excluded: &BTreeSet<String>,
 ) -> Result<BoundedResidencyRequirement, BoundedResidencySizingError> {
-    let tasks = replicated_text_materialization_tasks(selected)?;
-    bounded_requirement(
-        task_parameter_bytes(&tasks)?
+    let mut tasks = replicated_text_materialization_tasks(selected)?;
+    tasks.extend_from_slice(selected.auxiliary_materialization_tasks());
+    let (ordinary, _, _, auxiliary) = separate_auxiliary_parameters(
+        task_parameter_bytes(&tasks)?,
+        &auxiliary_owners(&tasks),
+        &BTreeSet::new(),
+        excluded,
+    )?;
+    let mut requirement = bounded_requirement(
+        ordinary
             .into_iter()
             .map(|(name, owner, bytes)| (name, owner, move || Ok(bytes))),
         selected.residency(),
         excluded,
-    )
+    )?;
+    let auxiliary = auxiliary.device_bytes(selected.residency()).ok_or(
+        BoundedResidencySizingError::ArithmeticOverflow("auxiliary phase bytes"),
+    )?;
+    requirement.window_bytes = if selected.residency().is_fully_resident() {
+        requirement.window_bytes.checked_add(auxiliary).ok_or(
+            BoundedResidencySizingError::ArithmeticOverflow("resident auxiliary bytes"),
+        )?
+    } else {
+        requirement.window_bytes.max(auxiliary)
+    };
+    requirement.required_bytes = requirement
+        .static_bytes
+        .checked_add(requirement.window_bytes)
+        .ok_or(BoundedResidencySizingError::ArithmeticOverflow(
+            "combined bounded bytes",
+        ))?;
+    Ok(requirement)
 }
 
 /// Exact parameter totals for the selected executable tasks. Routed storage is
@@ -57,11 +81,11 @@ pub fn selected_text_bounded_requirement(
 pub struct SelectedParameterResources {
     /// All executable parameters, including independently acquired banks.
     pub parameter_bytes: u64,
-    /// Parameters outside repeated execution units.
+    /// Pinned ordinary parameters, excluding separately paged auxiliary owners.
     pub pinned_bytes: u64,
-    /// Largest ordinary execution unit, excluding independently acquired banks.
+    /// Largest ordinary unit or auxiliary shared-plus-sequential phase, excluding independently acquired banks.
     pub largest_unit_bytes: u64,
-    /// Largest adjacent pair within one execution group.
+    /// Largest adjacent ordinary pair or auxiliary shared-plus-sequential phase.
     pub largest_adjacent_units_bytes: u64,
     /// All routed-bank parameters; shared feed-forward experts remain ordinary.
     pub expert_bytes: u64,
@@ -115,7 +139,12 @@ pub fn selected_parameter_resources(
     routed: &BTreeSet<String>,
     independently_acquired: &BTreeSet<String>,
 ) -> Result<SelectedParameterResources, BoundedResidencySizingError> {
-    parameter_resources(task_parameter_bytes(tasks)?, routed, independently_acquired)
+    parameter_resources_with_auxiliary(
+        task_parameter_bytes(tasks)?,
+        tasks,
+        routed,
+        independently_acquired,
+    )
 }
 
 /// Sizes a rank's owned physical outputs using the architecture's TP/EP layout.
@@ -210,7 +239,7 @@ pub fn selected_parameter_resources_for_layout(
             ));
         }
     }
-    parameter_resources(parameters, routed, independently_acquired)
+    parameter_resources_with_auxiliary(parameters, tasks, routed, independently_acquired)
 }
 
 fn local_output_bytes(
@@ -284,6 +313,103 @@ fn task_parameter_bytes(
     Ok(parameters)
 }
 
+fn auxiliary_owners(
+    tasks: &[crate::ReplicatedTextMaterializationTask],
+) -> BTreeMap<&str, &crate::AuxiliaryModuleResidency> {
+    tasks
+        .iter()
+        .filter_map(|task| task.auxiliary_residency().map(|owner| (task.name(), owner)))
+        .collect()
+}
+
+fn separate_auxiliary_parameters<'a>(
+    parameters: Vec<ParameterBytes<'a>>,
+    owners: &BTreeMap<&str, &crate::AuxiliaryModuleResidency>,
+    routed: &BTreeSet<String>,
+    independently_acquired: &BTreeSet<String>,
+) -> Result<
+    (
+        Vec<ParameterBytes<'a>>,
+        u64,
+        u64,
+        crate::AuxiliaryWeightRequirements,
+    ),
+    BoundedResidencySizingError,
+> {
+    use BoundedResidencySizingError::{ArithmeticOverflow, InvalidLocalGeometry};
+    let mut ordinary = Vec::new();
+    let mut modules = BTreeMap::new();
+    let mut total = 0u64;
+    let mut experts = 0u64;
+    for (name, owner, bytes) in parameters {
+        let Some(auxiliary) = owners.get(name) else {
+            ordinary.push((name, owner, bytes));
+            continue;
+        };
+        total = total
+            .checked_add(bytes)
+            .ok_or(ArithmeticOverflow("auxiliary parameters"))?;
+        if routed.contains(name) {
+            experts = experts
+                .checked_add(bytes)
+                .ok_or(ArithmeticOverflow("auxiliary experts"))?;
+        }
+        if independently_acquired.contains(name) {
+            continue;
+        }
+        let (shared, size) = modules
+            .entry(auxiliary.module())
+            .or_insert((auxiliary.shared(), 0u64));
+        if *shared != auxiliary.shared() {
+            return Err(InvalidLocalGeometry(format!(
+                "conflicting auxiliary module roles for {name}"
+            )));
+        }
+        *size = size
+            .checked_add(bytes)
+            .ok_or(ArithmeticOverflow("auxiliary module"))?;
+    }
+    let mut requirements = crate::AuxiliaryWeightRequirements::default();
+    for (shared, bytes) in modules.into_values() {
+        requirements = requirements
+            .checked_add_module(bytes, 0, shared)
+            .ok_or(ArithmeticOverflow("auxiliary phase"))?;
+    }
+    Ok((ordinary, total, experts, requirements))
+}
+
+fn parameter_resources_with_auxiliary(
+    parameters: Vec<ParameterBytes<'_>>,
+    tasks: &[crate::ReplicatedTextMaterializationTask],
+    routed: &BTreeSet<String>,
+    independently_acquired: &BTreeSet<String>,
+) -> Result<SelectedParameterResources, BoundedResidencySizingError> {
+    use BoundedResidencySizingError::ArithmeticOverflow;
+    let (ordinary, total, experts, auxiliary) = separate_auxiliary_parameters(
+        parameters,
+        &auxiliary_owners(tasks),
+        routed,
+        independently_acquired,
+    )?;
+    let mut result = parameter_resources(ordinary, routed, independently_acquired)?;
+    result.parameter_bytes = result
+        .parameter_bytes
+        .checked_add(total)
+        .ok_or(ArithmeticOverflow("all parameter bytes"))?;
+    result.expert_bytes = result
+        .expert_bytes
+        .checked_add(experts)
+        .ok_or(ArithmeticOverflow("all expert bytes"))?;
+    let peak = auxiliary
+        .device_bytes(LayerWeightResidency::LayerwiseHost(Default::default()))
+        .ok_or(ArithmeticOverflow("auxiliary peak bytes"))?;
+    result.largest_unit_bytes = result.largest_unit_bytes.max(peak);
+    // Auxiliary invocations have one sequential owner; the shared owner remains
+    // live across it. They do not use the ordinary adjacent-unit lookahead.
+    result.largest_adjacent_units_bytes = result.largest_adjacent_units_bytes.max(peak);
+    Ok(result)
+}
+
 fn parameter_resources<'a>(
     parameters: impl IntoIterator<Item = (&'a str, &'a ReplicatedTextParameterOwner, u64)>,
     routed: &BTreeSet<String>,
@@ -313,7 +439,10 @@ fn parameter_resources<'a>(
             continue;
         }
         match owner {
-            ReplicatedTextParameterOwner::StaticRole(_) => add(&mut result.pinned_bytes, bytes)?,
+            ReplicatedTextParameterOwner::StaticRole(_)
+            | ReplicatedTextParameterOwner::StaticUnitConsumers { .. } => {
+                add(&mut result.pinned_bytes, bytes)?
+            }
             ReplicatedTextParameterOwner::ExecutionUnit { group, unit } => {
                 add(
                     groups.entry(group).or_default().entry(*unit).or_default(),
@@ -357,7 +486,8 @@ where
         }
         let bytes = bytes()?;
         match owner {
-            ReplicatedTextParameterOwner::StaticRole(_) => {
+            ReplicatedTextParameterOwner::StaticRole(_)
+            | ReplicatedTextParameterOwner::StaticUnitConsumers { .. } => {
                 static_bytes = static_bytes
                     .checked_add(bytes)
                     .ok_or(ArithmeticOverflow("static parameter bytes"))?;
@@ -466,6 +596,30 @@ mod tests {
         LayerWeightResidency::LayerwiseHost(crate::LayerwiseLoadOptions::new(
             OffloadConfig::new(None, None, depth).unwrap(),
         ))
+    }
+
+    #[test]
+    fn shared_unit_consumers_charge_one_pinned_copy_per_selected_partition() {
+        let pinned = ReplicatedTextParameterOwner::StaticUnitConsumers {
+            role: "projector".into(),
+            consumers: vec![("vision".into(), 0), ("vision".into(), 1)],
+        };
+        let first = unit("vision", 0);
+        let second = unit("vision", 1);
+        let resources = parameter_resources(
+            [
+                ("shared", &pinned, 17),
+                ("first", &first, 11),
+                ("second", &second, 13),
+            ],
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+        )
+        .unwrap();
+        assert_eq!(resources.parameter_bytes, 41);
+        assert_eq!(resources.pinned_bytes, 17);
+        assert_eq!(resources.largest_unit_bytes, 13);
+        assert_eq!(resources.largest_adjacent_units_bytes, 24);
     }
 
     #[test]

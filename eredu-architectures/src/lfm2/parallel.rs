@@ -757,16 +757,7 @@ fn exact_logical_range(
     let tensor = layout
         .tensor(target)
         .ok_or_else(|| ParallelPlanError::InvalidTensor(format!("missing {target}")))?;
-    if tensor.logical_units() != Some(global) {
-        return Err(ParallelPlanError::InvalidTensor(format!(
-            "{target} has wrong semantic width"
-        )));
-    }
-    tensor
-        .logical_range()
-        .cloned()
-        .filter(|range| !range.is_empty() && range.end <= global)
-        .ok_or_else(|| ParallelPlanError::InvalidTensor(format!("{target} has no exact TP range")))
+    tensor.expanded_logical_range(global)
 }
 
 fn validate_realization(
@@ -1119,7 +1110,11 @@ pub fn layer_parallel_parameter_groups<
                 kv_heads,
                 attention,
                 |metadata, shape| {
-                    let name = metadata.id.as_str();
+                    let name = metadata
+                        .linear_companion_of
+                        .as_ref()
+                        .unwrap_or(&metadata.id)
+                        .as_str();
                     if name.ends_with("q_proj.weight")
                         || name.ends_with("k_proj.weight")
                         || name.ends_with("v_proj.weight")
@@ -1148,7 +1143,11 @@ pub fn layer_parallel_parameter_groups<
                 channels,
                 convolution,
                 |metadata, shape| {
-                    let name = metadata.id.as_str();
+                    let name = metadata
+                        .linear_companion_of
+                        .as_ref()
+                        .unwrap_or(&metadata.id)
+                        .as_str();
                     if name.contains("in_proj") {
                         Ok(MemberSharding::PartitionedSegments {
                             axis: 0,

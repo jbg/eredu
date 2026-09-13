@@ -305,7 +305,9 @@ pub fn realtime_task_binding_plan(
     let mut units = BTreeMap::<ParameterGroupOwner, Vec<WeightBinding>>::new();
     for task in tasks {
         let destination = match task.owner() {
-            ParameterGroupOwner::StaticRole(_) | ParameterGroupOwner::StaticAnyOf(_) => &mut pinned,
+            ParameterGroupOwner::StaticRole(_)
+            | ParameterGroupOwner::StaticAnyOf(_)
+            | ParameterGroupOwner::StaticUnitConsumers { .. } => &mut pinned,
             ParameterGroupOwner::ExecutionUnit { .. } => {
                 units.entry(task.owner().clone()).or_default()
             }

@@ -63,6 +63,81 @@ impl MlxPoolingAttentionStateFactory {
         })
     }
 
+    pub(crate) fn supports_isolated_snapshot(state: &MlxPoolingAttentionState) -> bool {
+        let mut manager = None;
+        state.as_ref().iter().all(|cache| {
+            cache.residency_manager().is_none_or(|paging| {
+                *manager.get_or_insert(paging.session_id()) == paging.session_id()
+            })
+        })
+    }
+
+    pub(crate) fn isolated_snapshot_auxiliary_bytes(
+        state: &MlxPoolingAttentionState,
+    ) -> Option<u64> {
+        state
+            .as_ref()
+            .iter()
+            .find_map(MlxPoolingAttentionCache::residency_manager)
+            .map(CacheResidencyManager::isolated_snapshot_bytes)
+            .unwrap_or(Some(0))
+    }
+
+    pub(crate) fn continuation_capacity_bound(
+        state: &MlxPoolingAttentionState,
+        additional: u64,
+    ) -> Option<u64> {
+        state.as_ref().iter().try_fold(0, |bound, cache| {
+            Some(bound.max(cache.continuation_capacity_bound(additional)?))
+        })
+    }
+
+    pub(crate) fn isolated_snapshot_auxiliary_growth(
+        state: &MlxPoolingAttentionState,
+        additional: u64,
+    ) -> Option<u64> {
+        state.as_ref().iter().try_fold(0u64, |bytes, cache| {
+            // The neutral key-only geometry has no value tensor. Native local
+            // storage uses a one-channel persistence sentinel; bound it as well
+            // as every possible new sealed-block catalog entry.
+            let absolute = u64::try_from(cache.offset())
+                .ok()?
+                .checked_add(additional)?;
+            let prefix = absolute.max(cache.continuation_capacity_bound(additional)?);
+            let sentinel = prefix.checked_mul(16)?.checked_add(4096 + 4 * 16)?;
+            let catalog = if cache.residency_manager().is_some() {
+                additional.checked_add(1)?.checked_mul(8192)?
+            } else {
+                0
+            };
+            bytes.checked_add(sentinel)?.checked_add(catalog)
+        })
+    }
+
+    pub(crate) fn isolated_snapshot(
+        state: &MlxPoolingAttentionState,
+        stream: &Stream,
+    ) -> Result<MlxPoolingAttentionState, Exception> {
+        if !Self::supports_isolated_snapshot(state) {
+            return Err(Exception::custom(
+                "pooling snapshot has inconsistent paging managers",
+            ));
+        }
+        let manager = state
+            .as_ref()
+            .iter()
+            .find_map(MlxPoolingAttentionCache::residency_manager)
+            .map(|manager| {
+                manager
+                    .isolated_snapshot(stream)
+                    .map_err(|error| Exception::custom(error.to_string()))
+            })
+            .transpose()?;
+        DeviceState::create(state.layout().clone(), |layer, _| {
+            state.as_ref()[layer].isolated_snapshot_in(manager.as_ref(), stream)
+        })
+    }
+
     pub(crate) fn fork_prediction_target_state(
         state: &MlxPoolingAttentionState,
         stream: &Stream,
@@ -76,7 +151,7 @@ impl MlxPoolingAttentionStateFactory {
             .transpose()
             .map_err(|error| Exception::custom(error.to_string()))?;
         DeviceState::create(state.layout().clone(), |layer, _| {
-            let mut cache = state.as_ref()[layer].deep_clone_state()?;
+            let mut cache = state.as_ref()[layer].deep_clone_state(stream)?;
             if let Some(manager) = manager.as_ref() {
                 cache.rebind_paging_manager(manager.clone());
             }
@@ -86,6 +161,14 @@ impl MlxPoolingAttentionStateFactory {
 }
 
 impl MlxPoolingAttentionCache {
+    /// Retains exact array views plus sealed history needed after a rollback.
+    pub(crate) fn checkpoint_clone_state(&self) -> Result<Self, Exception> {
+        let mut checkpoint = self.clone();
+        if let LiveKeyValueCache::Paged(cache) = self.local() {
+            *checkpoint.local_mut() = LiveKeyValueCache::Paged(cache.checkpoint_clone_state()?);
+        }
+        Ok(checkpoint)
+    }
     /// Creates resident pooling-attention state from one architecture-declared
     /// layer policy.
     pub fn resident_from_policy(
@@ -142,22 +225,65 @@ impl MlxPoolingAttentionCache {
         }
     }
 
-    /// Copies every state array into an independent MLX graph value.
-    pub fn deep_clone_state(&self) -> Result<Self, Exception> {
+    /// Copies all logical local/pooling views on the supplied stream. The
+    /// existing paging namespace remains retained until an enclosing fork binds
+    /// its independently owned manager.
+    pub fn deep_clone_state(&self, stream: &Stream) -> Result<Self, Exception> {
+        self.isolated_snapshot_in(self.residency_manager(), stream)
+    }
+
+    pub(crate) fn continuation_capacity_bound(&self, additional: u64) -> Option<u64> {
+        let absolute = u64::try_from(self.offset()).ok()?.checked_add(additional)?;
+        i32::try_from(absolute).ok()?;
+        match self.local() {
+            LiveKeyValueCache::Resident(cache) => cache.continuation_capacity_bound(additional),
+            LiveKeyValueCache::Paged(_) => Some(absolute),
+        }
+    }
+
+    /// Complete standalone layer copy, including an independent paging namespace.
+    pub(crate) fn isolated_snapshot(&self, stream: &Stream) -> Result<Self, Exception> {
+        let manager = self
+            .residency_manager()
+            .map(|manager| {
+                manager
+                    .isolated_snapshot(stream)
+                    .map_err(|error| Exception::custom(error.to_string()))
+            })
+            .transpose()?;
+        self.isolated_snapshot_in(manager.as_ref(), stream)
+    }
+
+    fn isolated_snapshot_in(
+        &self,
+        manager: Option<&CacheResidencyManager>,
+        stream: &Stream,
+    ) -> Result<Self, Exception> {
+        let local = match self.local() {
+            LiveKeyValueCache::Resident(cache) => {
+                LiveKeyValueCache::Resident(cache.isolated_snapshot(stream)?)
+            }
+            LiveKeyValueCache::Paged(cache) => {
+                let manager = manager.ok_or_else(|| {
+                    Exception::custom("pooling snapshot lacks copied paging manager")
+                })?;
+                let mut copy = cache.deep_clone_state(stream)?;
+                copy.rebind_paging_manager(manager.clone());
+                LiveKeyValueCache::Paged(copy)
+            }
+        };
         match self {
-            Self::Local(local) => local.deep_clone_state().map(Self::Local),
-            Self::Compressed { local, pool } => Ok(Self::Compressed {
-                local: local.deep_clone_state()?,
-                pool: pool.deep_clone_state()?,
+            Self::Local(_) => Ok(Self::Local(local)),
+            Self::Compressed { pool, .. } => Ok(Self::Compressed {
+                local,
+                pool: pool.isolated_snapshot(stream)?,
             }),
             Self::Sparse {
-                local,
-                pool,
-                index_pool,
+                pool, index_pool, ..
             } => Ok(Self::Sparse {
-                local: local.deep_clone_state()?,
-                pool: pool.deep_clone_state()?,
-                index_pool: index_pool.deep_clone_state()?,
+                local,
+                pool: pool.isolated_snapshot(stream)?,
+                index_pool: index_pool.isolated_snapshot(stream)?,
             }),
         }
     }
@@ -670,8 +796,8 @@ impl PoolingAttentionCache<MlxTensor> for MlxPoolingAttentionCache {
             .map_err(ComputeError::backend)
     }
 
-    fn checkpoint(&self) -> Self::Checkpoint {
-        self.clone()
+    fn checkpoint(&self) -> Result<Self::Checkpoint, ComputeError> {
+        self.checkpoint_clone_state().map_err(ComputeError::backend)
     }
 
     fn restore(
@@ -729,3 +855,7 @@ impl PoolingAttentionCache<MlxTensor> for MlxPoolingAttentionCache {
         self.clear().map_err(ComputeError::backend)
     }
 }
+
+#[cfg(test)]
+#[path = "tests/pooling_snapshots.rs"]
+mod snapshot_tests;

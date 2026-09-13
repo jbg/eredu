@@ -7,15 +7,25 @@ use eredu_nn::{
 
 use crate::ExpertPass;
 
+mod agreement;
 mod banks;
 mod route_intervention;
+mod units;
 use crate::{
     observe_and_intervene, ActivationObserver, ParameterBankAccess, ParameterBankKey,
     ReplicatedTextMaterializationTask, ReplicatedTextParameterOwner, RoutingObservation,
     WeightLoweringKind,
 };
+pub use agreement::{
+    AgreeingAddressableExpertProvider, AgreeingRoutedExpertProvider, ProviderAgreementRejected,
+};
 pub use banks::{RoutedBankProviderError, RoutedBankProviders};
 pub use route_intervention::{select_routes_with_observer, select_routes_with_provider};
+pub use units::{
+    with_exchanged_unit_observer, with_partition_unit_observer, with_provider_unit_observer,
+    with_resident_unit_coordinates, with_routed_unit_invocation, ProviderUnitObserver,
+    RoutedUnitBatch, RoutedUnitInvocation, RoutedUnitObserver, RoutedUnitOrigin, RoutedUnitOrigins,
+};
 
 /// A validated materialization task shared by all members of one bank target.
 ///
@@ -48,7 +58,13 @@ impl AddressableBankTask {
         {
             return Err(AddressableBankMemberError::InvalidParameter {
                 parameter: task.name().to_owned(),
-                detail: "selected source, executable, or lowering descriptor drifted".into(),
+                detail: format!(
+                    "selected lowering descriptor drifted: source {:?}/{:?}, executable {:?}/{:?}, physical {:?}/{:?}, logical {:?}/{:?}",
+                    descriptor.source(), task.source_encoding(),
+                    descriptor.executable(), task.executable(),
+                    descriptor.physical_shape(), task.physical_shape(),
+                    descriptor.logical_shape(), task.logical_shape(),
+                ),
             });
         }
         let sources = task
@@ -213,20 +229,10 @@ impl AddressableBankParameter {
                         ),
                     });
                 }
-                let owner_matches = match (task.owner(), companion.owner()) {
-                    (
-                        ReplicatedTextParameterOwner::ExecutionUnit { group, unit },
-                        crate::ParameterGroupOwner::ExecutionUnit {
-                            group: companion_group,
-                            global_unit,
-                        },
-                    ) => group == companion_group.as_str() && unit == global_unit,
-                    (
-                        ReplicatedTextParameterOwner::StaticRole(role),
-                        crate::ParameterGroupOwner::StaticRole(companion_role),
-                    ) => role == companion_role,
-                    _ => false,
-                };
+                let owner_matches = task
+                    .owner()
+                    .parameter_group_owner()
+                    .is_ok_and(|owner| companion.owner().refines_storage_owner(&owner));
                 if !owner_matches {
                     return Err(AddressableBankMemberError::InvalidParameter {
                         parameter: task.name().to_owned(),
@@ -298,6 +304,8 @@ impl AddressableBankParameter {
 }
 
 /// Exact generic storage member projected from an architecture-owned bank catalog.
+/// The key identifies a bank invocation; placement identifies its execution owner.
+/// Multiple distinct invocations, such as routed and shared banks, may have one owner.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct AddressableBankMember {
     key: ParameterBankKey,
@@ -388,13 +396,6 @@ impl AddressableBankMember {
         let parameters = parameters.into_iter().collect::<Vec<_>>();
         if parameters.is_empty() {
             return Err(AddressableBankMemberError::EmptyMember { key });
-        }
-        if placement.owner_unit() != key.unit() {
-            return Err(AddressableBankMemberError::InvalidPlacement(format!(
-                "addressable member unit {} differs from placement unit {}",
-                key.unit(),
-                placement.owner_unit()
-            )));
         }
         let mut bindings = std::collections::BTreeSet::new();
         let mut targets = std::collections::BTreeSet::new();
@@ -860,7 +861,7 @@ where
     B: GroupedNeuralBackend,
 {
     /// Indexed movement failure.
-    type Error;
+    type Error: std::error::Error + Send + Sync + 'static;
 
     /// Returns deterministic demand counts for integer indices below `upper_bound`.
     fn index_demands(
@@ -902,7 +903,7 @@ where
 /// they do not receive expert identities, topology, or model-family policy.
 pub trait ExpertRouteTensorMovement<T> {
     /// Tensor movement failure.
-    type Error;
+    type Error: std::error::Error + Send + Sync + 'static;
 
     /// Returns the logical tensor shape without materializing its values.
     fn shape(&self, value: &T) -> Vec<usize>;
@@ -939,7 +940,12 @@ pub trait ExpertRouteTensorMovement<T> {
 /// native resources until the exact completion has finished.
 pub trait ExpertRouteExchange<T> {
     /// Communication or metadata transport failure.
-    type Error;
+    type Error: std::error::Error + Send + Sync + 'static;
+
+    /// Completes one all-member vote after local route validation and bank work,
+    /// before any member enters reverse exchange. Idle owners participate too.
+    /// This is execution agreement, independent of observation or intervention.
+    fn agree_provider_success(&mut self, local_success: bool) -> Result<bool, Self::Error>;
 
     /// Exchanges one tensor whose leading rows match the supplied peer counts.
     fn exchange_tensor(
@@ -981,6 +987,8 @@ pub struct ExpertRouteInvocation {
 
 /// One owner-local grouped batch submitted after expert exchange.
 pub struct AddressableExpertRouteRequest<'a, T> {
+    /// Preserved peer/token/slot identities in exchange receive order.
+    pub unit_origins: RoutedUnitOrigins<'a>,
     /// Independently identified bank within the logical layer.
     pub bank: RoutedBankId,
     /// Global execution unit containing the addressable expert bank.
@@ -1033,7 +1041,7 @@ impl<T> AddressableExpertRouteRequest<'_, T> {
 /// tensor is natively complete.
 pub trait AddressableExpertRouteProvider<T> {
     /// Acquisition or grouped execution failure.
-    type Error;
+    type Error: std::error::Error + Send + Sync + 'static;
 
     /// Executes one owner-local grouped batch.
     fn execute_addressable_routes(
@@ -1096,7 +1104,7 @@ where
     /// Generic bank telemetry snapshot.
     type Report;
     /// Storage, transfer, lowering, or construction failure.
-    type Error;
+    type Error: std::error::Error + Send + Sync + 'static;
 
     /// Returns the selected byte geometry for one admitted bank member.
     fn member_bytes(&self, key: ParameterBankKey) -> Option<u64>;
@@ -1151,7 +1159,7 @@ where
     B: GroupedNeuralBackend,
 {
     /// Bank lookup or construction failure.
-    type Error;
+    type Error: std::error::Error + Send + Sync + 'static;
 
     /// Resolves one generic bank key and exact grouped construction specification.
     fn acquire(
@@ -1178,7 +1186,7 @@ impl RoutedBankId {
 }
 
 /// One architecture route batch submitted to a runtime expert provider.
-pub struct RoutedExpertRequest<'a, T> {
+pub struct RoutedExpertRequest<'a, 'observer, T: Tensor> {
     /// Independently identified bank in this logical layer.
     pub bank: RoutedBankId,
     /// Global decoder layer requesting experts.
@@ -1189,9 +1197,12 @@ pub struct RoutedExpertRequest<'a, T> {
     pub routes: &'a GroupSelection<T>,
     /// Whether this route batch belongs to prefill or decode.
     pub pass: ExpertPass,
+    /// Optional admitted sparse-unit observer. Providers must preserve it through
+    /// bank compaction and token chunking; it observes the values used downstream.
+    pub unit_observer: Option<&'observer mut dyn RoutedUnitObserver<T>>,
 }
 
-impl<T> RoutedExpertRequest<'_, T> {
+impl<T: Tensor> RoutedExpertRequest<'_, '_, T> {
     /// Projects architecture execution semantics into the storage workload
     /// class exposed to backend parameter-bank mechanisms.
     pub const fn parameter_bank_access(&self) -> ParameterBankAccess {
@@ -1298,7 +1309,7 @@ where
     B: GroupedNeuralBackend,
 {
     /// Provider-specific acquisition or execution failure.
-    type Error;
+    type Error: std::error::Error + Send + Sync + 'static;
 
     /// Optional pre-dispatch control supplied by an instrumented provider adapter.
     fn routing_control(
@@ -1326,7 +1337,7 @@ where
     fn forward_grouped(
         &mut self,
         resident_bank: &mut B::GatedProductGroups,
-        request: RoutedExpertRequest<'_, B::Tensor>,
+        request: RoutedExpertRequest<'_, '_, B::Tensor>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error>;
 
@@ -1338,7 +1349,7 @@ where
     fn forward_compact_grouped(
         &mut self,
         resident_bank: &mut B::GatedProductGroups,
-        request: RoutedExpertRequest<'_, B::Tensor>,
+        request: RoutedExpertRequest<'_, '_, B::Tensor>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error> {
         self.forward_grouped(resident_bank, request, context)
@@ -1348,7 +1359,7 @@ where
     fn forward_linear_routed(
         &mut self,
         resident_bank: &mut B::LinearGroups,
-        request: RoutedExpertRequest<'_, B::Tensor>,
+        request: RoutedExpertRequest<'_, '_, B::Tensor>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error>;
 
@@ -1356,7 +1367,7 @@ where
     fn forward_relu2_routed(
         &mut self,
         resident_bank: &mut B::Relu2Groups,
-        request: RoutedExpertRequest<'_, B::Tensor>,
+        request: RoutedExpertRequest<'_, '_, B::Tensor>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error>;
 }
@@ -1370,7 +1381,7 @@ where
     fn forward_grouped_tensor_parallel(
         &mut self,
         resident_bank: &mut B::GatedProductGroups,
-        request: RoutedExpertRequest<'_, B::Tensor>,
+        request: RoutedExpertRequest<'_, '_, B::Tensor>,
         partitions: usize,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<RoutedExpertTensorParallelOutput<B::Tensor>, Self::Error>;
@@ -1380,7 +1391,7 @@ where
     fn forward_compact_grouped_tensor_parallel(
         &mut self,
         resident_bank: &mut B::GatedProductGroups,
-        request: RoutedExpertRequest<'_, B::Tensor>,
+        request: RoutedExpertRequest<'_, '_, B::Tensor>,
         partitions: usize,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<RoutedExpertTensorParallelOutput<B::Tensor>, Self::Error> {
@@ -1391,7 +1402,7 @@ where
     fn forward_relu2_routed_tensor_parallel(
         &mut self,
         resident_bank: &mut B::Relu2Groups,
-        request: RoutedExpertRequest<'_, B::Tensor>,
+        request: RoutedExpertRequest<'_, '_, B::Tensor>,
         partitions: usize,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<RoutedExpertTensorParallelOutput<B::Tensor>, Self::Error>;
@@ -1460,6 +1471,10 @@ impl RoutedObservationPoints {
 /// Failure from either canonical expert execution or its observation hook.
 #[derive(Debug)]
 pub enum ObservedExpertProviderError<P, O> {
+    /// Original sparse-unit observer failure, retained across provider adapters.
+    Unit(eredu_nn::Error),
+    /// Two owners attempted to attach unit observation to the same request.
+    DuplicateUnitObserver,
     /// Request names a bank absent from architecture discovery.
     Bank(RoutedBankId),
     /// The wrapped provider rejected or failed the expert request.
@@ -1475,6 +1490,10 @@ where
 {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::Unit(error) => write!(formatter, "routed unit observer failed: {error}"),
+            Self::DuplicateUnitObserver => {
+                formatter.write_str("routed request already has a unit observer")
+            }
             Self::Bank(bank) => write!(
                 formatter,
                 "unknown routed observation bank {}",
@@ -1491,6 +1510,25 @@ where
     P: std::error::Error + 'static,
     O: std::error::Error + 'static,
 {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Unit(error) => Some(error),
+            Self::Provider(error) => Some(error),
+            Self::Observer(error) => Some(error),
+            _ => None,
+        }
+    }
+}
+
+impl<P: std::error::Error + Send + Sync + 'static> ObservedExpertProviderError<P, eredu_nn::Error> {
+    /// Preserves neural observer failures when returning through an architecture.
+    /// Provider failures retain their original typed cause through the same boundary.
+    pub fn into_neural_error(self) -> eredu_nn::Error {
+        match self {
+            Self::Unit(error) | Self::Observer(error) => error,
+            other => eredu_nn::Error::backend_source(other),
+        }
+    }
 }
 
 /// Decorates a routed provider with normalized routing observation.
@@ -1504,6 +1542,7 @@ pub struct ObservedExpertProvider<'a, P, O: ?Sized, E> {
     provider: &'a mut P,
     observer: &'a mut O,
     point: RoutedObservationPoints,
+    unit_failure: Option<eredu_nn::Error>,
     error: std::marker::PhantomData<fn() -> E>,
 }
 
@@ -1514,7 +1553,21 @@ impl<'a, P, O: ?Sized, E> ObservedExpertProvider<'a, P, O, E> {
             provider,
             observer,
             point,
+            unit_failure: None,
             error: std::marker::PhantomData,
+        }
+    }
+
+    /// Executes a neural architecture adapter while preserving a unit callback
+    /// failure even if that adapter formats its generic provider error as text.
+    pub fn execute_neural<R>(
+        mut self,
+        execute: impl FnOnce(&mut Self) -> Result<R, eredu_nn::Error>,
+    ) -> Result<R, eredu_nn::Error> {
+        let result = execute(&mut self);
+        match self.unit_failure {
+            Some(error) => Err(error),
+            None => result,
         }
     }
 
@@ -1549,6 +1602,7 @@ where
     B: GroupedNeuralBackend,
     P: RoutedExpertProvider<B>,
     O: ActivationObserver<B::Tensor, E> + ?Sized,
+    E: std::error::Error + Send + Sync + 'static,
 {
     type Error = ObservedExpertProviderError<P::Error, E>;
 
@@ -1590,7 +1644,7 @@ where
     fn forward_grouped(
         &mut self,
         resident_bank: &mut B::GatedProductGroups,
-        request: RoutedExpertRequest<'_, B::Tensor>,
+        request: RoutedExpertRequest<'_, '_, B::Tensor>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error> {
         let point = self
@@ -1599,10 +1653,15 @@ where
             .ok_or(ObservedExpertProviderError::Bank(request.bank))?
             .clone();
         let routes = request.routes;
-        let output = self
-            .provider
-            .forward_grouped(resident_bank, request, context)
-            .map_err(ObservedExpertProviderError::Provider)?;
+        let output = with_routed_unit_observer(self.observer, point.path(), request, |request| {
+            self.provider
+                .forward_grouped(resident_bank, request, context)
+        })
+        .inspect_err(|error| {
+            if let ObservedExpertProviderError::Unit(cause) = error {
+                self.unit_failure = Some(cause.clone());
+            }
+        })?;
         self.observe(&point, routes, &output)
             .map_err(ObservedExpertProviderError::Observer)
     }
@@ -1611,7 +1670,7 @@ where
     fn forward_linear_routed(
         &mut self,
         resident_bank: &mut B::LinearGroups,
-        request: RoutedExpertRequest<'_, B::Tensor>,
+        request: RoutedExpertRequest<'_, '_, B::Tensor>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error> {
         let point = self
@@ -1631,7 +1690,7 @@ where
     fn forward_relu2_routed(
         &mut self,
         resident_bank: &mut B::Relu2Groups,
-        request: RoutedExpertRequest<'_, B::Tensor>,
+        request: RoutedExpertRequest<'_, '_, B::Tensor>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error> {
         let point = self
@@ -1640,10 +1699,15 @@ where
             .ok_or(ObservedExpertProviderError::Bank(request.bank))?
             .clone();
         let routes = request.routes;
-        let output = self
-            .provider
-            .forward_relu2_routed(resident_bank, request, context)
-            .map_err(ObservedExpertProviderError::Provider)?;
+        let output = with_routed_unit_observer(self.observer, point.path(), request, |request| {
+            self.provider
+                .forward_relu2_routed(resident_bank, request, context)
+        })
+        .inspect_err(|error| {
+            if let ObservedExpertProviderError::Unit(cause) = error {
+                self.unit_failure = Some(cause.clone());
+            }
+        })?;
         self.observe(&point, routes, &output)
             .map_err(ObservedExpertProviderError::Observer)
     }
@@ -1654,29 +1718,166 @@ where
     B: GroupedNeuralBackend,
     P: TensorParallelRoutedExpertProvider<B>,
     O: ActivationObserver<B::Tensor, E> + ?Sized,
+    E: std::error::Error + Send + Sync + 'static,
 {
     fn forward_grouped_tensor_parallel(
         &mut self,
         resident_bank: &mut B::GatedProductGroups,
-        request: RoutedExpertRequest<'_, B::Tensor>,
+        request: RoutedExpertRequest<'_, '_, B::Tensor>,
         partitions: usize,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<RoutedExpertTensorParallelOutput<B::Tensor>, Self::Error> {
-        self.provider
-            .forward_grouped_tensor_parallel(resident_bank, request, partitions, context)
-            .map_err(ObservedExpertProviderError::Provider)
+        let point = self
+            .point
+            .bank(request.bank)
+            .ok_or(ObservedExpertProviderError::Bank(request.bank))?;
+        with_routed_unit_observer(self.observer, point.path(), request, |request| {
+            self.provider.forward_grouped_tensor_parallel(
+                resident_bank,
+                request,
+                partitions,
+                context,
+            )
+        })
+        .inspect_err(|error| {
+            if let ObservedExpertProviderError::Unit(cause) = error {
+                self.unit_failure = Some(cause.clone());
+            }
+        })
     }
 
     fn forward_relu2_routed_tensor_parallel(
         &mut self,
         resident_bank: &mut B::Relu2Groups,
-        request: RoutedExpertRequest<'_, B::Tensor>,
+        request: RoutedExpertRequest<'_, '_, B::Tensor>,
         partitions: usize,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<RoutedExpertTensorParallelOutput<B::Tensor>, Self::Error> {
-        self.provider
-            .forward_relu2_routed_tensor_parallel(resident_bank, request, partitions, context)
-            .map_err(ObservedExpertProviderError::Provider)
+        let point = self
+            .point
+            .bank(request.bank)
+            .ok_or(ObservedExpertProviderError::Bank(request.bank))?;
+        with_routed_unit_observer(self.observer, point.path(), request, |request| {
+            self.provider.forward_relu2_routed_tensor_parallel(
+                resident_bank,
+                request,
+                partitions,
+                context,
+            )
+        })
+        .inspect_err(|error| {
+            if let ObservedExpertProviderError::Unit(cause) = error {
+                self.unit_failure = Some(cause.clone());
+            }
+        })
+    }
+}
+
+fn attach_unit_observer<'data, 'a, 'source: 'a, T, O, E, P>(
+    observer: &'a mut O,
+    path: &str,
+    request: RoutedExpertRequest<'data, 'source, T>,
+) -> Result<RoutedExpertRequest<'data, 'a, T>, ObservedExpertProviderError<P, E>>
+where
+    T: Tensor,
+    O: ActivationObserver<T, E> + ?Sized,
+{
+    let added = observer
+        .routed_unit_observer(path)
+        .map_err(ObservedExpertProviderError::Observer)?;
+    if added.is_some() && request.unit_observer.is_some() {
+        return Err(ObservedExpertProviderError::DuplicateUnitObserver);
+    }
+    Ok(RoutedExpertRequest {
+        bank: request.bank,
+        layer: request.layer,
+        input: request.input,
+        routes: request.routes,
+        pass: request.pass,
+        unit_observer: added.or(request
+            .unit_observer
+            .map(|observer| observer as &'a mut (dyn RoutedUnitObserver<T> + 'a))),
+    })
+}
+
+struct RecordingUnitObserver<'a, T: Tensor> {
+    inner: &'a mut dyn RoutedUnitObserver<T>,
+    failure: &'a mut Option<eredu_nn::Error>,
+}
+impl<T: Tensor> RoutedUnitObserver<T> for RecordingUnitObserver<'_, T> {
+    fn begin_invocation(
+        &mut self,
+        invocation: &RoutedUnitInvocation<'_, T>,
+    ) -> Result<(), eredu_nn::Error> {
+        self.inner
+            .begin_invocation(invocation)
+            .inspect_err(|error| {
+                self.failure.get_or_insert_with(|| error.clone());
+            })
+    }
+    fn finish_invocation(&mut self, success: bool) -> Result<(), eredu_nn::Error> {
+        self.inner.finish_invocation(success).inspect_err(|error| {
+            if success {
+                self.failure.get_or_insert_with(|| error.clone());
+            }
+        })
+    }
+    fn invocation_active(&self) -> bool {
+        self.inner.invocation_active()
+    }
+    fn observe(&mut self, batch: &RoutedUnitBatch<'_, T>) -> Result<(), eredu_nn::Error> {
+        self.inner.observe(batch).map_err(|error| {
+            self.failure.get_or_insert_with(|| error.clone());
+            error
+        })
+    }
+    fn intervene(&mut self, batch: &RoutedUnitBatch<'_, T>) -> Result<Option<T>, eredu_nn::Error> {
+        self.inner.intervene(batch).map_err(|error| {
+            self.failure.get_or_insert_with(|| error.clone());
+            error
+        })
+    }
+    fn observe_effective(&mut self, batch: &RoutedUnitBatch<'_, T>) -> Result<(), eredu_nn::Error> {
+        self.inner.observe_effective(batch).map_err(|error| {
+            self.failure.get_or_insert_with(|| error.clone());
+            error
+        })
+    }
+}
+/// Attaches a borrowed unit observer for one routed invocation and preserves its
+/// original failure across provider error adaptation. Architecture drivers that
+/// observe shared and routed outputs together use this without duplicating their
+/// completed routing event. No completed-output observation is emitted here.
+pub fn with_routed_unit_observer<'data, T, O, E, P, R>(
+    observer: &mut O,
+    path: &str,
+    request: RoutedExpertRequest<'data, '_, T>,
+    execute: impl for<'unit> FnOnce(RoutedExpertRequest<'data, 'unit, T>) -> Result<R, P>,
+) -> Result<R, ObservedExpertProviderError<P, E>>
+where
+    T: Tensor,
+    O: ActivationObserver<T, E> + ?Sized,
+{
+    let request = attach_unit_observer(observer, path, request)?;
+    let mut failure = None;
+    let mut recording = request.unit_observer.map(|inner| RecordingUnitObserver {
+        inner,
+        failure: &mut failure,
+    });
+    let result = execute(RoutedExpertRequest {
+        bank: request.bank,
+        layer: request.layer,
+        input: request.input,
+        routes: request.routes,
+        pass: request.pass,
+        unit_observer: recording
+            .as_mut()
+            .map(|observer| observer as &mut dyn RoutedUnitObserver<T>),
+    });
+    drop(recording);
+    match failure {
+        Some(error) => Err(ObservedExpertProviderError::Unit(error)),
+        None => result.map_err(ObservedExpertProviderError::Provider),
     }
 }
 
@@ -1693,29 +1894,60 @@ where
     fn forward_grouped(
         &mut self,
         resident_bank: &mut B::GatedProductGroups,
-        request: RoutedExpertRequest<'_, B::Tensor>,
+        mut request: RoutedExpertRequest<'_, '_, B::Tensor>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error> {
-        resident_bank.forward_grouped(request.input, request.routes, context)
+        with_provider_unit_observer(
+            &mut request.unit_observer,
+            request.routes.group_indices(),
+            None,
+            0,
+            |observer| {
+                resident_bank.forward_grouped_with_unit_observer(
+                    request.input,
+                    request.routes,
+                    context,
+                    observer,
+                )
+            },
+        )
     }
 
     /// Executes an activated selected-linear bank with owned output rows.
     fn forward_linear_routed(
         &mut self,
         resident_bank: &mut B::LinearGroups,
-        request: RoutedExpertRequest<'_, B::Tensor>,
+        request: RoutedExpertRequest<'_, '_, B::Tensor>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error> {
+        if request.unit_observer.is_some() {
+            return Err(eredu_nn::Error::backend_source(
+                eredu_nn::GroupedUnitError::Unavailable,
+            ));
+        }
         resident_bank.forward_grouped(request.input, request.routes, context)
     }
 
     fn forward_relu2_routed(
         &mut self,
         resident_bank: &mut B::Relu2Groups,
-        request: RoutedExpertRequest<'_, B::Tensor>,
+        mut request: RoutedExpertRequest<'_, '_, B::Tensor>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error> {
-        resident_bank.forward_grouped(request.input, request.routes, context)
+        with_provider_unit_observer(
+            &mut request.unit_observer,
+            request.routes.group_indices(),
+            None,
+            0,
+            |observer| {
+                resident_bank.forward_grouped_with_unit_observer(
+                    request.input,
+                    request.routes,
+                    context,
+                    observer,
+                )
+            },
+        )
     }
 }
 
@@ -1726,16 +1958,25 @@ where
     fn forward_grouped_tensor_parallel(
         &mut self,
         resident_bank: &mut B::GatedProductGroups,
-        request: RoutedExpertRequest<'_, B::Tensor>,
+        mut request: RoutedExpertRequest<'_, '_, B::Tensor>,
         partitions: usize,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<RoutedExpertTensorParallelOutput<B::Tensor>, Self::Error> {
-        B::gated_product_groups_tensor_parallel(
-            resident_bank,
-            request.input,
-            request.routes,
-            partitions,
-            context,
+        with_provider_unit_observer(
+            &mut request.unit_observer,
+            request.routes.group_indices(),
+            None,
+            0,
+            |observer| {
+                B::gated_product_groups_tensor_parallel_with_unit_observer(
+                    resident_bank,
+                    request.input,
+                    request.routes,
+                    partitions,
+                    context,
+                    observer,
+                )
+            },
         )
         .map(RoutedExpertTensorParallelOutput::Partial)
     }
@@ -1743,16 +1984,25 @@ where
     fn forward_relu2_routed_tensor_parallel(
         &mut self,
         resident_bank: &mut B::Relu2Groups,
-        request: RoutedExpertRequest<'_, B::Tensor>,
+        mut request: RoutedExpertRequest<'_, '_, B::Tensor>,
         partitions: usize,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<RoutedExpertTensorParallelOutput<B::Tensor>, Self::Error> {
-        B::relu2_groups_tensor_parallel(
-            resident_bank,
-            request.input,
-            request.routes,
-            partitions,
-            context,
+        with_provider_unit_observer(
+            &mut request.unit_observer,
+            request.routes.group_indices(),
+            None,
+            0,
+            |observer| {
+                B::relu2_groups_tensor_parallel_with_unit_observer(
+                    resident_bank,
+                    request.input,
+                    request.routes,
+                    partitions,
+                    context,
+                    observer,
+                )
+            },
         )
         .map(RoutedExpertTensorParallelOutput::Partial)
     }

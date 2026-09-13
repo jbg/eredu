@@ -40,6 +40,7 @@ pub use controlled_speculative::*;
 mod inspection;
 mod loaded;
 mod observed;
+mod parameters;
 pub use control::{
     ControlledGenerationBranch, ControlledGenerationError, ControlledGenerationRecord,
     ControlledGenerationSession, ControlledGenerationSnapshot, GenerationBranchMetadata,

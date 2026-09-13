@@ -17,6 +17,9 @@ use safemlx::{
 mod collectives;
 mod handle;
 mod point_to_point;
+mod status;
+
+pub(crate) use status::independent_status_members;
 
 pub use collectives::{all_gather, all_sum, all_to_all_v};
 pub(crate) use collectives::{

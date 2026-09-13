@@ -152,6 +152,7 @@ impl HostTransferBuffer {
         let dim = i32::try_from(shape.len()).map_err(|_| crate::error::Exception {
             what: "Host transfer buffer rank exceeds i32::MAX".to_string(),
             location: std::panic::Location::caller(),
+            source: None,
         })?;
         Self::try_from_op(|buffer| unsafe {
             safemlx_sys::mlx_host_transfer_buffer_new(

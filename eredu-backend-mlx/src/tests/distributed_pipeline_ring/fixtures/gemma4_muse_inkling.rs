@@ -151,7 +151,15 @@ fn write_gemma4_tensor_parallel_fixture_with_options(
 }
 
 fn write_muse_glimmer_tensor_parallel_fixture(directory: &Path) {
-    let config = serde_json::json!({
+    write_muse_glimmer_fixture(directory, false, false, false);
+}
+
+fn write_muse_glimmer_component_fixture(directory: &Path, routed: bool, quantizable: bool) {
+    write_muse_glimmer_fixture(directory, true, routed, quantizable);
+}
+
+fn write_muse_glimmer_fixture(directory: &Path, components: bool, routed: bool, quantizable: bool) {
+    let mut config = serde_json::json!({
         "architectures": ["MuseGlimmerForConditionalGeneration"],
         "model_type": "muse_glimmer",
         "image_token_id": 22,
@@ -199,6 +207,31 @@ fn write_muse_glimmer_tensor_parallel_fixture(directory: &Path) {
             "rope_parameters": {"rope_theta": 10000.0, "rope_type": "default"}
         }
     });
+    if components {
+        config["image_token_id"] = 42.into();
+        config["video_token_id"] = 43.into();
+        config["text_config"]["vocab_size"] = 64.into();
+        config["text_config"]["hidden_size"] = 64.into();
+        config["text_config"]["intermediate_size"] = 128.into();
+        config["text_config"]["head_dim"] = 16.into();
+        config["text_config"]["qk_scale_factor"] = 1.3.into();
+        config["text_config"]["output_multiplier"] = 1.9.into();
+        config["text_config"]["final_logit_softcapping"] = 7.0.into();
+        config["vision_config"]["pos_emb_width"] = 4.into();
+        config["vision_config"]["max_position_embeddings"] = 8.into();
+    }
+    if quantizable {
+        // TP=2 retains a full group-32 block in each row-parallel media shard.
+        config["vision_config"]["hidden_size"] = 64.into();
+        config["vision_config"]["intermediate_size"] = 64.into();
+        config["out_hidden_size"] = 256.into();
+        config["projector_hidden_size"] = 64.into();
+    }
+    if routed {
+        config["text_config"]["num_experts"] = 4.into();
+        config["text_config"]["num_experts_per_tok"] = 2.into();
+        config["text_config"]["moe_intermediate_size"] = 64.into();
+    }
     std::fs::create_dir_all(directory).unwrap();
     std::fs::write(
         directory.join("config.json"),
@@ -218,6 +251,7 @@ fn write_muse_glimmer_tensor_parallel_fixture(directory: &Path) {
     let architecture = Architecture::new(args, stream).unwrap();
     let mut arrays = Vec::<(String, Array)>::new();
     struct Collector<'a> {
+        components: bool,
         stream: &'a Stream,
         arrays: &'a mut Vec<(String, Array)>,
     }
@@ -226,12 +260,33 @@ fn write_muse_glimmer_tensor_parallel_fixture(directory: &Path) {
             let parameter = parameter.as_array();
             self.arrays.push((
                 metadata.id.to_string(),
-                safemlx::ops::zeros_dtype(parameter.shape(), parameter.dtype(), self.stream)
-                    .unwrap(),
+                if self.components {
+                    let name = metadata.id.as_str();
+                    let seed = name
+                        .bytes()
+                        .fold(0u32, |s, b| s.wrapping_mul(31).wrapping_add(u32::from(b)));
+                    let values = (0..parameter.shape().iter().product::<i32>() as usize)
+                        .map(|i| {
+                            let delta = ((i * 7 + (seed % 97) as usize) % 41) as f32 - 20.0;
+                            if name.contains("norm") && name.ends_with("weight") {
+                                0.9 + delta * 0.002
+                            } else {
+                                delta * 0.008
+                            }
+                        })
+                        .collect::<Vec<_>>();
+                    Array::from_slice(&values, parameter.shape())
+                        .as_dtype(parameter.dtype(), self.stream)
+                        .unwrap()
+                } else {
+                    safemlx::ops::zeros_dtype(parameter.shape(), parameter.dtype(), self.stream)
+                        .unwrap()
+                },
             ));
         }
     }
     let mut collector = Collector {
+        components,
         stream,
         arrays: &mut arrays,
     };
@@ -559,11 +614,33 @@ fn gguf_tensor_from_array(name: impl Into<String>, array: &Array) -> GgufFixture
     f32_gguf_tensor(name, dimensions, evaluated.as_slice::<f32>().to_vec())
 }
 
-fn write_inkling_gguf_fixture(path: &Path) {
+fn write_inkling_gguf_fixture(path: &Path, components: bool) {
     let config = inkling_config();
     let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
     let stream = execution.stream();
-    let (_args, parameters) = initialized_inkling_parameters(&config, stream);
+    let (_args, mut parameters) = initialized_inkling_parameters(&config, stream);
+    if components {
+        for (name, value) in &mut parameters {
+            let shape = value.shape().to_vec();
+            let count = shape.iter().map(|dimension| *dimension as usize).product();
+            let seed = name
+                .bytes()
+                .fold(0_u32, |a, b| a.wrapping_mul(31).wrapping_add(u32::from(b)));
+            let values = (0..count)
+                .map(|index| {
+                    let delta = ((index * 7 + (seed % 97) as usize) % 41) as f32 - 20.0;
+                    if name.ends_with("global_scale") {
+                        1.3
+                    } else if name.contains("norm") && name.ends_with("weight") {
+                        1.0 + delta * 0.002
+                    } else {
+                        delta * 0.02
+                    }
+                })
+                .collect::<Vec<_>>();
+            *value = Array::from_slice(&values, &shape);
+        }
+    }
     let mut specs = Vec::new();
     for (runtime, value) in &parameters {
         let runtime = runtime.as_str();
@@ -650,4 +727,90 @@ fn f32_gguf_tensor(
             .flat_map(|value| value.to_le_bytes())
             .collect(),
     }
+}
+
+fn write_gemma4_component_fixture(directory: &Path, sparse: bool, quantizable: bool) {
+    let config = serde_json::json!({
+        "model_type":"gemma4_unified", "tie_word_embeddings":false, "image_token_id":42,
+        "text_config":{
+            "model_type":"gemma4_text", "hidden_size":64, "num_hidden_layers":4,
+            "intermediate_size":128, "num_attention_heads":4, "num_key_value_heads":2,
+            "head_dim":16, "rms_norm_eps":0.00001, "vocab_size":64,
+            "max_position_embeddings":128, "attention_bias":true, "attention_k_eq_v":sparse,
+            "num_kv_shared_layers":2,
+            "layer_types":["sliding_attention","full_attention","sliding_attention","full_attention"],
+            "sliding_window":8, "enable_moe_block":sparse, "num_experts":sparse.then_some(4),
+            "top_k_experts":sparse.then_some(2), "moe_intermediate_size":sparse.then_some(64),
+            // TP2 needs at least two complete groups of 32 for the quantized
+            // per-layer projection's input partition.
+            "hidden_size_per_layer_input":if quantizable {64} else {32}, "vocab_size_per_layer_input":64,
+            "final_logit_softcapping":7.0
+        },
+        "vision_config":{
+            "hidden_size":64, "intermediate_size":128, "num_hidden_layers":2,
+            "num_attention_heads":4, "num_key_value_heads":2, "head_dim":16, "patch_size":2,
+            "pooling_kernel_size":2, "position_embedding_size":4, "rms_norm_eps":0.00001
+        }
+    });
+    let family = eredu_architectures::gemma4::FamilyConfig::from_hf_json(
+        &serde_json::to_vec(&config).unwrap(),
+    )
+    .unwrap();
+    let schema = eredu_architectures::gemma4::safetensors_plan(&family).unwrap();
+    let tensors = schema
+        .common_tensors
+        .iter()
+        .chain(
+            schema
+                .layout_groups
+                .iter()
+                .filter_map(|group| group.variants.first())
+                .flat_map(|variant| &variant.tensors),
+        )
+        .map(|tensor| {
+            let seed = tensor
+                .key
+                .bytes()
+                .fold(0_u32, |a, b| a.wrapping_mul(31).wrapping_add(u32::from(b)));
+            let bytes = (0..tensor.shape.iter().product::<usize>())
+                .flat_map(|i| {
+                    let delta = ((i * 7 + (seed % 97) as usize) % 41) as f32 - 20.0;
+                    let value = if tensor.key.ends_with("layer_scalar") {
+                        1.15
+                    } else if tensor.key.ends_with("input_min")
+                        || tensor.key.ends_with("output_min")
+                    {
+                        -4.0
+                    } else if tensor.key.ends_with("input_max")
+                        || tensor.key.ends_with("output_max")
+                    {
+                        4.0
+                    } else if tensor.key.contains("norm") && tensor.key.ends_with("weight") {
+                        0.9 + delta * 0.002
+                    } else {
+                        delta * 0.008
+                    };
+                    value.to_le_bytes()
+                })
+                .collect::<Vec<_>>();
+            (tensor.key.clone(), tensor.shape.clone(), bytes)
+        })
+        .collect::<Vec<_>>();
+    std::fs::create_dir_all(directory).unwrap();
+    serialize_to_file(
+        tensors.iter().map(|(name, shape, bytes)| {
+            (
+                name,
+                TensorView::new(Dtype::F32, shape.clone(), bytes).unwrap(),
+            )
+        }),
+        None,
+        &directory.join("model.safetensors"),
+    )
+    .unwrap();
+    std::fs::write(
+        directory.join("config.json"),
+        serde_json::to_vec_pretty(&config).unwrap(),
+    )
+    .unwrap();
 }

@@ -84,6 +84,26 @@ pub fn activation_conformance<B: InterventionBackend>(
         read(&value),
         vec![1., 2., 3., 4., 5., f32::NEG_INFINITY, 7., f32::NEG_INFINITY]
     );
+    for (indices, keep_selected, expected) in [
+        (vec![0, 2], true, vec![1., 2., 3., 4., 5., 0., 7., 0.]),
+        (vec![0, 2], false, vec![1., 2., 3., 4., 0., 6., 0., 8.]),
+        (vec![], true, vec![1., 2., 3., 4., 0., 0., 0., 0.]),
+        (vec![0, 1, 2, 3], true, vec![1., 2., 3., 4., 5., 6., 7., 8.]),
+    ] {
+        let action = InterventionAction::MaskComponents {
+            dtype: InterventionDtype::Float32,
+            indices,
+            keep_selected,
+        };
+        let value =
+            eredu_runtime::intervention::apply_activation(backend, &input, &action, &row).unwrap();
+        assert_eq!(read(&value), expected);
+        assert_eq!(read(&input), vec![1., 2., 3., 4., 5., 6., 7., 8.]);
+        assert!(
+            eredu_runtime::intervention::apply_activation(backend, &input, &action, &slice)
+                .is_err()
+        );
+    }
     let scale = InterventionAction::Scale {
         dtype: InterventionDtype::Float32,
         factor: 1.,

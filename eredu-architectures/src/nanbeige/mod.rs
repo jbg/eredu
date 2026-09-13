@@ -319,6 +319,11 @@ pub fn prompt_cache_architecture_fingerprint(args: &ModelArgs) -> String {
 }
 
 impl Config for ModelArgs {
+    fn parameter_alias(&self, name: &str) -> Option<String> {
+        let source =
+            crate::decoder::repeated::source_name("model", self.physical_layer_count(), name);
+        (source != name).then_some(source)
+    }
     fn model_family(&self) -> &'static str {
         "nanbeige"
     }

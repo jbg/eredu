@@ -169,7 +169,7 @@ ordinary prefill also advances prediction state to its architecture-declared
 prefix-relative frontier. Callers do not need to enter speculative generation
 before saving a complete prompt cache.
 
-Schema version 8 records:
+Schema version 9 records:
 
 - model family, effective type, checkpoint identity, and an architecture
   fingerprint;
@@ -180,7 +180,11 @@ Schema version 8 records:
 - block ranges, shapes, dtypes, and payload digests; and
 - exact prefix token identity plus the caller's processed-prefix fingerprint.
 
-Load accepts schema version 8 only. Model family, architecture fingerprint,
+Load accepts schema version 9 only. Version 8 and earlier cannot distinguish
+the former affine companion cast from source-precision-preserving materialization;
+rebuild those persisted prefixes by replaying their exact token IDs. This schema
+boundary applies to all persisted caches, including unquantized models.
+Model family, architecture fingerprint,
 prefix identity, layer ownership, topology, state representation, tensor
 geometry, and payload digests must match before arrays become live. Multimodal
 applications should include media bytes and processor settings in the

@@ -104,6 +104,59 @@ fn recovery_requires_fresh_restoration_and_no_native_failure() {
 }
 
 #[test]
+fn admission_rejection_preserves_state_and_source_but_never_proves_native_completion() {
+    use super::model_session::restored_error_permits_recovery;
+    use super::Error;
+    use eredu_runtime::ReplicatedTextSessionError;
+    use std::error::Error as _;
+    type Failure = ReplicatedTextSessionError<std::io::Error, std::io::Error, std::io::Error>;
+    let cause = Failure::Architecture(std::io::Error::other("observer admission failure"));
+    let rejected = Error::after_replicated_model_call(
+        Failure::BeforeStateMutation(Box::new(cause)),
+        Some(7),
+        Some(7),
+    );
+    assert!(rejected.model_state_preserved());
+    for settled in [false, true] {
+        assert!(restored_error_permits_recovery(
+            status(settled, false, false),
+            &rejected
+        ));
+        assert!(!restored_error_permits_recovery(
+            status(settled, true, false),
+            &rejected
+        ));
+        assert!(!restored_error_permits_recovery(
+            status(settled, false, true),
+            &rejected
+        ));
+    }
+    let public = eredu_core::BackendFailure::from_error(rejected);
+    let mut cause = public.source();
+    let mut found = false;
+    while let Some(error) = cause {
+        found |= error
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|error| error.to_string() == "observer admission failure");
+        cause = error.source();
+    }
+    assert!(
+        found,
+        "public failure must retain the original typed admission cause"
+    );
+    let uncertain = Error::after_replicated_model_call(
+        Failure::Architecture(std::io::Error::other("forward failed")),
+        Some(7),
+        Some(7),
+    );
+    assert!(!uncertain.model_state_preserved());
+    assert!(!restored_error_permits_recovery(
+        status(true, false, false),
+        &uncertain
+    ));
+}
+
+#[test]
 fn unresolved_scope_retains_payload_and_lease_after_public_owners_drop() {
     let drops = Arc::new(AtomicUsize::new(0));
     let mut authority = SessionAuthority::new();
@@ -514,6 +567,94 @@ fn unsupported_observer_preflight_does_not_poison_an_unmodified_session() {
 }
 
 #[test]
+fn deferred_capture_admission_failure_allows_native_session_reuse_after_settlement() {
+    use eredu_core::{capture::*, Completion as _};
+    let context =
+        crate::backend::ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
+    let stream = context.stream();
+    let backend = super::MlxBackend::new(stream, stream);
+    let (_artifact, mut session) = native_session(&backend);
+    let catalog = eredu_core::ObservationCatalog {
+        schema_version: 1,
+        completeness: eredu_core::DescriptionCompleteness::Complete,
+        points: vec![],
+    };
+    let support = eredu_core::ObservationSupportReport {
+        schema_version: 1,
+        points: vec![],
+        capture: CaptureCapabilities::default(),
+    };
+    let plan = CapturePlan {
+        schema_version: 1,
+        selections: vec![],
+        limits: CaptureLimits {
+            per_step: CaptureUsage::default(),
+            cumulative: CaptureUsage::default(),
+            physical_native_bytes: None,
+            on_limit: CaptureLimitPolicy::Fail,
+        },
+    }
+    .admit(
+        &catalog,
+        &support,
+        &support.capture,
+        CaptureRequestShape {
+            batch: 1,
+            prompt_tokens: 2,
+            max_predictions: 1,
+        },
+    )
+    .unwrap();
+    let mut capture = eredu_runtime::capture::CaptureSession::new(plan);
+    let prompt = super::MlxBackend::prepare_text_prompt(&backend, vec![1, 2]).unwrap();
+    let result = session.submit_prefill_with_observer(
+        &backend,
+        prompt,
+        &mut super::bounded_capture::observer(&mut capture, stream, None, 1),
+    );
+    let error = match result {
+        Err(error) => error,
+        Ok(_) => panic!("out-of-range capture prediction must fail during admission"),
+    };
+    assert!(error.to_string().contains("prediction range"), "{error}");
+    assert!(
+        error.model_state_preserved(),
+        "admission never entered the model driver"
+    );
+    let public = eredu_core::BackendFailure::from_error(error);
+    let mut source: &(dyn std::error::Error + 'static) = &public;
+    while let Some(next) = source.source() {
+        source = next;
+    }
+    assert!(matches!(
+        source.downcast_ref::<CaptureError>(),
+        Some(CaptureError::Invalid(_))
+    ));
+    assert!(capture.take_step().is_none());
+    recovery::wait_for_retirement(|| session.ensure_no_submission_in_flight().is_ok());
+    // A new complete observed forward is allowed after native retirement. Reuse
+    // the capture owner too, proving its failed pending transaction was drained.
+    let prompt = super::MlxBackend::prepare_text_prompt(&backend, vec![1, 2]).unwrap();
+    session
+        .submit_prefill_with_observer(
+            &backend,
+            prompt,
+            &mut super::bounded_capture::observer(&mut capture, stream, None, 0),
+        )
+        .unwrap()
+        .completion
+        .wait()
+        .unwrap();
+    assert_eq!(capture.take_step().unwrap().prediction_index, 0);
+    session
+        .submit_token_decode(&backend, 3)
+        .unwrap()
+        .completion
+        .wait()
+        .unwrap();
+}
+
+#[test]
 fn completed_native_output_retains_entire_session_payload_after_session_drop() {
     use eredu_core::Completion as _;
     let context =
@@ -666,4 +807,53 @@ fn unwinding_after_real_cpu_work_poison_excludes_native_session_reuse() {
     }));
     assert!(result.is_err());
     assert!(session.submit_token_decode(&backend, 2).is_err());
+}
+
+#[test]
+fn failed_resource_status_preserves_original_cause_and_retains_authority() {
+    for observed in [status(false, true, false), status(false, false, true)] {
+        let mut authority = SessionAuthority::new();
+        let poisoned = Rc::new(Cell::new(false));
+        let owner =
+            SubmissionResources::new(authority.begin_submission().unwrap(), Rc::clone(&poisoned));
+        let native = Rc::new(Cell::new(observed));
+        let operation = ResourceOperation::with_probe(&owner, FakeProbe(Rc::clone(&native)));
+        let result = operation.finish::<()>(Err(super::Error::Io(std::io::Error::other(
+            "precise resource failure",
+        ))));
+        assert!(
+            matches!(result, Err(super::Error::Io(ref cause)) if cause.to_string() == "precise resource failure")
+        );
+        owner.request_release();
+        assert!(poisoned.get());
+        assert!(authority.require_idle().is_err());
+        native.set(status(true, true, false));
+        recovery::wait_for_retirement(|| authority.require_idle().is_ok());
+        assert!(authority.require_idle().is_ok());
+        assert!(poisoned.get());
+    }
+}
+
+#[test]
+fn failed_model_status_preserves_original_cause_without_restoring_reuse() {
+    let stream = crate::test_stream();
+    let backend = super::MlxBackend::new(stream, stream);
+    for observed in [status(false, true, false), status(false, false, true)] {
+        let (_artifact, mut session) = native_session(&backend);
+        let native = Rc::new(Cell::new(observed));
+        let error = session
+            .test_failed_operation(
+                FakeProbe(Rc::clone(&native)),
+                super::Error::Io(std::io::Error::other("precise session failure")),
+                false,
+            )
+            .unwrap_err();
+        assert!(
+            matches!(error, super::Error::Io(ref cause) if cause.to_string() == "precise session failure")
+        );
+        assert!(session.ensure_no_submission_in_flight().is_err());
+        native.set(status(true, true, false));
+        recovery::reap();
+        assert!(session.ensure_no_submission_in_flight().is_err());
+    }
 }

@@ -1105,6 +1105,22 @@ pub(crate) trait CommittedTokenSource {
     fn next_token(&mut self) -> Result<Option<u32>, Self::Error>;
 
     fn grammar_is_complete(&mut self) -> Result<bool, Self::Error>;
+
+    /// Carries host failure/cancellation through the source's retained session
+    /// before another prediction can start. Local causes remain typed.
+    fn finish_step<T, E>(
+        &mut self,
+        local: Result<T, E>,
+        cancelled: bool,
+        _map_source: impl FnOnce(Self::Error) -> E,
+    ) -> Result<Option<T>, E> {
+        local.map(|value| (!cancelled).then_some(value))
+    }
+
+    /// A callback may retain a typed delivery failure while cancelling the run.
+    fn delivery_failure(&self) -> Option<eredu_core::capture::CaptureError> {
+        None
+    }
 }
 
 /// Typed failure at the committed-token orchestration boundary.
@@ -1119,6 +1135,8 @@ pub(crate) enum CommittedGenerationError<S, D> {
     Pipeline(CommittedTokenPipelineError<D>),
     /// Portable generation lifecycle state was invalid.
     Lifecycle(eredu_core::generation::GenerationError),
+    /// Bounded host-record delivery failed after native computation completed.
+    Delivery(eredu_core::capture::CaptureError),
     /// The backend stopped without producing a terminal token.
     MissingTerminalToken,
 }
@@ -1170,7 +1188,52 @@ impl CommittedGenerationCursor {
                 eredu_core::generation::GenerationError::FailedGeneration,
             ));
         }
-        let result = self.step_inner(source, pipeline, cancellation, emit);
+        if self.finish_reason.is_some() {
+            return Err(CommittedGenerationError::Lifecycle(
+                eredu_core::generation::GenerationError::AlreadyFinished,
+            ));
+        }
+        let result = (|| {
+            let ready = source.finish_step(
+                source.delivery_failure().map_or(Ok(()), |error| {
+                    Err(CommittedGenerationError::Delivery(error))
+                }),
+                cancellation.is_cancelled(),
+                CommittedGenerationError::Source,
+            )?;
+            if ready.is_none() {
+                cancellation.cancel();
+            }
+            let result = self.step_inner(source, pipeline, cancellation, emit);
+            let result = result.and_then(|()| {
+                source.delivery_failure().map_or(Ok(()), |error| {
+                    Err(CommittedGenerationError::Delivery(error))
+                })
+            });
+            let ready = source.finish_step(
+                result,
+                cancellation.is_cancelled(),
+                CommittedGenerationError::Source,
+            )?;
+            if ready.is_none() {
+                cancellation.cancel();
+                if self.finish_reason.is_none() {
+                    self.sequence.cancel();
+                    pipeline.cancel(emit);
+                    self.finish_reason = Some(FinishReason::Cancelled);
+                }
+                // A peer cancellation can itself publish a terminal callback.
+                // All peers enter this final disposition, including failures.
+                source.finish_step(
+                    source.delivery_failure().map_or(Ok(()), |error| {
+                        Err(CommittedGenerationError::Delivery(error))
+                    }),
+                    true,
+                    CommittedGenerationError::Source,
+                )?;
+            }
+            Ok(())
+        })();
         if result.is_err() {
             self.failed = true;
         }
@@ -1188,11 +1251,6 @@ impl CommittedGenerationCursor {
         D: TokenDecoderBackend,
         T: CommittedTokenSource,
     {
-        if self.finish_reason.is_some() {
-            return Err(CommittedGenerationError::Lifecycle(
-                eredu_core::generation::GenerationError::AlreadyFinished,
-            ));
-        }
         if self.sequence.observe_cancellation(cancellation) {
             pipeline.cancel(emit);
             self.finish_reason = Some(FinishReason::Cancelled);

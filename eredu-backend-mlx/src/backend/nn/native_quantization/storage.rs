@@ -445,11 +445,21 @@ impl NativeQuantizedTensor {
         }
         if native_execution_backend(stream)? == NativeExecutionBackend::Metal && transpose {
             return match self.format() {
-                NativeQuantizationFormat::GgufQ4K => q4k_linear_metal(input, self, stream),
-                NativeQuantizationFormat::GgufQ5K => q5k_linear_metal(input, self, stream),
-                NativeQuantizationFormat::GgufQ6K => q6k_linear_metal(input, self, stream),
-                NativeQuantizationFormat::GgufQ8_0 => q8_0_linear_metal(input, self, stream),
-                NativeQuantizationFormat::GgufQ5_1 => q5_1_linear_metal(input, self, stream),
+                NativeQuantizationFormat::GgufQ4K if self.storage.endian == GgufEndian::Little => {
+                    q4k_linear_metal(input, self, stream)
+                }
+                NativeQuantizationFormat::GgufQ5K if self.storage.endian == GgufEndian::Little => {
+                    q5k_linear_metal(input, self, stream)
+                }
+                NativeQuantizationFormat::GgufQ6K if self.storage.endian == GgufEndian::Little => {
+                    q6k_linear_metal(input, self, stream)
+                }
+                NativeQuantizationFormat::GgufQ8_0 if self.storage.endian == GgufEndian::Little => {
+                    q8_0_linear_metal(input, self, stream)
+                }
+                NativeQuantizationFormat::GgufQ5_1 if self.storage.endian == GgufEndian::Little => {
+                    q5_1_linear_metal(input, self, stream)
+                }
                 _ => iq_linear_metal(input, self, stream),
             };
         }
@@ -465,9 +475,15 @@ impl NativeQuantizedTensor {
         }
         if native_execution_backend(stream)? == NativeExecutionBackend::Metal {
             return match self.format() {
-                NativeQuantizationFormat::GgufQ4K => q4k_embedding_metal(indices, self, stream),
-                NativeQuantizationFormat::GgufQ8_0 => q8_0_embedding_metal(indices, self, stream),
-                NativeQuantizationFormat::GgufQ5_1 => q5_1_embedding_metal(indices, self, stream),
+                NativeQuantizationFormat::GgufQ4K if self.storage.endian == GgufEndian::Little => {
+                    q4k_embedding_metal(indices, self, stream)
+                }
+                NativeQuantizationFormat::GgufQ8_0 if self.storage.endian == GgufEndian::Little => {
+                    q8_0_embedding_metal(indices, self, stream)
+                }
+                NativeQuantizationFormat::GgufQ5_1 if self.storage.endian == GgufEndian::Little => {
+                    q5_1_embedding_metal(indices, self, stream)
+                }
                 _ => iq_embedding_metal(indices, self, stream),
             };
         }
@@ -479,9 +495,15 @@ impl NativeQuantizedTensor {
         let evaluated = self.storage.bytes.evaluated()?;
         let raw = evaluated.as_slice::<u8>();
         let values = match self.format() {
-            NativeQuantizationFormat::GgufQ4K => decode_q4k_view(raw, self)?,
-            NativeQuantizationFormat::GgufQ5_1 => decode_q5_1_view(raw, self)?,
-            NativeQuantizationFormat::GgufQ8_0 => decode_q8_0_view(raw, self)?,
+            NativeQuantizationFormat::GgufQ4K if self.storage.endian == GgufEndian::Little => {
+                decode_q4k_view(raw, self)?
+            }
+            NativeQuantizationFormat::GgufQ5_1 if self.storage.endian == GgufEndian::Little => {
+                decode_q5_1_view(raw, self)?
+            }
+            NativeQuantizationFormat::GgufQ8_0 if self.storage.endian == GgufEndian::Little => {
+                decode_q8_0_view(raw, self)?
+            }
             format => {
                 let ty = format.ggml_type().expect("IQ format");
                 let physical_shape = if self.matrix_count == 1 {

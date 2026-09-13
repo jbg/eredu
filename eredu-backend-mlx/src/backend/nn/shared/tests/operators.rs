@@ -8,6 +8,72 @@ fn close(actual: &MlxTensor, expected: &[f32], tolerance: f32) {
         .all(|(left, right)| (left - right).abs() <= tolerance));
 }
 
+fn mxfp4_embedding_lookup_contract(device: DeviceType) {
+    use crate::module::Module as _;
+    let execution = ExecutionContext::new(Device::new(device, 0));
+    let stream = execution.stream();
+    let mut embedding = crate::nn::QuantizedEmbedding::unloaded_with_mode(
+        2,
+        32,
+        32,
+        4,
+        QuantizationMode::MxFp4,
+        stream,
+    )
+    .unwrap();
+    let codes = (0..64)
+        .map(|i| ((i * 5 + i / 32) % 16) as u32)
+        .collect::<Vec<_>>();
+    let packed = codes
+        .chunks_exact(8)
+        .map(|chunk| {
+            chunk
+                .iter()
+                .enumerate()
+                .fold(0u32, |word, (shift, code)| word | (code << (4 * shift)))
+        })
+        .collect::<Vec<_>>();
+    embedding.inner.weight.value = Array::from_slice(&packed, &[2, 4]);
+    embedding.scales.value = Some(Array::from_slice(&[127u8, 128], &[2, 1]));
+    let original = embedding.inner.weight.value.clone();
+    let magnitudes = [0.0f32, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0];
+    let decoded = codes
+        .iter()
+        .enumerate()
+        .map(|(i, code)| {
+            let sign = if code & 8 == 0 { 1.0 } else { -1.0 };
+            sign * magnitudes[(code & 7) as usize] * if i < 32 { 1.0 } else { 2.0 }
+        })
+        .collect::<Vec<_>>();
+    let expected = [1usize, 0, 1]
+        .into_iter()
+        .flat_map(|row| decoded[row * 32..(row + 1) * 32].iter().copied())
+        .collect::<Vec<_>>();
+    let tokens = Array::from_slice(&[1i32, 0, 1], &[1, 3]);
+    for weight in [
+        original.clone(),
+        Array::from_slice(&decoded, &[2, 32]),
+        original,
+    ] {
+        embedding.inner.weight.value = weight;
+        let values = embedding.forward(&tokens, stream).unwrap();
+        assert_eq!(values.dtype(), Dtype::Float32);
+        assert_eq!(values.shape(), [1, 3, 32]);
+        assert_eq!(values.evaluated().unwrap().as_slice::<f32>(), expected);
+    }
+}
+
+#[test]
+fn mlx_mxfp4_embedding_lookup_preserves_f32_contract_cpu() {
+    mxfp4_embedding_lookup_contract(DeviceType::Cpu);
+}
+
+#[test]
+#[ignore = "requires local MLX Metal execution"]
+fn mlx_mxfp4_embedding_lookup_preserves_f32_contract_metal() {
+    mxfp4_embedding_lookup_contract(DeviceType::Gpu);
+}
+
 #[test]
 fn mlx_portable_normalization_geometry_preserves_additive_l2() {
     let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
@@ -524,6 +590,69 @@ fn mlx_general_normalization_matches_scalar_references() {
 }
 
 #[test]
+#[ignore = "explicit CPU and Metal normalization parity; run outside the sandbox"]
+fn mlx_learned_rms_bf16_rounding_matches_independent_reference() {
+    let cpu = Stream::new_with_device(&Device::new(DeviceType::Cpu, 0));
+    let fixture = Array::load_safetensors(
+        concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/validation/bf16_rms_input_rounding.safetensors"
+        ),
+        &cpu,
+    )
+    .unwrap();
+    for device in [DeviceType::Cpu, DeviceType::Gpu] {
+        for prefix in ["", "f16_"] {
+            let input = &fixture[&format!("{prefix}input")];
+            let weight = &fixture[&format!("{prefix}weight")];
+            let expected_tensor = &fixture[&format!("{prefix}output")];
+            let stream = Stream::new_with_device(&Device::new(device, 0));
+            let mut normalization = MlxNeuralBackend::normalization(
+                NormalizationConstructionSpec::learned(
+                    2048,
+                    1e-5,
+                    ParameterSpec::trainable("gain").unwrap(),
+                ),
+                &stream,
+            )
+            .unwrap();
+            normalization.module.as_mut().unwrap().weight =
+                crate::module::PhysicalParam::new(weight.clone());
+            let output = normalization.forward(input, &stream).unwrap();
+            assert_eq!(output.dtype(), input.dtype());
+            let read = |array: &Array| {
+                array
+                    .as_dtype(Dtype::Float32, &stream)
+                    .unwrap()
+                    .evaluated()
+                    .unwrap()
+                    .as_slice::<f32>()
+                    .to_vec()
+            };
+            let actual = read(&output);
+            let expected = read(expected_tensor);
+            assert_eq!(
+                actual.iter().zip(&expected).filter(|(a, b)| a != b).count(),
+                0,
+                "{device:?}"
+            );
+            let direct = MlxNeuralBackend::rms_norm_with_weight(
+                &MlxTensor::from_array(input.clone()),
+                &MlxTensor::from_array(weight.clone()),
+                1e-5,
+                &stream,
+            )
+            .unwrap();
+            assert_eq!(
+                read(direct.as_array()),
+                expected,
+                "direct weighted RMS {device:?}"
+            );
+        }
+    }
+}
+
+#[test]
 #[ignore = "explicit MLX grouped-normalization parity; run outside the sandbox"]
 fn mlx_silu_gated_group_norm_matches_scalar_reference() {
     let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
@@ -628,4 +757,472 @@ fn scaled_softplus_preserves_bfloat16_and_rounds_once() {
     });
     let actual = MlxTensor::from_array(actual.as_array().as_dtype(Dtype::Float32, stream).unwrap());
     close(&actual, &expected, 0.0);
+}
+#[derive(Default)]
+struct VocabularyInputEvidence {
+    value: Option<MlxTensor>,
+    generated: usize,
+    reject: bool,
+}
+
+impl eredu_nn::ProjectionInputObserver<MlxTensor> for VocabularyInputEvidence {
+    fn observe(&mut self, value: &MlxTensor) -> Result<(), eredu_nn::Error> {
+        if self.reject {
+            return Err(eredu_nn::Error::backend(
+                "vocabulary input capture rejected",
+            ));
+        }
+        self.value = Some(value.clone());
+        Ok(())
+    }
+
+    fn observe_generated(
+        &mut self,
+        prototype: &MlxTensor,
+        creation_bytes: &eredu_nn::GeneratedTensorSource,
+        generate: &mut dyn FnMut() -> Result<MlxTensor, eredu_nn::Error>,
+    ) -> Result<(), eredu_nn::Error> {
+        if self.reject {
+            return Err(eredu_nn::Error::backend(
+                "vocabulary input capture rejected",
+            ));
+        }
+        assert_eq!(
+            creation_bytes.element_type,
+            Some(eredu_nn::TensorElementType::F32)
+        );
+        assert!(creation_bytes.creation_bytes >= prototype.as_array().size() as u64 * 4);
+        self.generated += 1;
+        self.observe(&generate()?)
+    }
+}
+
+fn verify_vocabulary_projection_inputs(device: DeviceType) {
+    use eredu_checkpoint::{BlockFp8Format, BlockFp8ScaleEncoding};
+    use eredu_nn::{DistributedNeuralBackend, VocabularyParallelRange};
+
+    let (group, _) = singleton_communication();
+    let execution = ExecutionContext::new(Device::new(device, 0));
+    let stream = execution.stream();
+    let (width, rows, vocabulary) = (259usize, 3usize, 129usize);
+    let range = VocabularyParallelRange {
+        global_vocabulary: vocabulary,
+        local: 0..vocabulary,
+    };
+    let format = LinearFormat::E4M3BlockFp8(
+        BlockFp8Format::new(128, 128, BlockFp8ScaleEncoding::FloatingPoint).unwrap(),
+    );
+    let mut head = MlxNeuralBackend::vocabulary_parallel_linear(
+        LinearSpec {
+            input: width as i32,
+            output: vocabulary as i32,
+            weight: parameter("lm_head.weight"),
+            bias: None,
+            format: test_format("lm_head.weight", format),
+        },
+        range.clone(),
+        stream,
+    )
+    .unwrap();
+    let codes = (0..width * vocabulary)
+        .map(|i| [0x38u8, 0xb8, 0x40, 0xc0][i % 4])
+        .collect::<Vec<_>>();
+    head.module.weight.value = Array::from_slice(&codes, &[vocabulary as i32, width as i32]);
+    head.module.weight_scale_inv.value = Some(Array::from_slice(
+        &[0.01f32, 0.03, 0.02, 0.04, 0.07, 0.09],
+        &[2, 3],
+    ));
+    let values = (0..width * rows)
+        .map(|i| ((i * 17 % 137) as f32 - 68.0) * 0.03137)
+        .collect::<Vec<_>>();
+    let input = MlxTensor::from_array(Array::from_slice(&values, &[1, rows as i32, width as i32]));
+    let export = |value: &MlxTensor| {
+        value
+            .as_array()
+            .evaluated()
+            .unwrap()
+            .as_slice::<f32>()
+            .to_vec()
+    };
+    let mut ordinary_input = VocabularyInputEvidence::default();
+    let ordinary = head
+        .forward_with_input_observer(&input, stream, Some(&mut ordinary_input))
+        .unwrap();
+    let mut parallel_input = VocabularyInputEvidence::default();
+    let parallel = MlxNeuralBackend::vocabulary_parallel_project_with_input_observer(
+        &mut head,
+        &input,
+        &group,
+        stream,
+        Some(&mut parallel_input),
+    )
+    .unwrap();
+    assert_eq!(export(&ordinary), export(&parallel));
+    let actual_input = export(parallel_input.value.as_ref().unwrap());
+    assert_eq!(actual_input, export(ordinary_input.value.as_ref().unwrap()));
+    assert!(actual_input
+        .iter()
+        .zip(&values)
+        .any(|(a, b)| (a - b).abs() > 0.01));
+    assert_eq!(
+        parallel_input.generated,
+        usize::from(device == DeviceType::Gpu)
+    );
+    assert_eq!(
+        export(&parallel),
+        export(
+            &MlxNeuralBackend::vocabulary_parallel_project(&mut head, &input, &group, stream,)
+                .unwrap()
+        ),
+    );
+    let mut rejected = VocabularyInputEvidence {
+        reject: true,
+        ..Default::default()
+    };
+    let error = MlxNeuralBackend::vocabulary_parallel_project_with_input_observer(
+        &mut head,
+        &input,
+        &group,
+        stream,
+        Some(&mut rejected),
+    )
+    .unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("vocabulary input capture rejected"));
+    assert!(rejected.value.is_none());
+    assert_eq!(rejected.generated, 0);
+
+    let mut tied = MlxNeuralBackend::vocabulary_parallel_embedding(
+        EmbeddingSpec {
+            vocabulary: vocabulary as i32,
+            dimensions: width as i32,
+            weight: parameter("embed_tokens.weight"),
+            format: test_format("embed_tokens.weight", LinearFormat::Dense),
+        },
+        range,
+        stream,
+    )
+    .unwrap();
+    let weights = (0..width * vocabulary)
+        .map(|i| ((i % 31) as f32 - 15.0) * 0.017)
+        .collect::<Vec<_>>();
+    bind_embedding(
+        &mut tied,
+        Array::from_slice(&weights, &[vocabulary as i32, width as i32]),
+        stream,
+    );
+    let ordinary = tied.as_linear(&input, stream).unwrap();
+    let mut evidence = VocabularyInputEvidence::default();
+    let parallel = MlxNeuralBackend::vocabulary_parallel_embedding_project_with_input_observer(
+        &mut tied,
+        &input,
+        &group,
+        stream,
+        Some(&mut evidence),
+    )
+    .unwrap();
+    assert_eq!(export(&ordinary), export(&parallel));
+    assert_eq!(export(evidence.value.as_ref().unwrap()), values);
+    assert_eq!(evidence.generated, 0);
+
+    // A native gather failure must retain the original exception through both
+    // readout adapters. A display-only wrapper loses this diagnostic identity.
+    let wrong_range = VocabularyParallelRange {
+        global_vocabulary: vocabulary - 1,
+        local: 0..vocabulary - 1,
+    };
+    head.vocabulary_range = Some(wrong_range.clone());
+    tied.vocabulary_range = Some(wrong_range);
+    for error in [
+        MlxNeuralBackend::vocabulary_parallel_project(&mut head, &input, &group, stream)
+            .unwrap_err(),
+        MlxNeuralBackend::vocabulary_parallel_embedding_project(&mut tied, &input, &group, stream)
+            .unwrap_err(),
+    ] {
+        let mut source: Option<&(dyn std::error::Error + 'static)> = Some(&error);
+        let mut found = false;
+        while let Some(cause) = source {
+            found |= cause
+                .downcast_ref::<safemlx::error::Exception>()
+                .is_some_and(|native| {
+                    native.what()
+                        == format!(
+                            "rank 0 local width {vocabulary} does not match declared width {}",
+                            vocabulary - 1
+                        )
+                });
+            source = cause.source();
+        }
+        assert!(
+            found,
+            "readout gather must preserve the original native exception: {error}"
+        );
+    }
+}
+
+#[test]
+#[ignore = "requires MLX runtime execution"]
+fn vocabulary_projection_inputs_cpu() {
+    verify_vocabulary_projection_inputs(DeviceType::Cpu);
+}
+
+#[test]
+#[ignore = "requires local MLX Metal execution"]
+fn vocabulary_projection_inputs_metal() {
+    verify_vocabulary_projection_inputs(DeviceType::Gpu);
+}
+
+fn verify_grouped_projection_inputs(device: DeviceType) {
+    use eredu_checkpoint::{BlockFp8Format, BlockFp8ScaleEncoding};
+    use eredu_nn::GroupedNeuralBackend;
+    let execution = ExecutionContext::new(Device::new(device, 0));
+    let stream = execution.stream();
+    let (width, groups, tokens, rank) = (259usize, 2usize, 3usize, 3usize);
+    let values = (0..groups * tokens * width)
+        .map(|i| ((i * 17 % 137) as f32 - 68.0) * 0.03137)
+        .collect::<Vec<_>>();
+    let input = MlxTensor::from_array(Array::from_slice(
+        &values,
+        &[1, groups as i32, tokens as i32, width as i32],
+    ));
+    let codes = (0..groups * rank * width)
+        .map(|i| [0x38u8, 0xb8, 0x40, 0xc0][i % 4])
+        .collect::<Vec<_>>();
+    let weights = (0..codes.len())
+        .map(|i| [1.0f32, -1.0, 2.0, -2.0][i % 4] * [0.01, 0.03, 0.02][i % width / 128])
+        .collect::<Vec<_>>();
+    let export = |value: &MlxTensor| {
+        value
+            .as_array()
+            .evaluated()
+            .unwrap()
+            .as_slice::<f32>()
+            .to_vec()
+    };
+    for fp8 in [false, true] {
+        let format = if fp8 {
+            LinearFormat::E4M3BlockFp8(
+                BlockFp8Format::new(128, 128, BlockFp8ScaleEncoding::FloatingPoint).unwrap(),
+            )
+        } else {
+            LinearFormat::Dense
+        };
+        let mut linear = MlxNeuralBackend::linear(
+            LinearSpec {
+                input: width as i32,
+                output: (groups * rank) as i32,
+                weight: parameter("grouped.weight"),
+                bias: None,
+                format: test_format("grouped.weight", format),
+            },
+            stream,
+        )
+        .unwrap();
+        if fp8 {
+            linear.module.weight.value =
+                Array::from_slice(&codes, &[(groups * rank) as i32, width as i32]);
+            linear.module.weight_scale_inv.value =
+                Some(Array::from_slice(&[0.01f32, 0.03, 0.02], &[1, 3]));
+        } else {
+            linear.module.weight.value =
+                Array::from_slice(&weights, &[(groups * rank) as i32, width as i32]);
+        }
+        let ordinary = MlxNeuralBackend::grouped_linear(
+            &mut linear,
+            &input,
+            groups as i32,
+            rank as i32,
+            stream,
+        )
+        .unwrap();
+        let mut evidence = VocabularyInputEvidence::default();
+        let observed = MlxNeuralBackend::grouped_linear_with_input_observer(
+            &mut linear,
+            &input,
+            groups as i32,
+            rank as i32,
+            stream,
+            Some(&mut evidence),
+        )
+        .unwrap();
+        let actual = export(&observed);
+        assert_eq!(actual, export(&ordinary));
+        let effective = export(evidence.value.as_ref().unwrap());
+        assert_eq!(
+            evidence.value.as_ref().unwrap().as_array().shape(),
+            input.as_array().shape()
+        );
+        if fp8 {
+            assert!(effective
+                .iter()
+                .zip(&values)
+                .any(|(a, b)| (a - b).abs() > 0.01));
+        } else {
+            assert_eq!(effective, values);
+        }
+        for group in 0..groups {
+            for token in 0..tokens {
+                for out in 0..rank {
+                    let expected = (0..width)
+                        .map(|k| {
+                            f64::from(effective[(group * tokens + token) * width + k])
+                                * f64::from(weights[(group * rank + out) * width + k])
+                        })
+                        .sum::<f64>();
+                    let actual = f64::from(actual[(group * tokens + token) * rank + out]);
+                    assert!(
+                        (actual - expected).abs() <= 3e-5 * expected.abs().max(1.0),
+                        "{actual} != {expected}"
+                    );
+                }
+            }
+        }
+        let mut rejected = VocabularyInputEvidence {
+            reject: true,
+            ..Default::default()
+        };
+        let error = MlxNeuralBackend::grouped_linear_with_input_observer(
+            &mut linear,
+            &input,
+            groups as i32,
+            rank as i32,
+            stream,
+            Some(&mut rejected),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("input capture rejected"));
+        assert!(rejected.value.is_none());
+        assert_eq!(rejected.generated, 0);
+        let mut invalid = VocabularyInputEvidence::default();
+        assert!(MlxNeuralBackend::grouped_linear_with_input_observer(
+            &mut linear,
+            &input,
+            2,
+            i32::MAX,
+            stream,
+            Some(&mut invalid),
+        )
+        .is_err());
+        assert!(invalid.value.is_none());
+        assert_eq!(invalid.generated, 0);
+    }
+}
+
+#[test]
+#[ignore = "requires MLX runtime execution"]
+fn grouped_projection_inputs_cpu() {
+    verify_grouped_projection_inputs(DeviceType::Cpu);
+}
+
+#[test]
+#[ignore = "requires local MLX Metal execution"]
+fn grouped_projection_inputs_metal() {
+    verify_grouped_projection_inputs(DeviceType::Gpu);
+}
+
+fn verify_hyper_head_coefficients(device: DeviceType) {
+    use eredu_nn::{HyperHeadOperator, HyperHeadSpec, HyperNeuralBackend};
+    let execution = ExecutionContext::new(Device::new(device, 0));
+    let stream = execution.stream();
+    let mut head = MlxNeuralBackend::hyper_head(
+        HyperHeadSpec {
+            streams: 2,
+            hidden_size: 3,
+            norm_epsilon: 1e-5,
+            epsilon: 1e-6,
+            function: parameter("head.function"),
+            base: parameter("head.base"),
+            scale: parameter("head.scale"),
+        },
+        stream,
+    )
+    .unwrap();
+    head.module.function.value = Array::from_slice(
+        &[
+            0.1f32, -0.2, 0.3, -0.4, 0.5, -0.6, -0.3, 0.4, -0.5, 0.6, -0.7, 0.8,
+        ],
+        &[2, 6],
+    );
+    head.module.base.value = Array::from_slice(&[-0.25f32, 0.5], &[2]);
+    head.module.scale.value = Array::from_slice(&[0.7f32], &[1]);
+    let values = [
+        1.0f32, -2.0, 3.0, -4.0, 5.0, -6.0, -0.5, 0.25, -0.75, 1.5, -1.25, 2.0,
+    ];
+    let input = MlxTensor::from_array(Array::from_slice(&values, &[1, 2, 2, 3]));
+    let ordinary = head.forward(&input, stream).unwrap();
+    let mut capture = VocabularyInputEvidence::default();
+    let observed = head
+        .forward_with_coefficients_observer(&input, stream, Some(&mut capture))
+        .unwrap();
+    let coefficients = capture
+        .value
+        .as_ref()
+        .unwrap()
+        .as_array()
+        .evaluated()
+        .unwrap();
+    assert_eq!(
+        capture.value.as_ref().unwrap().as_array().shape(),
+        [1, 2, 2]
+    );
+    assert_eq!(capture.generated, 0);
+    let expected = (0..6)
+        .map(|i| {
+            let row = i / 3;
+            (0..2)
+                .map(|s| {
+                    values[(row * 2 + s) * 3 + i % 3] * coefficients.as_slice::<f32>()[row * 2 + s]
+                })
+                .sum::<f32>()
+        })
+        .collect::<Vec<_>>();
+    close(&observed, &expected, 1e-6);
+    close(
+        &observed,
+        ordinary.as_array().evaluated().unwrap().as_slice::<f32>(),
+        0.0,
+    );
+    struct Reject;
+    impl eredu_nn::TensorValueObserver<MlxTensor> for Reject {
+        fn observe(&mut self, _: &MlxTensor) -> Result<(), eredu_nn::Error> {
+            Err(eredu_nn::Error::backend_source(std::io::Error::other(
+                "coefficient admission rejected",
+            )))
+        }
+
+        fn observe_generated(
+            &mut self,
+            _: &MlxTensor,
+            _: &eredu_nn::GeneratedTensorSource,
+            _: &mut dyn FnMut() -> Result<MlxTensor, eredu_nn::Error>,
+        ) -> Result<(), eredu_nn::Error> {
+            panic!("hyper-head coefficients already exist in ordinary execution")
+        }
+    }
+    let error = head
+        .forward_with_coefficients_observer(&input, stream, Some(&mut Reject))
+        .unwrap_err();
+    let source = std::error::Error::source(&error).unwrap();
+    assert!(source.downcast_ref::<std::io::Error>().is_some());
+    assert_eq!(source.to_string(), "coefficient admission rejected");
+    close(
+        &head
+            .forward_with_coefficients_observer(&input, stream, None)
+            .unwrap(),
+        &expected,
+        1e-6,
+    );
+}
+
+#[test]
+#[ignore = "requires native MLX CPU execution"]
+fn hyper_head_coefficients_cpu() {
+    verify_hyper_head_coefficients(DeviceType::Cpu);
+}
+
+#[test]
+#[ignore = "requires native MLX Metal execution"]
+fn hyper_head_coefficients_metal() {
+    verify_hyper_head_coefficients(DeviceType::Gpu);
 }

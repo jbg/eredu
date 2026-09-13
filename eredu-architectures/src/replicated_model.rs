@@ -55,6 +55,22 @@ pub(crate) trait FixedReplicatedFamily<B: NeuralBackend>: 'static {
     ) -> Result<B::Tensor, Error>
     where
         C: AttentionCache<B::Tensor> + RuntimeStateComponents<B>;
+    fn forward_unit_observed<C, O>(
+        unit: &mut Self::Unit,
+        path: &str,
+        hidden: &B::Tensor,
+        state: &mut C,
+        forward: &ReplicatedForwardContext<B::Tensor>,
+        context: &<B::Tensor as Tensor>::Context,
+        observer: &mut O,
+    ) -> Result<B::Tensor, Error>
+    where
+        C: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
+        O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
+    {
+        let _ = (path, observer);
+        Self::forward_unit(unit, hidden, state, forward, context)
+    }
 }
 
 pub(crate) trait CompressedReplicatedFamily<B: BlockwiseAttentionBackend>: 'static {
@@ -86,6 +102,23 @@ pub(crate) trait CompressedReplicatedFamily<B: BlockwiseAttentionBackend>: 'stat
     ) -> Result<B::Tensor, Error>
     where
         C: CompressedAttentionCache<B::Tensor> + RuntimeStateComponents<B>;
+
+    fn forward_unit_observed<C, O>(
+        unit: &mut Self::Unit,
+        path: &str,
+        hidden: &B::Tensor,
+        state: &mut C,
+        forward: &ReplicatedForwardContext<B::Tensor>,
+        context: &<B::Tensor as Tensor>::Context,
+        observer: &mut O,
+    ) -> Result<B::Tensor, Error>
+    where
+        C: CompressedAttentionCache<B::Tensor> + RuntimeStateComponents<B>,
+        O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
+    {
+        let _ = (path, observer);
+        Self::forward_unit(unit, hidden, state, forward, context)
+    }
 }
 
 pub(crate) struct MixedState;
@@ -135,6 +168,16 @@ impl<B: NeuralBackend, C: AttentionCache<B::Tensor> + RuntimeLayerState<B>>
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
         self.inner.attention(request, context)
+    }
+    fn uses_blockwise_attention(&self) -> bool {
+        self.inner.uses_blockwise_attention()
+    }
+    fn relative_attention<N: NeuralBackend<Tensor = B::Tensor>>(
+        &mut self,
+        request: eredu_nn::RelativeAttentionInput<'_, B::Tensor>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Error> {
+        self.inner.relative_attention::<N>(request, context)
     }
 }
 
@@ -405,15 +448,15 @@ impl<B: NeuralBackend, F: FixedReplicatedFamily<B>, P> FixedReplicatedModel<B, F
     }
 }
 
-impl<B, P> crate::prediction_extension::NemotronHPredictionTarget<B>
-    for FixedReplicatedModel<B, crate::replicated_text::NemotronHReplicated, P>
+impl<B, F, P> FixedReplicatedModel<B, F, P>
 where
     B: BlockwiseAttentionBackend
         + eredu_nn::DistributedNeuralBackend
         + eredu_nn::TensorParallelGroupedNeuralBackend
         + eredu_nn::HyperNeuralBackend,
+    F: FixedReplicatedFamily<B>,
 {
-    fn embed_prediction(
+    fn embed_prediction_shared(
         &mut self,
         tokens: &B::Tensor,
         parallel: Option<&B::ParallelContext>,
@@ -435,27 +478,78 @@ where
         }
     }
 
+    fn project_prediction_shared(
+        &mut self,
+        hidden: &B::Tensor,
+        parallel: Option<&B::ParallelContext>,
+        context: &<B::Tensor as Tensor>::Context,
+        instrumentation: &mut crate::decoder::ComponentInstrumentation<'_, B::Tensor>,
+    ) -> Result<B::Tensor, Error> {
+        self.decoder.static_modules_mut().project_instrumented(
+            hidden,
+            parallel,
+            context,
+            instrumentation,
+        )
+    }
+}
+
+impl<B, P> crate::prediction_extension::NemotronHPredictionTarget<B>
+    for FixedReplicatedModel<B, crate::replicated_text::NemotronHReplicated, P>
+where
+    B: BlockwiseAttentionBackend
+        + eredu_nn::DistributedNeuralBackend
+        + eredu_nn::TensorParallelGroupedNeuralBackend
+        + eredu_nn::HyperNeuralBackend,
+{
+    fn embed_prediction(
+        &mut self,
+        tokens: &B::Tensor,
+        parallel: Option<&B::ParallelContext>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Error> {
+        self.embed_prediction_shared(tokens, parallel, context)
+    }
     fn project_prediction(
         &mut self,
         hidden: &B::Tensor,
         parallel: Option<&B::ParallelContext>,
         context: &<B::Tensor as Tensor>::Context,
+        instrumentation: &mut crate::decoder::ComponentInstrumentation<'_, B::Tensor>,
     ) -> Result<B::Tensor, Error> {
-        use eredu_nn::LinearOperator;
-        let modules = self.decoder.static_modules_mut();
-        match (parallel, modules.lm_head.as_mut()) {
-            (Some(parallel), Some(head)) => {
-                B::vocabulary_parallel_project(head, hidden, parallel, context)
-            }
-            (None, Some(head)) => head.forward(hidden, context),
-            (Some(parallel), None) => B::vocabulary_parallel_embedding_project(
-                &mut modules.embeddings,
-                hidden,
-                parallel,
-                context,
-            ),
-            (None, None) => modules.embeddings.as_linear(hidden, context),
-        }
+        self.project_prediction_shared(hidden, parallel, context, instrumentation)
+    }
+}
+
+impl<B, P> crate::prediction_extension::QwenHybridPredictionTarget<B>
+    for FixedReplicatedModel<B, crate::replicated_text::QwenHybridReplicated, P>
+where
+    B: BlockwiseAttentionBackend
+        + eredu_nn::DistributedNeuralBackend
+        + eredu_nn::TensorParallelGroupedNeuralBackend
+        + eredu_nn::HyperNeuralBackend,
+{
+    fn embed_prediction(
+        &mut self,
+        tokens: &B::Tensor,
+        parallel: Option<&B::ParallelContext>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Error> {
+        self.embed_prediction_shared(tokens, parallel, context)
+    }
+    fn project_prediction(
+        &mut self,
+        hidden: &B::Tensor,
+        parallel: Option<&B::ParallelContext>,
+        context: &<B::Tensor as Tensor>::Context,
+        instrumentation: &mut crate::decoder::ComponentInstrumentation<'_, B::Tensor>,
+    ) -> Result<B::Tensor, Error> {
+        self.decoder.static_modules_mut().project_instrumented(
+            hidden,
+            parallel,
+            context,
+            instrumentation,
+        )
     }
 }
 
@@ -670,6 +764,23 @@ macro_rules! common_layered_methods {
         fn static_modules_mut(&mut self) -> &mut Self::StaticModules {
             self.decoder.static_modules_mut()
         }
+        fn begin_forward_observed<'a, O>(
+            &mut self,
+            input: Self::Input<'a>,
+            state: &mut S,
+            context: &<B::Tensor as Tensor>::Context,
+            observer: &mut O,
+        ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Error>
+        where
+            O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
+        {
+            let mut forward = self.begin_forward(input, state, context)?;
+            let mut borrowed = eredu_runtime::BorrowedActivationObserver(observer);
+            forward.hidden =
+                crate::decoder::ComponentInstrumentation::new("readout", &mut borrowed)
+                    .apply("embedding", forward.hidden)?;
+            Ok(forward)
+        }
         fn begin_execution_group(
             &mut self,
             group: usize,
@@ -689,6 +800,24 @@ macro_rules! common_layered_methods {
             context: &<B::Tensor as Tensor>::Context,
         ) -> Result<B::Tensor, Error> {
             self.decoder.finish_logits(hidden, context)
+        }
+        fn finish_forward_observed<O>(
+            &mut self,
+            hidden: &B::Tensor,
+            _state: &mut S,
+            _forward: &Self::ForwardContext,
+            context: &<B::Tensor as Tensor>::Context,
+            observer: &mut O,
+        ) -> Result<B::Tensor, Error>
+        where
+            O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
+        {
+            let mut borrowed = eredu_runtime::BorrowedActivationObserver(observer);
+            self.decoder.finish_logits_instrumented(
+                hidden,
+                context,
+                &mut crate::decoder::ComponentInstrumentation::new("readout", &mut borrowed),
+            )
         }
         fn retained_context_values<'a>(
             &'a self,
@@ -806,6 +935,32 @@ where
             context,
         )
     }
+
+    fn forward_unit_observed<O>(
+        &mut self,
+        group: usize,
+        index: usize,
+        unit: &mut Self::Unit,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &mut Self::ForwardContext,
+        context: &<B::Tensor as Tensor>::Context,
+        observer: &mut O,
+    ) -> Result<B::Tensor, Error>
+    where
+        O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
+    {
+        let path = self.decoder.unit_path(group, index)?;
+        F::forward_unit_observed(
+            unit,
+            &path,
+            hidden,
+            state.layer(index).map_err(Error::backend)?,
+            forward,
+            context,
+            observer,
+        )
+    }
 }
 
 impl<B, S, F> ReplicatedTextArchitecture<B, S> for FixedReplicatedModel<B, F, MixedState>
@@ -905,6 +1060,28 @@ where
         };
         F::forward_unit(unit, hidden, &mut layer, forward, context)
     }
+
+    fn forward_unit_observed<O>(
+        &mut self,
+        group: usize,
+        index: usize,
+        unit: &mut Self::Unit,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &mut Self::ForwardContext,
+        context: &<B::Tensor as Tensor>::Context,
+        observer: &mut O,
+    ) -> Result<B::Tensor, Error>
+    where
+        O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
+    {
+        let path = self.decoder.unit_path(group, index)?;
+        let mut layer = AttentionLayer::<B, _> {
+            inner: state.layer(index).map_err(Error::backend)?,
+            backend: PhantomData,
+        };
+        F::forward_unit_observed(unit, &path, hidden, &mut layer, forward, context, observer)
+    }
 }
 
 impl<B, S, F> ReplicatedTextArchitecture<B, S> for FixedReplicatedModel<B, F, AttentionState>
@@ -995,6 +1172,28 @@ where
             backend: PhantomData,
         };
         F::forward_unit(unit, hidden, &mut layer, forward, context)
+    }
+
+    fn forward_unit_observed<O>(
+        &mut self,
+        group: usize,
+        index: usize,
+        unit: &mut Self::Unit,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &mut Self::ForwardContext,
+        context: &<B::Tensor as Tensor>::Context,
+        observer: &mut O,
+    ) -> Result<B::Tensor, Error>
+    where
+        O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
+    {
+        let path = self.decoder.unit_path(group, index)?;
+        let mut layer = FixedLayer::<B, _> {
+            inner: state.layer(index).map_err(Error::backend)?,
+            backend: PhantomData,
+        };
+        F::forward_unit_observed(unit, &path, hidden, &mut layer, forward, context, observer)
     }
 }
 
@@ -1089,6 +1288,28 @@ where
             backend: PhantomData,
         };
         F::forward_unit(unit, hidden, &mut layer, forward, context)
+    }
+
+    fn forward_unit_observed<O>(
+        &mut self,
+        group: usize,
+        index: usize,
+        unit: &mut Self::Unit,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &mut Self::ForwardContext,
+        context: &<B::Tensor as Tensor>::Context,
+        observer: &mut O,
+    ) -> Result<B::Tensor, Error>
+    where
+        O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
+    {
+        let path = self.decoder.unit_path(group, index)?;
+        let mut layer = StatelessLayer::<B, _> {
+            inner: state.layer(index).map_err(Error::backend)?,
+            backend: PhantomData,
+        };
+        F::forward_unit_observed(unit, &path, hidden, &mut layer, forward, context, observer)
     }
 }
 
@@ -1190,6 +1411,32 @@ where
             context,
         )
     }
+
+    fn forward_unit_observed<O>(
+        &mut self,
+        group: usize,
+        index: usize,
+        unit: &mut Self::Unit,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &mut Self::ForwardContext,
+        context: &<B::Tensor as Tensor>::Context,
+        observer: &mut O,
+    ) -> Result<B::Tensor, Error>
+    where
+        O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
+    {
+        let path = self.decoder.unit_path(group, index)?;
+        F::forward_unit_observed(
+            unit,
+            &path,
+            hidden,
+            state.layer(index).map_err(Error::backend)?,
+            forward,
+            context,
+            observer,
+        )
+    }
 }
 
 impl<B, S, F> ReplicatedTextArchitecture<B, S>
@@ -1287,6 +1534,28 @@ where
             backend: PhantomData,
         };
         F::forward_unit(unit, hidden, &mut layer, forward, context)
+    }
+
+    fn forward_unit_observed<O>(
+        &mut self,
+        group: usize,
+        index: usize,
+        unit: &mut Self::Unit,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &mut Self::ForwardContext,
+        context: &<B::Tensor as Tensor>::Context,
+        observer: &mut O,
+    ) -> Result<B::Tensor, Error>
+    where
+        O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
+    {
+        let path = self.decoder.unit_path(group, index)?;
+        let mut layer = CompressedLayer::<B, _> {
+            inner: state.layer(index).map_err(Error::backend)?,
+            backend: PhantomData,
+        };
+        F::forward_unit_observed(unit, &path, hidden, &mut layer, forward, context, observer)
     }
 }
 

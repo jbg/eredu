@@ -68,6 +68,7 @@ pub(super) fn interventions() -> InterventionDiscovery {
             dtypes: vec![InterventionDtype::Float32],
             operations: vec![InterventionKind::Scale],
             score_stages: vec![],
+            routed_units: None,
             routing: None,
             prefill: ObservationSupportStatus::Supported,
             decode: ObservationSupportStatus::Supported,
@@ -170,6 +171,33 @@ impl CaptureBackend for Records {
     }
 }
 impl InterventionEstimator for Records {
+    fn activation_usage(
+        &self,
+        source: &[u64],
+        slice: &ResolvedCaptureSlice,
+        _: &InterventionAction,
+    ) -> Result<CaptureUsage, CaptureError> {
+        let elements = |shape: &[u64]| {
+            shape
+                .iter()
+                .try_fold(1u64, |n, d| n.checked_mul(*d).ok_or(CaptureError::Overflow))
+        };
+        let bytes = elements(source)?
+            .checked_add(
+                elements(&slice.shape)?
+                    .checked_mul(3)
+                    .ok_or(CaptureError::Overflow)?,
+            )
+            .and_then(|n| n.checked_mul(8))
+            .ok_or(CaptureError::Overflow)?;
+        Ok(CaptureUsage {
+            captures: 0,
+            retained_bytes: bytes,
+            host_bytes: bytes,
+            encoded_bytes: 0,
+        })
+    }
+
     fn validate_geometry(
         &self,
         source: &[u64],
@@ -199,6 +227,25 @@ impl InterventionEstimator for Records {
     }
 }
 impl InterventionBackend for Records {
+    fn mask_components(
+        &mut self,
+        value: &Vec<f32>,
+        ids: &[u32],
+        keep_selected: bool,
+    ) -> io::Result<Vec<f32>> {
+        Ok(value
+            .iter()
+            .enumerate()
+            .map(|(i, v)| {
+                if ids.contains(&(i as u32)) == keep_selected {
+                    *v
+                } else {
+                    0.0
+                }
+            })
+            .collect())
+    }
+
     fn intervention_dtype(&self, _: &Vec<f32>) -> io::Result<InterventionDtype> {
         Ok(InterventionDtype::Float32)
     }

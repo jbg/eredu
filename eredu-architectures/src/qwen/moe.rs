@@ -325,6 +325,10 @@ mod tests {
 impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> DecoderProjectionOperator<B>
     for RoutedGatedProduct<B>
 {
+    fn residual_observation(&self) -> &'static str {
+        "feed_forward.contribution"
+    }
+
     fn forward_feed_forward(
         &mut self,
         input: &B::Tensor,
@@ -336,6 +340,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> DecoderProjec
             &mut provider,
             &mut self.experts,
             RoutedExpertRequest {
+                unit_observer: None,
                 bank: eredu_runtime::RoutedBankId::new(0),
                 layer: self.layer,
                 input,
@@ -362,6 +367,7 @@ impl<B: eredu_nn::TensorParallelGroupedNeuralBackend + eredu_nn::DistributedNeur
             &mut provider,
             &mut self.experts,
             RoutedExpertRequest {
+                unit_observer: None,
                 bank: eredu_runtime::RoutedBankId::new(0),
                 layer: self.layer,
                 input,
@@ -440,6 +446,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> FeedForward<B
                     .forward_grouped(
                         &mut moe.experts,
                         RoutedExpertRequest {
+                            unit_observer: None,
                             bank: eredu_runtime::RoutedBankId::new(0),
                             layer,
                             input,
@@ -448,7 +455,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> FeedForward<B
                         },
                         context,
                     )
-                    .map_err(Error::backend)
+                    .map_err(Error::backend_source)
             }
         }
     }
@@ -476,6 +483,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> FeedForward<B
                     .forward_grouped_tensor_parallel(
                         &mut moe.experts,
                         RoutedExpertRequest {
+                            unit_observer: None,
                             bank: eredu_runtime::RoutedBankId::new(0),
                             layer,
                             input,
@@ -485,7 +493,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> FeedForward<B
                         B::parallel_size(parallel),
                         context,
                     )
-                    .map_err(Error::backend)?;
+                    .map_err(Error::backend_source)?;
                 eredu_runtime::reduce_routed_expert_tensor_parallel::<B>(output, parallel, context)
             }
         }
@@ -495,6 +503,13 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> FeedForward<B
 impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> DecoderProjectionOperator<B>
     for FeedForward<B>
 {
+    fn residual_observation(&self) -> &'static str {
+        match self {
+            Self::Dense(_) => "feed_forward.output",
+            Self::Routed(_) => "feed_forward.contribution",
+        }
+    }
+
     fn forward_feed_forward(
         &mut self,
         input: &B::Tensor,
@@ -505,11 +520,40 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> DecoderProjec
             Self::Routed(moe) => moe.forward_feed_forward(input, context),
         }
     }
+    fn forward_feed_forward_observed(
+        &mut self,
+        input: &B::Tensor,
+        context: &<B::Tensor as Tensor>::Context,
+        instrumentation: &mut crate::decoder::ComponentInstrumentation<'_, B::Tensor>,
+    ) -> Result<B::Tensor, Error> {
+        match self {
+            Self::Dense(mlp) => mlp.forward_feed_forward_observed(input, context, instrumentation),
+            Self::Routed(moe) => moe.forward_feed_forward(input, context),
+        }
+    }
 }
 
 impl<B: eredu_nn::TensorParallelGroupedNeuralBackend + eredu_nn::DistributedNeuralBackend>
     TensorParallelProjectionOperator<B> for FeedForward<B>
 {
+    fn forward_feed_forward_parallel_observed(
+        &mut self,
+        input: &B::Tensor,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+        instrumentation: &mut crate::decoder::ComponentInstrumentation<'_, B::Tensor>,
+    ) -> Result<B::Tensor, Error> {
+        match self {
+            Self::Dense(mlp) => mlp.forward_feed_forward_parallel_observed(
+                input,
+                parallel,
+                context,
+                instrumentation,
+            ),
+            Self::Routed(moe) => moe.forward_feed_forward_parallel(input, parallel, context),
+        }
+    }
+
     fn forward_feed_forward_parallel(
         &mut self,
         input: &B::Tensor,
@@ -526,6 +570,40 @@ impl<B: eredu_nn::TensorParallelGroupedNeuralBackend + eredu_nn::DistributedNeur
 impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend>
     crate::decoder::RoutedProjectionOperator<B> for FeedForward<B>
 {
+    fn forward_observed_with_provider<P>(
+        &mut self,
+        layer: usize,
+        input: &B::Tensor,
+        pass: ExpertPass,
+        provider: &mut P,
+        context: &<B::Tensor as Tensor>::Context,
+        instrumentation: &mut crate::decoder::ComponentInstrumentation<'_, B::Tensor>,
+        points: Option<eredu_runtime::RoutedObservationPoints>,
+    ) -> Result<B::Tensor, Error>
+    where
+        P: eredu_runtime::RoutedExpertProvider<B>,
+        P::Error: std::fmt::Display,
+    {
+        if let Self::Dense(mlp) = self {
+            return mlp.forward_feed_forward_observed(input, context, instrumentation);
+        }
+        match (points, instrumentation.observer()) {
+            (Some(points), Some(observer)) => eredu_runtime::ObservedExpertProvider::new(
+                provider, observer, points,
+            )
+            .execute_neural(|provider| {
+                <Self as crate::decoder::RoutedProjectionOperator<B>>::forward_with_provider(
+                    self, layer, input, pass, provider, context,
+                )
+            }),
+            _ => <Self as crate::decoder::RoutedProjectionOperator<B>>::forward_with_provider(
+                self, layer, input, pass, provider, context,
+            ),
+        }
+    }
+
+    const COMPONENT_OBSERVATIONS: bool = true;
+
     fn forward_with_provider<P>(
         &mut self,
         layer: usize,
@@ -545,6 +623,46 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend>
 impl<B: eredu_nn::TensorParallelGroupedNeuralBackend + eredu_nn::DistributedNeuralBackend>
     TensorParallelRoutedProjectionOperator<B> for FeedForward<B>
 {
+    fn forward_parallel_observed_with_provider<P>(
+        &mut self,
+        layer: usize,
+        input: &B::Tensor,
+        pass: ExpertPass,
+        provider: &mut P,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+        instrumentation: &mut crate::decoder::ComponentInstrumentation<'_, B::Tensor>,
+        points: Option<eredu_runtime::RoutedObservationPoints>,
+    ) -> Result<B::Tensor, Error>
+    where
+        P: eredu_runtime::TensorParallelRoutedExpertProvider<B>,
+        P::Error: std::fmt::Display,
+    {
+        if let Self::Dense(mlp) = self {
+            return mlp.forward_feed_forward_parallel_observed(
+                input,
+                parallel,
+                context,
+                instrumentation,
+            );
+        }
+        match (points, instrumentation.observer()) {
+            (Some(points), Some(observer)) => {
+                eredu_runtime::ObservedExpertProvider::new(provider, observer, points)
+                    .execute_neural(|provider| {
+                        <Self as crate::decoder::TensorParallelRoutedProjectionOperator<B>>::forward_parallel_with_provider(
+                            self, layer, input, pass, provider, parallel, context,
+                        )
+                    })
+            }
+            _ => {
+                <Self as crate::decoder::TensorParallelRoutedProjectionOperator<B>>::forward_parallel_with_provider(
+                    self, layer, input, pass, provider, parallel, context,
+                )
+            }
+        }
+    }
+
     fn forward_parallel_with_provider<P>(
         &mut self,
         layer: usize,

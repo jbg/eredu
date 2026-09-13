@@ -55,6 +55,10 @@ where
         )
     }
 
+    fn routed_sparse_observations(&self) -> bool {
+        true
+    }
+
     fn forward_unit_observed_with_provider<P, O>(
         &mut self,
         group: usize,
@@ -1208,6 +1212,27 @@ where
         })
     }
 
+    fn begin_forward_observed<'a, O>(
+        &mut self,
+        input: Self::Input<'a>,
+        state: &mut S,
+        context: &<B::Tensor as Tensor>::Context,
+        observer: &mut O,
+    ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error>
+    where
+        O: eredu_runtime::ActivationObserver<B::Tensor, Self::Error> + ?Sized,
+    {
+        let mut forward = self.begin_forward(input, state, context)?;
+        if matches!(forward.context.mode, ForwardMode::Target) {
+            let mut borrowed = eredu_runtime::BorrowedActivationObserver(observer);
+            forward.hidden =
+                crate::decoder::ComponentInstrumentation::new("readout", &mut borrowed)
+                    .apply("embedding", forward.hidden)?;
+            forward.context.embedded = forward.hidden.clone();
+        }
+        Ok(forward)
+    }
+
     fn begin_execution_group(
         &mut self,
         group: usize,
@@ -1259,6 +1284,33 @@ where
         }
     }
 
+    fn forward_unit_observed<O>(
+        &mut self,
+        group: usize,
+        index: usize,
+        unit: &mut Self::Unit,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &mut Self::ForwardContext,
+        context: &<B::Tensor as Tensor>::Context,
+        observer: &mut O,
+    ) -> Result<B::Tensor, Self::Error>
+    where
+        O: eredu_runtime::ActivationObserver<B::Tensor, Self::Error> + ?Sized,
+    {
+        self.forward_unit_observed_with_provider(
+            group,
+            index,
+            unit,
+            hidden,
+            state,
+            forward,
+            observer,
+            &mut eredu_runtime::ResidentExpertProvider,
+            context,
+        )
+    }
+
     fn complete_execution_group(
         &mut self,
         group: usize,
@@ -1298,6 +1350,29 @@ where
                 Some(head) => eredu_nn::LinearOperator::forward(head, hidden, context),
                 None => self.static_modules.embeddings.as_linear(hidden, context),
             },
+        }
+    }
+
+    fn finish_forward_observed<O>(
+        &mut self,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &Self::ForwardContext,
+        context: &<B::Tensor as Tensor>::Context,
+        observer: &mut O,
+    ) -> Result<B::Tensor, Self::Error>
+    where
+        O: eredu_runtime::ActivationObserver<B::Tensor, Self::Error> + ?Sized,
+    {
+        if matches!(forward.mode, ForwardMode::Target) {
+            let mut borrowed = eredu_runtime::BorrowedActivationObserver(observer);
+            self.static_modules.finish_instrumented(
+                hidden,
+                context,
+                &mut crate::decoder::ComponentInstrumentation::new("readout", &mut borrowed),
+            )
+        } else {
+            self.finish_forward(hidden, state, forward, context)
         }
     }
 

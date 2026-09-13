@@ -31,7 +31,8 @@ pub use prediction::{
     PredictionBinding, PredictionConstruction, PredictionMechanisms, WithoutPrediction,
 };
 pub use routed_partition::{
-    construct_selected_partition_providers, PartitionBankMechanisms, PartitionBankProviders,
+    construct_partition_bank_providers, construct_selected_partition_providers,
+    PartitionBankMechanisms, PartitionBankProviders, PreparedPartitionBanks,
 };
 pub use routed_session::{
     construct_selected_routed_composite_session, construct_selected_routed_session,
@@ -185,12 +186,14 @@ impl<C> PreparedPartitionPredictionResources<C> {
 /// Opaque, mutually agreeing prediction selection and source roles.
 #[doc(hidden)]
 pub struct PreparedPredictionSelection {
+    placement: crate::prediction_extension::PredictionPlacementSlot,
     extension: PredictionExtensionPlan,
     source: SharedCheckpointSource,
     realization: eredu_runtime::SelectedSpeculativeRealization,
     capability: CapabilityEstimate,
     topology: ParallelRankTopology,
     tasks: Vec<ReplicatedTextMaterializationTask>,
+    residency: eredu_runtime::LayerWeightResidency,
 }
 
 /// Opaque branch input created only by the total construction driver.
@@ -415,12 +418,14 @@ where
             if extension.same_admission(source_extension) =>
         {
             Some(PreparedPredictionSelection {
+                placement: Arc::clone(&graph.prediction_placement),
                 extension: extension.clone(),
                 source: Arc::clone(source),
                 realization: realization.clone(),
                 capability: crate::prediction_extension::prediction_extension_capability(extension)
                     .map_err(|error| PreparedExecutionError::Architecture(error.to_string()))?,
                 topology,
+                residency: selected.text_realization().residency(),
                 tasks: selected
                     .text_realization()
                     .auxiliary_materialization_tasks()

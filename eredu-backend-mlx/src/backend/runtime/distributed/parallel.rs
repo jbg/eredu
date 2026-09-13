@@ -91,7 +91,7 @@ pub(crate) fn sample_and_synchronize_bounded<S: Sampler<MlxSamplingBackend>>(
             group,
             stream,
         )
-        .map_err(|error| authority.submission_error(error, operation, phase, None))
+        .map_err(|error| authority.submission_failure(error, operation, phase, None))
         .map_err(|error| Error::Parallel(error.to_string()))?;
     let token = authority
         .wait(token_submission, operation, phase, None)
@@ -111,7 +111,7 @@ pub(crate) fn sample_and_synchronize_bounded<S: Sampler<MlxSamplingBackend>>(
             group,
             stream,
         )
-        .map_err(|error| authority.submission_error(error, operation, phase, None))
+        .map_err(|error| authority.submission_failure(error, operation, phase, None))
         .map_err(|error| Error::Parallel(error.to_string()))?;
     let eredu_core::Submission { output, completion } = finished_submission;
     let (finished, completion) = completion.with_f32_flag(output.into_array());

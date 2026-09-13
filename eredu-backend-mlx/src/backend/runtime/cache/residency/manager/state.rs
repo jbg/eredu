@@ -66,6 +66,7 @@ pub(in super::super) struct CacheManagerState {
     pub(in super::super) background_disk_error: Option<String>,
     pub(in super::super) lifecycle: CacheBlockLifecycle,
     pub(in super::super) blocks: BTreeMap<CacheBlockId, CacheBlockRecord>,
+    pub(in super::super) history_retentions: Vec<Weak<CacheHistoryRetention>>,
     pub(in super::super) host_write_reservations:
         HashMap<CacheIoOperationKey, HostWriteReservation>,
     pub(in super::super) retiring_host_demotions: HashMap<u64, RetiringHostDemotion>,

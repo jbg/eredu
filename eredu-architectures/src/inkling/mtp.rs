@@ -2,9 +2,8 @@
 
 use eredu_core::{AttentionPolicy, LayerSchedule};
 use eredu_nn::{
-    AttentionCache, AuxiliaryConvolutionState, Error, GroupedNeuralBackend, LinearOperator,
-    LinearSpec, NormalizationConstructionSpec, NormalizationOperator, ParameterSpec, Parameterized,
-    Tensor,
+    AttentionCache, AuxiliaryConvolutionState, Error, GroupedNeuralBackend, LinearSpec,
+    NormalizationConstructionSpec, NormalizationOperator, ParameterSpec, Parameterized, Tensor,
 };
 
 use super::{DecoderLayer, FeedForwardPolicy, LayerPolicy, ModelArgs, MtpConfig, TextArgs};
@@ -21,6 +20,15 @@ pub struct MtpDepth<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend
     pub input_projection: B::Linear,
     /// The same neutral decoder layer used by the ordinary model.
     pub transformer_block: DecoderLayer<B>,
+}
+
+/// Shared learned normalization used by every embedded prediction depth.
+/// The prepared extension omits this module when chain normalization is disabled.
+#[derive(Debug, Clone, Parameterized)]
+#[parameterized(tensor = "B::Tensor")]
+pub struct MtpShared<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> {
+    /// Canonical shared chain normalization.
+    pub chain_norm: B::Normalization,
 }
 
 /// Hidden-state continuation returned by one embedded prediction depth.
@@ -173,25 +181,98 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> MtpModel<B> {
     where
         S: AttentionCache<B::Tensor> + AuxiliaryConvolutionState<B::Tensor>,
     {
+        self.forward_step_instrumented(
+            hidden,
+            embeddings,
+            tokens,
+            depth,
+            state,
+            context,
+            &mut crate::decoder::ComponentInstrumentation::disabled(),
+        )
+    }
+
+    /// Observes the released double-normalization fusion and ordinary decoder.
+    pub fn forward_step_instrumented<S>(
+        &mut self,
+        hidden: &B::Tensor,
+        embeddings: &B::Tensor,
+        tokens: &B::Tensor,
+        depth: usize,
+        state: &mut [S],
+        context: &<B::Tensor as Tensor>::Context,
+        instrumentation: &mut crate::decoder::ComponentInstrumentation<'_, B::Tensor>,
+    ) -> Result<MtpOutput<B::Tensor>, Error>
+    where
+        S: AttentionCache<B::Tensor> + AuxiliaryConvolutionState<B::Tensor>,
+    {
         if self.layers.is_empty() || state.len() != self.layers.len() {
             return Err(Error::backend(
                 "Inkling MTP state does not match prediction depths",
             ));
         }
         let depth = depth % self.layers.len();
-        let layer = &mut self.layers[depth];
-        let hidden = layer.hidden_norm.forward(hidden, context)?;
-        let hidden = layer.hidden_norm.forward(&hidden, context)?;
-        let embeddings = layer.embedding_norm.forward(embeddings, context)?;
+        self.layers[depth].forward_step_instrumented(
+            hidden,
+            embeddings,
+            tokens,
+            &mut state[depth],
+            self.chain_norm.as_mut(),
+            context,
+            instrumentation,
+        )
+    }
+}
+
+impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> MtpDepth<B> {
+    /// Executes one physical depth using its own causal state and the optional
+    /// shared chain norm. The whole-chain and prepared drivers use this equation.
+    pub fn forward_step_instrumented<S>(
+        &mut self,
+        hidden: &B::Tensor,
+        embeddings: &B::Tensor,
+        tokens: &B::Tensor,
+        state: &mut S,
+        chain_norm: Option<&mut B::Normalization>,
+        context: &<B::Tensor as Tensor>::Context,
+        instrumentation: &mut crate::decoder::ComponentInstrumentation<'_, B::Tensor>,
+    ) -> Result<MtpOutput<B::Tensor>, Error>
+    where
+        S: AttentionCache<B::Tensor> + AuxiliaryConvolutionState<B::Tensor>,
+    {
+        instrumentation.observe("prediction.hidden", hidden)?;
+        instrumentation.observe("prediction.embedding", embeddings)?;
+        let hidden = self.hidden_norm.forward(hidden, context)?;
+        let hidden = instrumentation.apply("prediction.hidden.first_normalized", hidden)?;
+        let hidden = self.hidden_norm.forward(&hidden, context)?;
+        let hidden = instrumentation.apply("prediction.hidden.normalized", hidden)?;
+        let embeddings = self.embedding_norm.forward(embeddings, context)?;
+        let embeddings = instrumentation.apply("prediction.embedding.normalized", embeddings)?;
         let combined = B::Tensor::concatenate(&[hidden, embeddings], -1, context)?;
-        let fused = layer.input_projection.forward(&combined, context)?;
-        let mut hidden =
-            layer
-                .transformer_block
-                .forward(&fused, Some(&mut state[depth]), context)?;
-        if let Some(norm) = &mut self.chain_norm {
-            hidden = norm.forward(&hidden, context)?;
-        }
+        let fused = instrumentation.project::<B>(
+            "prediction.fusion.input",
+            &mut self.input_projection,
+            &combined,
+            None,
+            context,
+        )?;
+        let fused = instrumentation.apply("prediction.fusion.output", fused)?;
+        let hidden = instrumentation.with_scope("transformer_block", |instrumentation| {
+            self.transformer_block.forward_with_provider_instrumented(
+                &fused,
+                Some(state),
+                eredu_runtime::ExpertPass::Prefill,
+                &mut eredu_runtime::ResidentExpertProvider,
+                context,
+                instrumentation,
+            )
+        })?;
+        let hidden = instrumentation.apply("prediction.readout.residual", hidden)?;
+        let hidden = match chain_norm {
+            Some(norm) => norm.forward(&hidden, context)?,
+            None => hidden,
+        };
+        let hidden = instrumentation.apply("prediction.readout.normalized", hidden)?;
         Ok(MtpOutput {
             hidden,
             tokens: tokens.clone(),
@@ -199,7 +280,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> MtpModel<B> {
     }
 }
 
-pub(super) fn mtp_text_args(
+pub(crate) fn mtp_text_args(
     backbone: &TextArgs,
     config: &MtpConfig,
     attention: AttentionPolicy,

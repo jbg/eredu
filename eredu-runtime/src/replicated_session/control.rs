@@ -30,6 +30,13 @@ where
         None
     }
 
+    /// Logical allocation and initialization bound for a fresh empty state with
+    /// the same selected realization. This includes metadata and fixed storage;
+    /// it must not be inferred solely from currently populated cache tensors.
+    fn estimate_reset_state(&self, _state: &Self::State) -> Option<SnapshotEstimate> {
+        None
+    }
+
     /// Copies every native state component and completes its native work,
     /// preserving geometry and positions before distributed preparation agreement.
     /// Mutable storage must be isolated. On error the source remains unchanged;
@@ -68,6 +75,63 @@ where
             &self.state,
             self.committed_prompt_input_identity.as_ref(),
         )
+    }
+
+    /// Prices a provisional empty state for an enclosing parameter transaction.
+    /// The installed state is retained by exchange, without copying its tensors.
+    pub fn estimate_parameter_reset_state(&self) -> Option<SnapshotEstimate> {
+        let native = self.mechanisms.estimate_reset_state(&self.state)?;
+        let metadata = std::mem::size_of::<ReplicatedTextControlState<()>>() as u64;
+        Some(SnapshotEstimate {
+            retained_bytes: native.retained_bytes.checked_add(metadata)?,
+            copy_bytes: native.copy_bytes.checked_add(metadata)?,
+        })
+    }
+
+    /// Prepares an empty state without changing installed state or doing a
+    /// collective exchange. The enclosing parameter coordinator owns admission,
+    /// preparation agreement, publication, rollback and terminal fencing.
+    /// Call only after reserving `estimate_parameter_reset_state`.
+    pub fn prepare_parameter_reset_state(
+        &mut self,
+        context: &<<B as NeuralBackend>::Tensor as Tensor>::Context,
+    ) -> Result<
+        ReplicatedTextControlState<M::State>,
+        ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>,
+    > {
+        self.ensure_commit_resolved()?;
+        let selected = self.selected_state.state().ok_or_else(|| {
+            ReplicatedTextSessionError::Contract(
+                "parameter state reset requires selected state".into(),
+            )
+        })?;
+        let state = self
+            .mechanisms
+            .realize_state(selected, context)
+            .map_err(ReplicatedTextSessionError::Mechanism)?;
+        self.validate_control_geometry(&state)?;
+        Ok(ReplicatedTextControlState {
+            owner: Arc::clone(&self.control_identity),
+            state,
+            prompt_input_identity: None,
+        })
+    }
+
+    /// Exchanges complete state under an enclosing parameter transaction, with
+    /// no nested collective or tensor copy. A second exchange restores the exact
+    /// original cache and prompt identity. Commit epochs are never rewound.
+    /// Invalidate snapshots only after every peer confirms publication.
+    pub fn exchange_parameter_reset_state(
+        &mut self,
+        slot: &mut ReplicatedTextControlState<M::State>,
+    ) -> Result<(), ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>> {
+        self.validate_control_state(slot)?;
+        std::mem::swap(&mut self.state, &mut slot.state);
+        std::mem::swap(
+            &mut self.committed_prompt_input_identity,
+            &mut slot.prompt_input_identity,
+        );
+        Ok(())
     }
 
     /// Estimates another independent copy of an existing compatible slot.

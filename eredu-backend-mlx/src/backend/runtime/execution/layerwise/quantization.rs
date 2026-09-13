@@ -319,6 +319,17 @@ where
             .source_recipe()
             .map_err(|error| Error::Quantization(error.to_string()))?;
         let mut metadata = recipe.infer(store)?;
+        // Admission describes the complete derived source recipe. Validate it
+        // before applying this rank's separately admitted placement. The local
+        // metadata is checked against the actual source module below.
+        if let Some(expected) = task.derived_output() {
+            if expected != &metadata {
+                return Err(Error::Quantization(format!(
+                    "selected materialization task {:?} differs from its admitted derived output",
+                    task.name()
+                )));
+            }
+        }
         if let Some(layout) = source_layout {
             let tensor = layout.tensor(task.name()).ok_or_else(|| {
                 Error::Quantization(format!(
@@ -377,20 +388,16 @@ where
                 native_source_dtype
             )));
         }
-        if let Some(expected) = task.derived_output() {
-            if expected != &metadata {
-                return Err(Error::Quantization(format!(
-                    "selected materialization task {:?} differs from its admitted derived output",
-                    task.name()
-                )));
-            }
-        }
-        let companions = selected.get(name).cloned().ok_or_else(|| {
+        let mut companions = selected.get(name).cloned().ok_or_else(|| {
             Error::Quantization(format!(
                 "selected materialization task {:?} has no exact packed companion topology",
                 task.name()
             ))
         })?;
+        // Floating destination handles are unloaded placeholders, not a request
+        // to cast generated values. Match the admitted source precision used by
+        // independent bank transforms and their selected byte accounting.
+        companions.affine_companion_dtype = metadata.dtype().clone();
         let target = companions.weight_name.clone();
         if recipes
             .insert(target.clone(), (recipe, companions))

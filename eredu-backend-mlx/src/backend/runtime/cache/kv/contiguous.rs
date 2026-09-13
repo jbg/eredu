@@ -480,9 +480,11 @@ impl eredu_runtime::RuntimeLayerState<MlxNeuralBackend> for ConcatKeyValueCache 
     type RetainedValues<'a> = RetainedArrayIter<'a>;
 
     fn retained_values(&self) -> Self::RetainedValues<'_> {
-        self.keys
-            .iter()
-            .chain(self.values.iter())
-            .map(retained_tensor)
+        [
+            self.keys.as_ref().map(retained_tensor),
+            self.values.as_ref().map(retained_tensor),
+        ]
+        .into_iter()
+        .flatten()
     }
 }

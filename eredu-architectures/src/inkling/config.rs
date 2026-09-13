@@ -315,7 +315,10 @@ impl TextArgs {
         // Short-convolution kernels are rank-3 convolution parameters, not
         // matrix projections. The model-wide load-time linear quantization
         // policy must not change their representation.
-        if name.ends_with("_sconv.weight") || name.ends_with(".moe.router.weight") {
+        if name.ends_with("_sconv.weight")
+            || name.ends_with(".moe.router.weight")
+            || name.ends_with(".self_attn.rel_proj")
+        {
             return LinearFormat::Dense;
         }
         self.quantized_weight_configs

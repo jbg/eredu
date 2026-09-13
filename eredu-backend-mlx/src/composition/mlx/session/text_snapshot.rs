@@ -190,6 +190,7 @@ impl TextSnapshotBackend for MlxBackend<'_> {
                     prng,
                     sampler: sampling.sampler.clone(),
                     next_prediction: sampling.next_prediction,
+                    parameter_epoch: sampling.parameter_epoch,
                 })
             })())
         })?

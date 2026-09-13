@@ -958,16 +958,7 @@ fn exact_logical_range(
     let tensor = layout
         .tensor(target)
         .ok_or_else(|| ParallelPlanError::InvalidTensor(format!("missing {target}")))?;
-    if tensor.logical_units() != Some(global) {
-        return Err(ParallelPlanError::InvalidTensor(format!(
-            "{target} has wrong semantic width"
-        )));
-    }
-    tensor
-        .logical_range()
-        .cloned()
-        .filter(|range| !range.is_empty() && range.end <= global)
-        .ok_or_else(|| ParallelPlanError::InvalidTensor(format!("{target} has no exact TP range")))
+    tensor.expanded_logical_range(global)
 }
 
 fn validate_realization(
@@ -1195,9 +1186,19 @@ fn block_parallel_parameter_groups<B: GroupedNeuralBackend + eredu_nn::Distribut
                             axis: 0,
                             segments: segments.clone(),
                         })
-                    } else if name.ends_with("conv1d.weight")
-                        || name.ends_with("conv1d.bias")
-                        || name.ends_with("dt_bias")
+                    } else if name.ends_with("conv1d.weight") || name.ends_with("conv1d.bias") {
+                        // Convolution channels concatenate values, input-state
+                        // and output-state projections. Each TP owner must take
+                        // its group interval from every semantic segment.
+                        Ok(MemberSharding::PartitionedSegments {
+                            axis: 0,
+                            segments: vec![
+                                0..intermediate,
+                                intermediate..intermediate + grouped,
+                                intermediate + grouped..intermediate + 2 * grouped,
+                            ],
+                        })
+                    } else if name.ends_with("dt_bias")
                         || name.ends_with("A_log")
                         || name.ends_with("D")
                         || name.ends_with("norm.weight")
@@ -1724,6 +1725,56 @@ mod tests {
             range(0, 7),
         );
         assert!(partition_local_geometry(&args, &malformed, 2..4).is_err());
+    }
+
+    #[test]
+    fn routed_partition_expands_uniform_encoded_expert_ranges() {
+        let topology = eredu_core::ParallelRankTopology::new(
+            eredu_core::ParallelTopology::new(2, 2, 2, 1).unwrap(),
+            5,
+        )
+        .unwrap();
+        for units in [2, 4, 8] {
+            let mut layout = routed_layout();
+            for (target, axis, shape, local) in [
+                (
+                    "model.layers.3.moe.experts.up_proj",
+                    1,
+                    vec![4, 8, 16],
+                    vec![4, 4, 16],
+                ),
+                (
+                    "model.layers.3.moe.shared_experts.up_proj.weight",
+                    0,
+                    vec![8, 16],
+                    vec![4, 16],
+                ),
+            ] {
+                insert_logical(
+                    &mut layout,
+                    target,
+                    "expert.intermediate",
+                    shape,
+                    local,
+                    range(axis, 4),
+                    units,
+                    0..units / 2,
+                );
+            }
+            let geometry = partition_local_routed_geometry(
+                &routed_args(),
+                &layout,
+                2..4,
+                topology,
+                &realization(topology),
+            )
+            .unwrap();
+            assert_eq!(geometry.routed_expert_intermediate_range(), Some(0..4));
+            assert_eq!(geometry.shared_expert_intermediate_range(), Some(0..4));
+            for bank in geometry.expert_banks() {
+                assert_eq!(bank.intermediate_range(), 0..4);
+            }
+        }
     }
 
     #[test]

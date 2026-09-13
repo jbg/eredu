@@ -11,7 +11,7 @@ pub const DISCOVERY_SCHEMA_VERSION: u32 = 1;
 
 /// Current architecture descriptor schema, including layer execution groups.
 /// Observation catalogs and support reports retain their independent version.
-pub const ARCHITECTURE_DESCRIPTOR_SCHEMA_VERSION: u32 = 2;
+pub const ARCHITECTURE_DESCRIPTOR_SCHEMA_VERSION: u32 = 14;
 
 /// Coverage of a descriptor, node, or catalog.
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
@@ -182,6 +182,10 @@ pub struct AttentionAttributes {
     pub causal: Option<bool>,
     /// Position encoding used by this layer.
     pub positional_encoding: Option<PositionalEncoding>,
+    /// Canonical learned sink-logit parameter included in attention normalization.
+    /// These per-query-head logits carry zero values; absence means no declaration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sink_logits: Option<String>,
 }
 
 /// Stateful token-mixing equation class.
@@ -401,6 +405,30 @@ pub struct ArchitectureDescriptor {
     pub layer_groups: Vec<ArchitectureLayerGroup>,
     /// Architecture-declared observation points, independent of execution support.
     pub observations: ObservationCatalog,
+    /// Compact component declarations; empty means not described, never zero components.
+    #[serde(default)]
+    pub components: Vec<crate::component::ComponentGroup>,
+    /// Equations connecting component boundaries, including causal histories
+    /// and learned scales. Node ownership distinguishes target and prediction
+    /// invocations; these are not additional additive residual terms.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub component_transforms: Vec<crate::component::ComponentTensorTransform>,
+    /// Compact expert/unit declarations. Sparse participation is distinct from
+    /// topology and does not imply loaded observation or intervention support.
+    #[serde(default)]
+    pub routed_components: Vec<crate::component::RoutedComponentGroup>,
+    /// Architecture-owned readout equation; absence means it has not been described.
+    #[serde(default)]
+    pub component_readout: Option<crate::component::ComponentReadout>,
+    /// Separately invoked component/readout domains, such as prediction depths.
+    /// They do not contribute to the primary target's component readout.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub component_scopes: Vec<crate::component::ComponentExecutionScope>,
+    /// Explicit speculative invocation roots, inherited by descendant nodes.
+    /// These also describe work without a component score equation, such as
+    /// context-cache preparation. Nested roots override their ancestors.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub speculative_invocations: Vec<crate::speculative::SpeculativeCaptureBinding>,
     /// Explicit omissions at this scope.
     pub completeness: DescriptionCompleteness,
 }
@@ -489,11 +517,19 @@ pub enum ObservationDtype {
 }
 
 /// Portable value category produced by an advertised observation.
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ObservationValueType {
     /// A complete tensor, materialized through `TensorObservation`.
     Tensor,
+    /// Sparse routed values in original `[token, route, component]` coordinates.
+    /// Every row retains its global expert identity; inactive experts have no row.
+    RoutedUnits {
+        /// Exact architecture provider invocation, without suffix interpretation.
+        routing: String,
+        /// Complete bank and selected-route geometry.
+        geometry: crate::capture::RoutedUnitGeometry,
+    },
 }
 
 /// Capture timing relative to an intervention at the same path.
@@ -576,6 +612,9 @@ pub struct ObservationMechanisms {
     pub activation_tensors: bool,
     /// The backend collects normalized routing-event tensors.
     pub routing_tensors: bool,
+    /// Bounded actual selected-unit capture, including original route identities.
+    #[serde(default)]
+    pub routed_unit_tensors: bool,
     /// Floating observations are converted to portable F32 host values.
     pub floating_to_f32: bool,
 }
@@ -586,7 +625,9 @@ pub struct ObservationMechanisms {
 pub enum ObservationSupportStatus {
     /// The selected execution emits this point in this phase.
     Supported,
-    /// Supported if the stated input or execution condition holds.
+    /// Supported if the stated input or execution condition holds. Plans may
+    /// select the point without asserting that condition: an absent capture is
+    /// missing, and an absent scheduled intervention fails before commitment.
     Conditional(String),
     /// The selected execution cannot emit this observation.
     Unsupported(String),

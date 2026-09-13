@@ -282,8 +282,7 @@ where
                 self.cache,
                 self.target_state.as_ref().expect("checked boundary"),
                 context,
-            )
-            .map_err(SpeculativeControlError::backend)?
+            )?
             .ok_or(SpeculativeControlError::Unsupported(
                 "executor has no durable speculative checkpoint",
             ))?;
@@ -323,8 +322,7 @@ where
         let target_randomness = snapshot.target_randomness.clone();
         let draft_randomness = snapshot.draft_randomness.clone();
         let target = executor
-            .restore_control_snapshot(self.cache, &snapshot.cache, &snapshot.target, context)
-            .map_err(SpeculativeControlError::backend)?
+            .restore_control_snapshot(self.cache, &snapshot.cache, &snapshot.target, context)?
             .ok_or(SpeculativeControlError::Unsupported(
                 "executor has no durable speculative restore",
             ))?;
@@ -377,6 +375,125 @@ pub enum SpeculativeCaptureRole {
     Target,
     /// Canonical or optimistic draft proposal.
     Draft,
+}
+
+/// Actual forward computation producing an internal speculative activation.
+/// These phases are distinct from committed prediction positions and from
+/// sequence-row coordinates within a captured tensor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "phase", rename_all = "snake_case")]
+pub enum SpeculativeActivationPhase {
+    /// Initial ordinary-target prompt evaluation.
+    TargetPrefill,
+    /// Prediction-local state seeded from target prompt hidden values.
+    PredictionPrefill,
+    /// One tentative sequential prediction invocation.
+    Proposal {
+        /// Zero-based depth within the current proposal block.
+        depth: usize,
+    },
+    /// A tentative fused prediction block.
+    FusedProposal,
+    /// Ordinary-target evaluation of a tentative proposal block.
+    Verification,
+    /// Prediction-local replay of retained verified inputs.
+    PredictionReplay,
+    /// Ordinary-target replay after rejecting a suffix of a verification block.
+    TargetReplay,
+}
+
+/// Scheduler provenance for one speculative executor operation. Tensor rows
+/// remain separate physical coordinates; this is not proof of token commitment.
+/// A run's delivery identity distinguishes restores and branches with the same
+/// prefix. No token history is retained in this fixed-size record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpeculativeActivationOrigin {
+    /// Stable request within the owning scheduler.
+    pub request: SpeculativeRequestId,
+    /// Number of canonical generated tokens before this operation.
+    pub committed_tokens: usize,
+    /// Generated-token schedule coordinate: the next proposal position, the
+    /// start of a verification/replay block, or zero for initial prefill. It
+    /// does not identify every physical row of an internal activation.
+    pub prediction: usize,
+    /// SHA-256 of the exact generated prefix assumed by this operation, using
+    /// the domain `eredu.speculative.activation-prefix.v1` and little-endian u32
+    /// token IDs. The prefix length is `prediction`.
+    pub prefix_digest: [u8; 32],
+    /// Whether this work assumed a still-unverified previous proposal block.
+    /// Canonical proposals are also tentative, even when this is false.
+    pub optimistic: bool,
+}
+
+/// Bounded internal evidence from an actual speculative forward. A successful
+/// forward is still tentative until the generation driver commits its tokens.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SpeculativeActivationCapture {
+    /// Exact loaded activation-plan identity when installed through immutable
+    /// public admission. Low-level observer fixtures may have no such authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admission_identity: Option<String>,
+    /// Monotonic collector invocation identity; restore never rewinds it.
+    pub invocation: u64,
+    /// Scheduler request and assumed generated prefix.
+    pub origin: SpeculativeActivationOrigin,
+    /// Architecture computation that produced this evidence.
+    pub phase: SpeculativeActivationPhase,
+    /// Whether this forward and its evidence finished successfully. False
+    /// retains failure evidence without presenting it as committed output.
+    pub completed: bool,
+    /// Existing value/effective-value records, exact physical shape and shared
+    /// cumulative resource usage. Its transaction outcome describes the forward
+    /// only; even `Committed` does not imply speculative token acceptance.
+    pub captures: crate::capture::CapturedStep,
+}
+
+impl SpeculativeActivationOrigin {
+    pub(super) fn new(request: SpeculativeRequestId, committed: &[u32], optimistic: bool) -> Self {
+        Self {
+            request,
+            committed_tokens: committed.len(),
+            prediction: committed.len(),
+            prefix_digest: Self::digest(committed),
+            optimistic,
+        }
+    }
+
+    pub(super) fn with_prefix(self, prefix: &[u32]) -> Self {
+        Self {
+            prediction: prefix.len(),
+            prefix_digest: Self::digest(prefix),
+            ..self
+        }
+    }
+
+    fn digest(prefix: &[u32]) -> [u8; 32] {
+        use sha2::{Digest, Sha256};
+        let mut digest = Sha256::new();
+        digest.update(b"eredu.speculative.activation-prefix.v1");
+        for token in prefix {
+            digest.update(token.to_le_bytes());
+        }
+        digest.finalize().into()
+    }
+}
+
+/// Bounds an operation's provenance lifetime, including backend errors and
+/// unwinding. Completion ownership remains with the ordinary submission driver.
+pub(super) fn with_activation_origin<E: SpeculativeExecutor, R>(
+    executor: &mut E,
+    origin: Option<SpeculativeActivationOrigin>,
+    operation: impl FnOnce(&mut E) -> R,
+) -> R {
+    struct Guard<'a, E: SpeculativeExecutor>(&'a mut E);
+    impl<E: SpeculativeExecutor> Drop for Guard<'_, E> {
+        fn drop(&mut self) {
+            self.0.set_activation_origin(None);
+        }
+    }
+    let guard = Guard(executor);
+    guard.0.set_activation_origin(origin);
+    operation(guard.0)
 }
 
 /// Prospective tensor edits admitted for one model's speculative prediction rows.

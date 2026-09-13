@@ -145,7 +145,7 @@ impl AddressableGroupedBank<MlxNeuralBackend> for AddressableParameterBank {
     type Error = Error;
 
     fn member_bytes(&self, key: ParameterBankKey) -> Option<u64> {
-        self.catalog.get(&key).copied()
+        self.effective_member_bytes.get(&key).copied()
     }
 
     fn acquire(
@@ -183,8 +183,7 @@ impl AddressableGroupedBank<MlxNeuralBackend> for AddressableParameterBank {
             .local_parameter_names()
             .into_iter()
             .map(|name| {
-                acquisition
-                    .compact_binding(&name, stream)
+                self.compact_parameter_binding(acquisition, &name, stream)
                     .map(|value| (name, value))
             })
             .collect::<Result<BTreeMap<_, _>, _>>()?;
@@ -211,8 +210,7 @@ impl AddressableGroupedBank<MlxNeuralBackend> for AddressableParameterBank {
             .local_parameter_names()
             .into_iter()
             .map(|name| {
-                acquisition
-                    .compact_binding(&name, stream)
+                self.compact_parameter_binding(acquisition, &name, stream)
                     .map(|value| (name, value))
             })
             .collect::<Result<BTreeMap<_, _>, _>>()?;
@@ -238,8 +236,7 @@ impl AddressableGroupedBank<MlxNeuralBackend> for AddressableParameterBank {
             .local_parameter_names()
             .into_iter()
             .map(|name| {
-                acquisition
-                    .compact_binding(&name, stream)
+                self.compact_parameter_binding(acquisition, &name, stream)
                     .map(|value| (name, value))
             })
             .collect::<Result<BTreeMap<_, _>, _>>()?;

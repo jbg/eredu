@@ -2,6 +2,35 @@
 
 use super::*;
 
+// Numeric conformance reports include integer media positions as well as
+// floating cache values. Preserve every integer exactly in this test-only
+// representation; an unrepresentable value must not hide a state difference.
+#[cfg(test)]
+fn numeric_fixture_values(array: &Array) -> Result<Vec<f32>, Exception> {
+    let evaluated = array.evaluated()?;
+    match array.dtype() {
+        safemlx::Dtype::Float32 => evaluated
+            .try_to_vec::<f32>()
+            .map_err(|error| Exception::custom(error.to_string())),
+        safemlx::Dtype::Int32 => evaluated
+            .try_to_vec::<i32>()
+            .map_err(|error| Exception::custom(error.to_string()))?
+            .into_iter()
+            .map(|value| {
+                let converted = value as f32;
+                if f64::from(converted) == f64::from(value) {
+                    Ok(converted)
+                } else {
+                    Err(Exception::custom("integer state is not exactly representable in the numeric fixture report"))
+                }
+            })
+            .collect(),
+        dtype => Err(Exception::custom(format!(
+            "unsupported numeric fixture state dtype: {dtype:?}"
+        ))),
+    }
+}
+
 /// Append-only attention state selected independently from fixed components.
 #[derive(Debug, Clone)]
 enum MlxHybridAttentionState {
@@ -12,13 +41,17 @@ enum MlxHybridAttentionState {
 impl MlxHybridAttentionState {
     fn deep_clone_state(&self) -> Result<Self, Exception> {
         match self {
+            Self::KeyValue(MlxKeyValueLayerState::Stateless) => {
+                Ok(Self::KeyValue(MlxKeyValueLayerState::Stateless))
+            }
             Self::KeyValue(MlxKeyValueLayerState::Device(cache)) => cache
                 .checkpoint_clone_state()
                 .map(MlxKeyValueLayerState::Device)
                 .map(Self::KeyValue),
-            Self::KeyValue(MlxKeyValueLayerState::Paged(cache)) => Ok(Self::KeyValue(
-                MlxKeyValueLayerState::Paged(cache.checkpoint_clone_state()),
-            )),
+            Self::KeyValue(MlxKeyValueLayerState::Paged(cache)) => cache
+                .checkpoint_clone_state()
+                .map(MlxKeyValueLayerState::Paged)
+                .map(Self::KeyValue),
             Self::Compressed(cache) => cache.deep_clone_state().map(Self::Compressed),
         }
     }
@@ -53,7 +86,9 @@ impl MlxHybridAttentionState {
         match self {
             Self::KeyValue(MlxKeyValueLayerState::Paged(cache)) => Some(cache.manager()),
             Self::Compressed(cache) => cache.residency_manager(),
-            Self::KeyValue(MlxKeyValueLayerState::Device(_)) => None,
+            Self::KeyValue(MlxKeyValueLayerState::Stateless | MlxKeyValueLayerState::Device(_)) => {
+                None
+            }
         }
     }
 
@@ -69,6 +104,10 @@ impl MlxHybridAttentionState {
 
     fn restore_checkpoint(&mut self, checkpoint: &Self, stream: &Stream) -> Result<(), Exception> {
         match (self, checkpoint) {
+            (
+                Self::KeyValue(MlxKeyValueLayerState::Stateless),
+                Self::KeyValue(MlxKeyValueLayerState::Stateless),
+            ) => Ok(()),
             (
                 Self::KeyValue(MlxKeyValueLayerState::Device(current)),
                 Self::KeyValue(MlxKeyValueLayerState::Device(previous)),
@@ -419,6 +458,20 @@ impl AttentionCache<MlxTensor> for MlxHybridLayerState {
             stream,
         )
     }
+    fn relative_attention<N: eredu_nn::NeuralBackend<Tensor = MlxTensor>>(
+        &mut self,
+        request: eredu_nn::RelativeAttentionInput<'_, MlxTensor>,
+        stream: &Stream,
+    ) -> Result<MlxTensor, ComputeError> {
+        match self.attention.as_mut() {
+            Some(MlxHybridAttentionState::KeyValue(cache)) => {
+                cache.relative_attention::<N>(request, stream)
+            }
+            _ => Err(ComputeError::backend(
+                "layer has no key/value attention cache",
+            )),
+        }
+    }
 }
 
 impl CompressedAttentionCache<MlxTensor> for MlxHybridLayerState {
@@ -524,7 +577,10 @@ impl MlxHybridState {
         self.layers
             .iter()
             .try_fold(0, |bound, layer| match &layer.attention {
-                None => Some(bound),
+                None
+                | Some(MlxHybridAttentionState::KeyValue(MlxKeyValueLayerState::Stateless)) => {
+                    Some(bound)
+                }
                 Some(MlxHybridAttentionState::KeyValue(MlxKeyValueLayerState::Device(cache))) => {
                     Some(bound.max(cache.continuation_capacity_bound(additional)?))
                 }
@@ -537,20 +593,29 @@ impl MlxHybridState {
                         ),
                     )
                 }
-                _ => None,
+                Some(MlxHybridAttentionState::Compressed(cache)) => {
+                    Some(bound.max(cache.continuation_capacity_bound(additional)?))
+                }
             })
     }
 
     pub(crate) fn supports_isolated_snapshot(&self) -> bool {
         self.layers.iter().all(|layer| match &layer.attention {
-            None | Some(MlxHybridAttentionState::KeyValue(MlxKeyValueLayerState::Device(_))) => {
-                true
-            }
+            None
+            | Some(MlxHybridAttentionState::KeyValue(
+                MlxKeyValueLayerState::Stateless | MlxKeyValueLayerState::Device(_),
+            )) => true,
             Some(MlxHybridAttentionState::KeyValue(MlxKeyValueLayerState::Paged(cache))) => self
                 .manager
                 .as_ref()
                 .is_some_and(|manager| manager.session_id() == cache.manager().session_id()),
-            _ => false,
+            Some(MlxHybridAttentionState::Compressed(cache)) => {
+                cache.residency_manager().is_none_or(|paging| {
+                    self.manager
+                        .as_ref()
+                        .is_some_and(|manager| manager.session_id() == paging.session_id())
+                })
+            }
         })
     }
 
@@ -566,12 +631,11 @@ impl MlxHybridState {
             .layers
             .iter()
             .filter(|layer| {
-                matches!(
-                    layer.attention,
-                    Some(MlxHybridAttentionState::KeyValue(
-                        MlxKeyValueLayerState::Paged(_)
-                    ))
-                )
+                layer
+                    .attention
+                    .as_ref()
+                    .and_then(MlxHybridAttentionState::manager)
+                    .is_some()
             })
             .count() as u64;
         additional
@@ -585,7 +649,7 @@ impl MlxHybridState {
     pub(crate) fn isolated_snapshot(&self, stream: &Stream) -> Result<Self, Exception> {
         if !self.supports_isolated_snapshot() {
             return Err(Exception::custom(
-                "isolated snapshots require ordinary KV attention and consistent paging managers",
+                "isolated snapshots require consistent attention paging managers",
             ));
         }
         let manager = self
@@ -603,6 +667,11 @@ impl MlxHybridState {
             .map(|layer| {
                 let attention = match &layer.attention {
                     None => None,
+                    Some(MlxHybridAttentionState::KeyValue(MlxKeyValueLayerState::Stateless)) => {
+                        Some(MlxHybridAttentionState::KeyValue(
+                            MlxKeyValueLayerState::Stateless,
+                        ))
+                    }
                     Some(MlxHybridAttentionState::KeyValue(MlxKeyValueLayerState::Device(
                         cache,
                     ))) => Some(MlxHybridAttentionState::KeyValue(
@@ -622,7 +691,18 @@ impl MlxHybridState {
                             MlxKeyValueLayerState::Paged(cache),
                         ))
                     }
-                    _ => unreachable!("validated KV attention and fixed state"),
+                    Some(MlxHybridAttentionState::Compressed(cache)) => {
+                        let mut cache = cache.isolated_snapshot(stream)?;
+                        if cache.is_paged() {
+                            cache.rebind_paging_manager(
+                                manager
+                                    .as_ref()
+                                    .expect("paged state has copied manager")
+                                    .clone(),
+                            );
+                        }
+                        Some(MlxHybridAttentionState::Compressed(cache))
+                    }
                 };
                 let fixed = layer
                     .fixed
@@ -823,12 +903,11 @@ impl MlxHybridState {
                 let Some(value) = value else {
                     continue;
                 };
-                let evaluated = value.as_array().evaluated()?;
                 snapshot.push((
                     layer,
                     *role,
                     value.as_array().shape().to_vec(),
-                    evaluated.as_slice::<f32>().to_vec(),
+                    numeric_fixture_values(value.as_array())?,
                 ));
             }
         }
@@ -840,8 +919,7 @@ impl MlxHybridState {
         self.retained_arrays()
             .into_iter()
             .map(|array| {
-                let evaluated = array.evaluated()?;
-                Ok((array.shape().to_vec(), evaluated.as_slice::<f32>().to_vec()))
+                Ok((array.shape().to_vec(), numeric_fixture_values(array)?))
             })
             .collect()
     }
@@ -887,7 +965,9 @@ impl MlxHybridState {
                 Some(MlxHybridAttentionState::Compressed(cache)) => {
                     cache.rebind_paging_manager(manager.clone());
                 }
-                Some(MlxHybridAttentionState::KeyValue(MlxKeyValueLayerState::Device(_)))
+                Some(MlxHybridAttentionState::KeyValue(
+                    MlxKeyValueLayerState::Stateless | MlxKeyValueLayerState::Device(_),
+                ))
                 | None => {}
             }
         }

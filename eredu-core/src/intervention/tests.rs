@@ -41,6 +41,7 @@ fn discovery(routing: bool) -> InterventionDiscovery {
         prefill: S::Supported,
         decode: S::Supported,
         conditions: vec![],
+        routed_units: None,
         routing: None,
     };
     if routing {
@@ -117,6 +118,81 @@ fn zero() -> InterventionOperation {
     operation(InterventionAction::Zero {
         dtype: InterventionDtype::Float32,
     })
+}
+
+#[test]
+fn distributed_intent_preserves_semantics_without_sharing_session_authority() {
+    let host = plan(vec![zero()]);
+    let local = discovery(false);
+    let mut peer = local.clone();
+    peer.session_identity = Some("peer-native-session".into());
+    let a = host.clone().admit(&local, request(), "run-a").unwrap();
+    let b = host.clone().admit(&peer, request(), "run-b").unwrap();
+    assert_ne!(a.identity(), b.identity());
+    assert_eq!(a.intent_identity(), b.intent_identity());
+    // Preserve the existing session-bound identity byte-for-byte.
+    let digest = Sha256::digest(
+        serde_json::to_vec(&(
+            a.plan(),
+            a.points(),
+            a.request(),
+            &local.artifact_identity,
+            &local.session_identity,
+            "run-a",
+        ))
+        .unwrap(),
+    );
+    let digest = digest
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    assert_eq!(a.identity(), format!("intervention-v1-{digest}"));
+    peer.artifact_identity = "another-source".into();
+    assert_ne!(
+        a.intent_identity(),
+        host.clone()
+            .admit(&peer, request(), "run-a")
+            .unwrap()
+            .intent_identity()
+    );
+    peer = local.clone();
+    peer.points[0].axes[2].dimension = D::Known(3);
+    assert_ne!(
+        a.intent_identity(),
+        host.clone()
+            .admit(&peer, request(), "run-a")
+            .unwrap()
+            .intent_identity()
+    );
+    let mut changed = host.clone();
+    changed.operations[0].action = InterventionAction::Scale {
+        dtype: InterventionDtype::Float32,
+        factor: 0.0,
+    };
+    assert_ne!(
+        a.intent_identity(),
+        changed
+            .admit(&local, request(), "run-a")
+            .unwrap()
+            .intent_identity()
+    );
+    changed = host.clone();
+    changed.operations[0].schedule.first_prediction = 1;
+    assert_ne!(
+        a.intent_identity(),
+        changed
+            .admit(&local, request(), "run-a")
+            .unwrap()
+            .intent_identity()
+    );
+    let mut geometry = request();
+    geometry.prompt_tokens += 1;
+    assert_ne!(
+        a.intent_identity(),
+        host.admit(&local, geometry, "run-a")
+            .unwrap()
+            .intent_identity()
+    );
 }
 
 #[test]
@@ -317,12 +393,33 @@ fn unknown_targets_duplicate_ids_axes_and_unsupported_phases_fail() {
     for status in [
         S::Unsupported("partitioned".into()),
         S::Unverified("native support".into()),
-        S::Conditional("media required".into()),
     ] {
         let mut d = discovery(false);
         d.points[0].prefill = status;
         assert!(plan(vec![zero()]).admit(&d, request(), "s").is_err());
     }
+}
+
+#[test]
+fn conditional_intervention_admission_preserves_the_execution_requirement() {
+    let mut discovery = discovery(false);
+    let conditional = S::Conditional("media branch must execute".into());
+    discovery.points[0].prefill = conditional.clone();
+    let admitted = plan(vec![zero()])
+        .admit(&discovery, request(), "s")
+        .unwrap();
+    assert_eq!(admitted.points()[0].prefill, conditional);
+    // Admission does not establish that the selected branch was actually run;
+    // the runtime's commitment check requires the intervention to be applied.
+    assert!(admitted
+        .validate_actual(
+            0,
+            CapturePhase::Prefill,
+            0,
+            &[1, 3, 4],
+            Some(InterventionDtype::Float32)
+        )
+        .is_err());
 }
 
 #[test]
@@ -467,5 +564,107 @@ fn empty_plans_and_inactive_schedules_have_explicit_semantics() {
             &[1, 1, 2],
             Some(InterventionDtype::Float32)
         )
+        .is_err());
+}
+
+#[test]
+fn compact_masks_admit_all_layer_keep_only_without_one_operation_per_removed_unit() {
+    let mut catalog = discovery(false);
+    let template = catalog.points[0].clone();
+    catalog.points.clear();
+    let mut operations = vec![];
+    for layer in 0..128 {
+        for kind in ["attention", "ffn"] {
+            let mut point = template.clone();
+            point.path = format!("layer.{layer}.{kind}");
+            point.axes[2].name = "component".into();
+            let width = if kind == "attention" { 8192 } else { 32768 };
+            point.axes[2].dimension = D::Known(width);
+
+            point.operations.push(InterventionKind::MaskComponents);
+            let mut operation = zero();
+            operation.id = point.path.clone();
+            operation.schedule.decode = false;
+            operation.target = point.path.clone();
+            operation.slices = vec![CaptureSlice {
+                axis: "sequence".into(),
+                start: 2,
+                end: 3,
+                stride: 1,
+            }];
+            operation.action = InterventionAction::MaskComponents {
+                dtype: InterventionDtype::Float32,
+                indices: (0..width as u32).collect(),
+                keep_selected: true,
+            };
+            operations.push(operation);
+            catalog.points.push(point);
+        }
+    }
+    let plan = plan(operations);
+    let payload: u64 = plan
+        .operations
+        .iter()
+        .map(|operation| operation.action.payload_bytes().unwrap())
+        .sum();
+    assert_eq!(payload, 20 * 1024 * 1024);
+    let encoded = serde_json::to_vec(&plan).unwrap();
+    assert!(
+        encoded.len() > 1024 * 1024,
+        "regression must exceed the former JSON cap"
+    );
+    assert!(encoded.len() < MAX_INTERVENTION_PLAN_BYTES as usize);
+    let decoded: InterventionPlan = serde_json::from_slice(&encoded).unwrap();
+    drop(encoded);
+    drop(plan);
+    let admitted = decoded.admit(&catalog, request(), "session").unwrap();
+    assert_eq!(admitted.plan().operations.len(), 256);
+}
+
+#[test]
+fn compact_masks_reject_wrong_axes_duplicate_ids_and_component_axis_slicing() {
+    let mut catalog = discovery(false);
+    catalog.points[0]
+        .operations
+        .push(InterventionKind::MaskComponents);
+    let mut operation = zero();
+    operation.action = InterventionAction::MaskComponents {
+        dtype: InterventionDtype::Float32,
+        indices: vec![1],
+        keep_selected: true,
+    };
+    assert!(plan(vec![operation.clone()])
+        .admit(&catalog, request(), "session")
+        .is_err());
+    catalog.points[0].axes[2].name = "component".into();
+    plan(vec![operation.clone()])
+        .admit(&catalog, request(), "session")
+        .unwrap();
+    for indices in [vec![1, 1], vec![2]] {
+        operation.action = InterventionAction::MaskComponents {
+            dtype: InterventionDtype::Float32,
+            indices,
+            keep_selected: true,
+        };
+        assert!(plan(vec![operation.clone()])
+            .admit(&catalog, request(), "session")
+            .is_err());
+    }
+    operation.action = InterventionAction::MaskComponents {
+        dtype: InterventionDtype::Float32,
+        indices: vec![],
+        keep_selected: true,
+    };
+    plan(vec![operation.clone()])
+        .admit(&catalog, request(), "session")
+        .unwrap();
+    operation.slices = vec![CaptureSlice {
+        axis: "component".into(),
+        start: 0,
+        end: 1,
+        stride: 1,
+    }];
+    assert!(plan(vec![operation])
+        .admit(&catalog, request(), "session")
         .is_err());
 }

@@ -1,0 +1,20 @@
+{
+  "source": "LiquidAI/LFM2-8B-A1B",
+  "revision": "c1c44ff9fc00db3ebf4516970563f5f383d23670",
+  "prefix_ids": [
+    1098,
+    5706,
+    803,
+    4481,
+    856
+  ],
+  "prediction": 1,
+  "boundary": "layer 3 feed-forward RMS normalization",
+  "epsilon": 1e-05,
+  "torch": "2.14.0",
+  "transformers": "5.16.1",
+  "sha256": "0b87afb7ceb62948e371ac45c9dabff7e6178aaafec41e2a4ca6a0a3ae623d2a",
+  "equation": "(input.float() * torch.rsqrt(input.float().square().mean(-1, keepdim=True) + 1e-5)).bfloat16() * weight",
+  "native_failure_before_fix": "19 differing coordinates on Metal despite exact residual input",
+  "f16_variant": "Inputs and gains converted to F16; independent float32 RMS, F16 normalized value and product"
+}

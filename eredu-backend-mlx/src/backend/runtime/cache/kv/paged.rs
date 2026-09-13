@@ -45,6 +45,14 @@ where
         )
     }
 
+    fn paged_relative_attention(
+        &mut self,
+        input: &eredu_nn::RelativeAttentionInput<'_, MlxTensor>,
+        stream: &Stream,
+    ) -> Result<Option<Array>, Exception> {
+        T::paged_relative_attention(self, input, stream)
+    }
+
     fn update_for_attention(
         &mut self,
         keys: Array,
@@ -81,6 +89,7 @@ pub struct PagedKeyValueCache {
     tail_values: Option<Array>,
     pub(super) tail_start: i64,
     pub(super) offset: i64,
+    retained_history: Option<std::sync::Arc<super::super::residency::CacheHistoryRetention>>,
 }
 
 /// Rollback metadata for one sequential semantic branch.
@@ -120,7 +129,7 @@ impl LiveKeyValueCache {
     pub fn deep_clone_state(&self) -> Result<Self, Exception> {
         match self {
             Self::Resident(cache) => cache.deep_clone_state().map(Self::Resident),
-            Self::Paged(cache) => Ok(Self::Paged(cache.clone())),
+            Self::Paged(cache) => cache.checkpoint_clone_state().map(Self::Paged),
         }
     }
 
@@ -203,7 +212,7 @@ impl LiveKeyValueCache {
     ) -> Result<(), Exception> {
         match (self, checkpoint) {
             (Self::Resident(cache), Self::Resident(previous)) => {
-                *cache = previous.deep_clone_state()?;
+                *cache = previous.isolated_snapshot(stream)?;
                 Ok(())
             }
             (Self::Paged(cache), Self::Paged(previous)) => {
@@ -271,6 +280,17 @@ impl KeyValueCache for LiveKeyValueCache {
 
     fn is_paged(&self) -> bool {
         matches!(self, Self::Paged(_))
+    }
+
+    fn paged_relative_attention(
+        &mut self,
+        input: &eredu_nn::RelativeAttentionInput<'_, MlxTensor>,
+        stream: &Stream,
+    ) -> Result<Option<Array>, Exception> {
+        match self {
+            Self::Resident(_) => Ok(None),
+            Self::Paged(cache) => cache.paged_relative_attention(input, stream),
+        }
     }
 
     fn paged_attention(
@@ -345,8 +365,24 @@ impl PagedKeyValueCache {
     /// Snapshots append-only local state while retaining its exact array views.
     /// Appends replace tails rather than mutating them, so the shared views are
     /// immutable for the lifetime of the checkpoint.
-    pub fn checkpoint_clone_state(&self) -> Self {
-        self.clone()
+    pub fn checkpoint_clone_state(&self) -> Result<Self, Exception> {
+        let mut checkpoint = self.clone();
+        if let Some(window) = self.sliding_window {
+            let start = (self.offset - i64::from(window)).max(0);
+            if start < self.tail_start {
+                checkpoint.retained_history = Some(
+                    self.manager
+                        .retain_history(
+                            self.global_layer,
+                            CacheRepresentation::KeyValue,
+                            start,
+                            self.tail_start,
+                        )
+                        .map_err(cache_residency_exception)?,
+                );
+            }
+        }
+        Ok(checkpoint)
     }
 
     /// Captures the shared-manager frontier required to discard one
@@ -509,6 +545,7 @@ impl PagedKeyValueCache {
             tail_values: None,
             tail_start: offset,
             offset,
+            retained_history: None,
         })
     }
 
@@ -519,6 +556,7 @@ impl PagedKeyValueCache {
 
     pub(crate) fn rebind_paging_manager(&mut self, manager: CacheResidencyManager) {
         self.manager = manager;
+        self.retained_history = None;
     }
 
     /// Returns whether another cache has the same immutable transaction
@@ -695,6 +733,9 @@ impl PagedKeyValueCache {
             )
             .map_err(cache_residency_exception)?;
         self.clone_from(checkpoint);
+        // Only the saved frontier retains old history. The resumed live state
+        // must allow it to expire when that checkpoint is released.
+        self.retained_history = None;
         Ok(())
     }
 
@@ -713,6 +754,7 @@ impl PagedKeyValueCache {
         self.tail_values = None;
         self.tail_start = 0;
         self.offset = 0;
+        self.retained_history = None;
         Ok(())
     }
 
@@ -818,10 +860,20 @@ impl PagedKeyValueCache {
         values: Array,
         stream: &Stream,
     ) -> Result<(), Exception> {
+        let values = self.normalize_update_values(&keys, values, stream)?;
+        self.append_normalized(keys, values, false, stream)
+    }
+
+    fn append_normalized(
+        &mut self,
+        keys: Array,
+        values: Array,
+        retain_for_attention: bool,
+        stream: &Stream,
+    ) -> Result<(), Exception> {
         self.manager
             .bind_transfer_device(stream)
             .map_err(cache_residency_exception)?;
-        let values = self.normalize_update_values(&keys, values, stream)?;
         self.validate_update(&keys, &values)?;
         if let Some(tail) = &self.tail_keys {
             if tail.dim(0) != keys.dim(0)
@@ -848,7 +900,7 @@ impl PagedKeyValueCache {
                 0,
             )
             .map_err(cache_residency_exception)?;
-        let result = self.append_inner(keys, values, stream);
+        let result = self.append_inner(keys, values, retain_for_attention, stream);
         if let Err(error) = result {
             let rollback = self.rollback_append(
                 previous_tail_keys,
@@ -871,6 +923,7 @@ impl PagedKeyValueCache {
         &mut self,
         keys: Array,
         values: Array,
+        retain_for_attention: bool,
         stream: &Stream,
     ) -> Result<(), Exception> {
         let block_size = self.manager.options().block_size_tokens();
@@ -910,6 +963,13 @@ impl PagedKeyValueCache {
             }
         }
         self.offset += input_len as i64;
+        if !retain_for_attention {
+            self.discard_sliding_history()?;
+        }
+        Ok(())
+    }
+
+    fn discard_sliding_history(&self) -> Result<(), Exception> {
         if let Some(window) = self.sliding_window {
             let visible_start = (self.offset - window as i64).max(self.prefix_tokens as i64);
             self.manager
@@ -1038,6 +1098,11 @@ impl PagedKeyValueCache {
         } else {
             concatenate_axis(&value_refs, -2, stream)?
         };
+        if i64::from(keys.dim(-2)) != end - start || i64::from(values.dim(-2)) != end - start {
+            return Err(Exception::custom(
+                "paged cache visible history is incomplete",
+            ));
+        }
         Ok((keys, values))
     }
 }
@@ -1059,6 +1124,7 @@ impl Default for PagedKeyValueCache {
             tail_values: None,
             tail_start: 0,
             offset: 0,
+            retained_history: None,
         }
     }
 }
@@ -1091,6 +1157,118 @@ impl KeyValueCache for PagedKeyValueCache {
         sinks: Option<&Array>,
         softcap: Option<f32>,
         arithmetic: eredu_nn::AttentionArithmetic,
+        stream: &Stream,
+    ) -> Result<Option<Array>, Exception> {
+        self.scan_attention(
+            queries, scale, mask, sinks, softcap, arithmetic, None, stream,
+        )
+    }
+
+    fn paged_relative_attention(
+        &mut self,
+        input: &eredu_nn::RelativeAttentionInput<'_, MlxTensor>,
+        stream: &Stream,
+    ) -> Result<Option<Array>, Exception> {
+        input
+            .validate()
+            .map_err(|error| Exception::custom(error.to_string()))?;
+        if i64::from(input.query_offset) != self.offset - i64::from(input.queries.as_array().dim(2))
+            || input.window != self.sliding_window
+            || self.prefix_tokens != 0
+        {
+            return Err(Exception::custom(
+                "relative attention request differs from retained cache geometry",
+            ));
+        }
+        let kernel =
+            crate::backend::nn::relative_attention::RelativeAttentionKernel::new(input, stream)?;
+        self.scan_attention(
+            &kernel.queries,
+            1.0 / kernel.queries.dim(3) as f32,
+            None,
+            None,
+            None,
+            eredu_nn::AttentionArithmetic::Fused,
+            Some(&kernel),
+            stream,
+        )
+    }
+
+    fn update_for_attention(
+        &mut self,
+        keys: Array,
+        values: Array,
+        stream: &Stream,
+    ) -> Result<(Array, Array), Exception> {
+        let submitted = (keys.clone(), values.clone());
+        let values = self.normalize_update_values(&keys, values, stream)?;
+        self.append_normalized(keys, values, true, stream)?;
+        Ok(submitted)
+    }
+
+    fn update_and_fetch(
+        &mut self,
+        keys: Array,
+        values: Array,
+        stream: &Stream,
+    ) -> Result<(Array, Array), Exception> {
+        if let Some(window) = self.sliding_window {
+            let values = self.normalize_update_values(&keys, values, stream)?;
+            self.validate_update(&keys, &values)?;
+            // Retain the history needed by the earliest submitted query before
+            // append discards blocks outside the final query's window. Every
+            // submitted key remains visible to this call, including long prefill.
+            let start = (self.offset - (window - 1) as i64).max(0);
+            let visible = if start < self.offset {
+                let (past_keys, past_values) =
+                    self.contiguous_visible(start, self.offset, stream)?;
+                (
+                    concatenate_axis(&[past_keys, keys.clone()], -2, stream)?,
+                    concatenate_axis(&[past_values, values.clone()], -2, stream)?,
+                )
+            } else {
+                (keys.clone(), values.clone())
+            };
+            self.append_normalized(keys, values, false, stream)?;
+            return Ok(visible);
+        }
+        let previous_offset = self.offset;
+        let update_len = keys.dim(-2) as i64;
+        let fallback_keys = keys.clone();
+        let fallback_values = values.clone();
+        self.append(keys, values, stream)?;
+        if update_len == self.offset - previous_offset {
+            Ok((fallback_keys, fallback_values))
+        } else {
+            Err(Exception::custom("paged cache offset changed unexpectedly"))
+        }
+    }
+}
+
+impl eredu_runtime::RuntimeLayerState<MlxNeuralBackend> for PagedKeyValueCache {
+    type RetainedValues<'a> = RetainedArrayIter<'a>;
+
+    fn retained_values(&self) -> Self::RetainedValues<'_> {
+        [
+            self.tail_keys.as_ref().map(retained_tensor),
+            self.tail_values.as_ref().map(retained_tensor),
+        ]
+        .into_iter()
+        .flatten()
+    }
+}
+
+impl PagedKeyValueCache {
+    #[allow(clippy::too_many_arguments)]
+    fn scan_attention(
+        &mut self,
+        queries: &Array,
+        scale: f32,
+        mask: Option<&Array>,
+        sinks: Option<&Array>,
+        softcap: Option<f32>,
+        arithmetic: eredu_nn::AttentionArithmetic,
+        relative: Option<&crate::backend::nn::relative_attention::RelativeAttentionKernel>,
         stream: &Stream,
     ) -> Result<Option<Array>, Exception> {
         if self.key_only {
@@ -1161,7 +1339,14 @@ impl KeyValueCache for PagedKeyValueCache {
                 );
                 scanned_blocks += 1;
                 scanned_bytes += lease.bytes();
-                accumulator.accumulate(&block, stream)?;
+                let bias = relative
+                    .map(|kernel| kernel.bias(block.start, block.end, stream))
+                    .transpose()?;
+                if let Some(bias) = &bias {
+                    scratch =
+                        scratch.max(relative.unwrap().prepared_bytes() + 3 * bias.nbytes() as u64);
+                }
+                accumulator.accumulate_with_bias(&block, bias.as_ref(), stream)?;
                 accumulator.submit()?;
                 drop(lease);
             }
@@ -1181,11 +1366,22 @@ impl KeyValueCache for PagedKeyValueCache {
                 );
                 scanned_blocks += 1;
                 scanned_bytes += block.bytes;
-                accumulator.accumulate(&block, stream)?;
+                let bias = relative
+                    .map(|kernel| kernel.bias(block.start, block.end, stream))
+                    .transpose()?;
+                if let Some(bias) = &bias {
+                    scratch =
+                        scratch.max(relative.unwrap().prepared_bytes() + 3 * bias.nbytes() as u64);
+                }
+                accumulator.accumulate_with_bias(&block, bias.as_ref(), stream)?;
             }
         }
         let output = accumulator.finish(stream)?;
         safemlx::transforms::eval([&output])?;
+        // Every query in the submitted span has now consumed its visible keys.
+        // Before this point, discarding by the final query's window would erase
+        // keys needed by earlier queries in a multi-token attention call.
+        self.discard_sliding_history()?;
         self.manager
             .record_attention_scan(
                 self.global_layer,
@@ -1196,48 +1392,5 @@ impl KeyValueCache for PagedKeyValueCache {
             )
             .map_err(cache_residency_exception)?;
         Ok(Some(output))
-    }
-
-    fn update_for_attention(
-        &mut self,
-        keys: Array,
-        values: Array,
-        stream: &Stream,
-    ) -> Result<(Array, Array), Exception> {
-        let submitted = (keys.clone(), values.clone());
-        self.append(keys, values, stream)?;
-        Ok(submitted)
-    }
-
-    fn update_and_fetch(
-        &mut self,
-        keys: Array,
-        values: Array,
-        stream: &Stream,
-    ) -> Result<(Array, Array), Exception> {
-        let previous_offset = self.offset;
-        let update_len = keys.dim(-2) as i64;
-        let fallback_keys = keys.clone();
-        let fallback_values = values.clone();
-        self.append(keys, values, stream)?;
-        if let Some(window) = self.sliding_window {
-            let start = (previous_offset - (window - 1) as i64).max(0);
-            self.contiguous_visible(start, self.offset, stream)
-        } else if update_len == self.offset - previous_offset {
-            Ok((fallback_keys, fallback_values))
-        } else {
-            Err(Exception::custom("paged cache offset changed unexpectedly"))
-        }
-    }
-}
-
-impl eredu_runtime::RuntimeLayerState<MlxNeuralBackend> for PagedKeyValueCache {
-    type RetainedValues<'a> = RetainedArrayIter<'a>;
-
-    fn retained_values(&self) -> Self::RetainedValues<'_> {
-        self.tail_keys
-            .iter()
-            .chain(self.tail_values.iter())
-            .map(retained_tensor)
     }
 }

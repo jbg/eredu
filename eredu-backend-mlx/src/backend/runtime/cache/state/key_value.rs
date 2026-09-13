@@ -5,6 +5,8 @@ use super::*;
 /// One concrete MLX key/value layer state selected by runtime residency policy.
 #[derive(Debug, Clone)]
 pub enum MlxKeyValueLayerState {
+    /// A physical invocation with no mutable attention state.
+    Stateless,
     /// Contiguous execution-device keys and values.
     Device(ConcatKeyValueCache),
     /// Block-addressable keys and values managed by finite residency budgets.
@@ -14,6 +16,7 @@ pub enum MlxKeyValueLayerState {
 impl MlxKeyValueLayerState {
     pub(super) fn clear(&mut self) -> Result<(), Exception> {
         match self {
+            Self::Stateless => Ok(()),
             Self::Device(cache) => {
                 cache.clear();
                 Ok(())
@@ -24,13 +27,15 @@ impl MlxKeyValueLayerState {
 
     fn deep_clone_state(&self) -> Result<Self, Exception> {
         match self {
+            Self::Stateless => Ok(Self::Stateless),
             Self::Device(cache) => cache.checkpoint_clone_state().map(Self::Device),
-            Self::Paged(cache) => Ok(Self::Paged(cache.checkpoint_clone_state())),
+            Self::Paged(cache) => cache.checkpoint_clone_state().map(Self::Paged),
         }
     }
 
     fn restore_checkpoint(&mut self, checkpoint: &Self, stream: &Stream) -> Result<(), Exception> {
         match (self, checkpoint) {
+            (Self::Stateless, Self::Stateless) => Ok(()),
             (Self::Device(current), Self::Device(previous)) => {
                 *current = previous.checkpoint_clone_state()?;
                 Ok(())
@@ -46,8 +51,22 @@ impl MlxKeyValueLayerState {
 }
 
 impl KeyValueCache for MlxKeyValueLayerState {
+    fn paged_relative_attention(
+        &mut self,
+        input: &eredu_nn::RelativeAttentionInput<'_, MlxTensor>,
+        stream: &Stream,
+    ) -> Result<Option<Array>, Exception> {
+        match self {
+            Self::Stateless => Err(Exception::custom(
+                "stateless invocation cannot execute relative attention",
+            )),
+            Self::Device(cache) => cache.paged_relative_attention(input, stream),
+            Self::Paged(cache) => cache.paged_relative_attention(input, stream),
+        }
+    }
     fn offset(&self) -> i32 {
         match self {
+            Self::Stateless => 0,
             Self::Device(cache) => KeyValueCache::offset(cache),
             Self::Paged(cache) => KeyValueCache::offset(cache),
         }
@@ -55,6 +74,7 @@ impl KeyValueCache for MlxKeyValueLayerState {
 
     fn max_size(&self) -> Option<i32> {
         match self {
+            Self::Stateless => None,
             Self::Device(cache) => KeyValueCache::max_size(cache),
             Self::Paged(cache) => KeyValueCache::max_size(cache),
         }
@@ -62,6 +82,7 @@ impl KeyValueCache for MlxKeyValueLayerState {
 
     fn retained_arrays(&self) -> Vec<&Array> {
         match self {
+            Self::Stateless => Vec::new(),
             Self::Device(cache) => cache.retained_arrays(),
             Self::Paged(cache) => cache.retained_arrays(),
         }
@@ -82,6 +103,9 @@ impl KeyValueCache for MlxKeyValueLayerState {
         stream: &Stream,
     ) -> Result<Option<Array>, Exception> {
         match self {
+            Self::Stateless => Err(Exception::custom(
+                "stateless invocation cannot execute cached attention",
+            )),
             Self::Device(cache) => {
                 cache.paged_attention(queries, scale, mask, sinks, softcap, arithmetic, stream)
             }
@@ -98,6 +122,9 @@ impl KeyValueCache for MlxKeyValueLayerState {
         stream: &Stream,
     ) -> Result<(Array, Array), Exception> {
         match self {
+            Self::Stateless => Err(Exception::custom(
+                "stateless invocation cannot acquire key/value state",
+            )),
             Self::Device(cache) => KeyValueCache::update_for_attention(cache, keys, values, stream),
             Self::Paged(cache) => KeyValueCache::update_for_attention(cache, keys, values, stream),
         }
@@ -110,6 +137,9 @@ impl KeyValueCache for MlxKeyValueLayerState {
         stream: &Stream,
     ) -> Result<(Array, Array), Exception> {
         match self {
+            Self::Stateless => Err(Exception::custom(
+                "stateless invocation cannot acquire key/value state",
+            )),
             Self::Device(cache) => cache.update_and_fetch(keys, values, stream),
             Self::Paged(cache) => cache.update_and_fetch(keys, values, stream),
         }
@@ -121,6 +151,7 @@ impl RuntimeLayerState<MlxNeuralBackend> for MlxKeyValueLayerState {
 
     fn retained_values(&self) -> Self::RetainedValues<'_> {
         match self {
+            Self::Stateless => [None, None].into_iter().flatten(),
             Self::Device(cache) => RuntimeLayerState::<MlxNeuralBackend>::retained_values(cache),
             Self::Paged(cache) => RuntimeLayerState::<MlxNeuralBackend>::retained_values(cache),
         }
@@ -230,6 +261,7 @@ pub(super) fn common_selected_placement(
 impl MlxKeyValueState {
     pub(crate) fn continuation_capacity_bound(&self, additional: u64) -> Option<u64> {
         self.layers.iter().try_fold(0, |bound, layer| match layer {
+            MlxKeyValueLayerState::Stateless => Some(bound),
             MlxKeyValueLayerState::Device(cache) => {
                 Some(bound.max(cache.continuation_capacity_bound(additional)?))
             }
@@ -258,6 +290,9 @@ impl MlxKeyValueState {
             .iter()
             .enumerate()
             .map(|(layer, policy)| {
+                if *policy == LayerCachePolicy::NoState {
+                    return Ok(MlxKeyValueLayerState::Stateless);
+                }
                 let window = key_value_window(layer, policy)?;
                 Ok(MlxKeyValueLayerState::Device(match window {
                     Some(window) => ConcatKeyValueCache::new_for_sliding_attention(window),
@@ -294,6 +329,9 @@ impl MlxKeyValueState {
             .iter()
             .enumerate()
             .map(|(layer, policy)| {
+                if *policy == LayerCachePolicy::NoState {
+                    return Ok(MlxKeyValueLayerState::Stateless);
+                }
                 let window = key_value_window(layer, policy)?;
                 let global_layer = global_layer_start.checked_add(layer).ok_or_else(|| {
                     Exception::custom("key/value state global layer index overflowed")
@@ -337,6 +375,10 @@ impl MlxKeyValueState {
             .zip(selected_layers)
             .enumerate()
             .map(|(layer, (policy, components))| {
+                if *policy == LayerCachePolicy::NoState {
+                    if !components.is_empty() { return Err(Exception::custom("stateless invocation has selected state components")); }
+                    return Ok(MlxKeyValueLayerState::Stateless);
+                }
                 let window = key_value_window(layer, policy)?;
                 match common_selected_placement(layer, "key/value", components)? {
                     Some(StateComponentPlacement::Device) => {
@@ -421,7 +463,7 @@ impl MlxKeyValueState {
     pub(crate) fn supports_isolated_snapshot(&self) -> bool {
         let mut manager = None;
         self.layers.iter().all(|layer| match layer {
-            MlxKeyValueLayerState::Device(_) => true,
+            MlxKeyValueLayerState::Stateless | MlxKeyValueLayerState::Device(_) => true,
             MlxKeyValueLayerState::Paged(cache) => {
                 let id = cache.manager().session_id();
                 *manager.get_or_insert(id) == id
@@ -480,6 +522,7 @@ impl MlxKeyValueState {
             .layers
             .iter()
             .map(|layer| match layer {
+                MlxKeyValueLayerState::Stateless => Ok(MlxKeyValueLayerState::Stateless),
                 MlxKeyValueLayerState::Device(cache) => cache
                     .isolated_snapshot(stream)
                     .map(MlxKeyValueLayerState::Device),
@@ -505,14 +548,14 @@ impl MlxKeyValueState {
 
     pub(crate) fn fork_prediction_target_state(&self, stream: &Stream) -> Result<Self, Exception> {
         let manager = self.layers.iter().find_map(|layer| match layer {
-            MlxKeyValueLayerState::Device(_) => None,
+            MlxKeyValueLayerState::Stateless | MlxKeyValueLayerState::Device(_) => None,
             MlxKeyValueLayerState::Paged(cache) => Some(cache.manager()),
         });
         let Some(manager) = manager else {
             return self.deep_clone_state();
         };
         if self.layers.iter().any(|layer| match layer {
-            MlxKeyValueLayerState::Device(_) => false,
+            MlxKeyValueLayerState::Stateless | MlxKeyValueLayerState::Device(_) => false,
             MlxKeyValueLayerState::Paged(cache) => {
                 cache.manager().session_id() != manager.session_id()
             }
@@ -542,6 +585,7 @@ impl MlxKeyValueState {
                 .iter()
                 .zip(&other.layers)
                 .all(|(canonical, branch)| match (canonical, branch) {
+                    (MlxKeyValueLayerState::Stateless, MlxKeyValueLayerState::Stateless) => true,
                     (MlxKeyValueLayerState::Device(_), MlxKeyValueLayerState::Device(_)) => true,
                     (
                         MlxKeyValueLayerState::Paged(canonical),
@@ -577,7 +621,7 @@ impl MlxKeyValueState {
             .iter()
             .find_map(|layer| match layer {
                 MlxKeyValueLayerState::Paged(cache) => Some(cache.report()),
-                MlxKeyValueLayerState::Device(_) => None,
+                MlxKeyValueLayerState::Stateless | MlxKeyValueLayerState::Device(_) => None,
             })
             .transpose()
     }
@@ -592,6 +636,9 @@ impl MlxKeyValueState {
     ) -> Result<PromptCacheManifest, Exception> {
         let mut manager = None;
         for layer in &mut self.layers {
+            if matches!(layer, MlxKeyValueLayerState::Stateless) {
+                continue;
+            }
             let MlxKeyValueLayerState::Paged(cache) = layer else {
                 return Err(Exception::custom(
                     "prompt-cache persistence requires explicitly paged state",
@@ -616,7 +663,7 @@ impl SemanticStateTransaction for MlxKeyValueState {
             .layers
             .iter()
             .map(|layer| match layer {
-                MlxKeyValueLayerState::Device(_) => Ok(None),
+                MlxKeyValueLayerState::Stateless | MlxKeyValueLayerState::Device(_) => Ok(None),
                 MlxKeyValueLayerState::Paged(cache) => cache.transaction_checkpoint().map(Some),
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -665,9 +712,12 @@ impl SemanticStateTransaction for MlxKeyValueState {
     }
 
     fn permits_parallel_branches(&self) -> bool {
-        self.layers
-            .iter()
-            .all(|layer| matches!(layer, MlxKeyValueLayerState::Device(_)))
+        self.layers.iter().all(|layer| {
+            matches!(
+                layer,
+                MlxKeyValueLayerState::Stateless | MlxKeyValueLayerState::Device(_)
+            )
+        })
     }
 }
 

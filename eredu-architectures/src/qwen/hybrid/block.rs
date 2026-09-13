@@ -2,7 +2,7 @@
 
 use eredu_nn::{
     AttentionCache, Error, GatedProductGroupLayout, GroupScoring, GroupSelectionOperator,
-    GroupedGatedProductSpec, GroupedNeuralBackend, LinearOperator, LinearSpec, NeuralBackend,
+    GroupedGatedProductSpec, GroupedNeuralBackend, LinearSpec, NeuralBackend,
     NormalizationConstructionSpec, NormalizationOperator, NormalizationScale, ParameterSpec,
     Parameterized, RotarySpec, Tensor, TopKGroupSelectionSpec, TopKGroupSelectorSpec,
 };
@@ -13,7 +13,8 @@ use eredu_runtime::{
 
 use crate::{
     decoder::{
-        Attention, AttentionInput, DecoderProjectionOperator, Mlp, TensorParallelProjectionOperator,
+        Attention, AttentionInput, ComponentInstrumentation, DecoderProjectionOperator, Mlp,
+        TensorParallelProjectionOperator,
     },
     linear_format::standard_expert_projection,
 };
@@ -36,6 +37,8 @@ pub enum TokenMixer<B: NeuralBackend> {
 pub struct SharedRoutedGatedProduct<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> {
     #[parameter(skip)]
     layer: usize,
+    #[parameter(skip)]
+    resident_unit_coordinates: Option<(eredu_core::component::ComponentCoordinateMap, bool)>,
     /// Learned top-k router.
     pub router: B::Selector,
     /// Packed routed expert bank.
@@ -51,6 +54,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> SharedRoutedG
         config: &HybridConfig,
         layer: usize,
         prefix: &str,
+        routed_spec: Option<GroupedGatedProductSpec>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
         let prefix = format!("{prefix}.mlp");
@@ -69,11 +73,15 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> SharedRoutedG
             context,
         )?;
         let experts = B::grouped_gated_product(
-            expert_bank_spec_at(config, &format!("{prefix}.experts"))?,
+            match routed_spec {
+                Some(spec) => spec,
+                None => expert_bank_spec_at(config, &format!("{prefix}.experts"))?,
+            },
             context,
         )?;
         Ok(Self {
             layer,
+            resident_unit_coordinates: None,
             router,
             experts,
             shared_expert: new_mlp(
@@ -93,6 +101,15 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> SharedRoutedG
         })
     }
 
+    /// Retains global scalar coordinates for a prepared resident prediction bank.
+    pub(crate) fn bind_resident_unit_coordinates(
+        &mut self,
+        coordinates: eredu_core::component::ComponentCoordinateMap,
+        partitioned: bool,
+    ) {
+        self.resident_unit_coordinates = Some((coordinates, partitioned));
+    }
+
     fn forward_with_provider<P>(
         &mut self,
         input: &B::Tensor,
@@ -108,6 +125,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> SharedRoutedG
             .forward_grouped(
                 &mut self.experts,
                 RoutedExpertRequest {
+                    unit_observer: None,
                     bank: eredu_runtime::RoutedBankId::new(0),
                     layer: self.layer,
                     input,
@@ -116,10 +134,10 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> SharedRoutedG
                 },
                 context,
             )
-            .map_err(Error::backend)?;
-        let shared = self.shared_expert.forward_feed_forward(input, context)?;
-        let shared_gate = B::sigmoid(self.shared_expert_gate.forward(input, context)?, context)?;
-        routed.add(&shared.multiply(&shared_gate, context)?, context)
+            .map_err(Error::backend_source)?;
+        let shared =
+            self.forward_shared(input, context, &mut ComponentInstrumentation::disabled())?;
+        routed.add(&shared, context)
     }
 
     /// Executes shared/routed feed-forward work with pre-dispatch routing controls
@@ -147,22 +165,35 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> SharedRoutedG
             point.path(),
             observer,
         )?;
-        let routed = provider
-            .forward_grouped(
-                &mut self.experts,
-                RoutedExpertRequest {
-                    bank: eredu_runtime::RoutedBankId::new(0),
-                    layer: self.layer,
-                    input,
-                    routes: &routes,
-                    pass: pass(input),
-                },
+        let routed = eredu_runtime::with_routed_unit_observer(
+            observer,
+            point.path(),
+            RoutedExpertRequest {
+                unit_observer: None,
+                bank: eredu_runtime::RoutedBankId::new(0),
+                layer: self.layer,
+                input,
+                routes: &routes,
+                pass: pass(input),
+            },
+            |request| {
+                eredu_runtime::with_resident_unit_coordinates(
+                    self.resident_unit_coordinates.as_ref(),
+                    request,
+                    |request| provider.forward_grouped(&mut self.experts, request, context),
+                )
+            },
+        )
+        .map_err(eredu_runtime::ObservedExpertProviderError::into_neural_error)?;
+        let shared = {
+            let path = format!("{}.shared_expert", point.path());
+            let mut borrowed = eredu_runtime::BorrowedActivationObserver(observer);
+            self.forward_shared(
+                input,
                 context,
-            )
-            .map_err(Error::backend)?;
-        let shared = self.shared_expert.forward_feed_forward(input, context)?;
-        let shared_gate = B::sigmoid(self.shared_expert_gate.forward(input, context)?, context)?;
-        let shared = shared.multiply(&shared_gate, context)?;
+                &mut ComponentInstrumentation::new(&path, &mut borrowed),
+            )?
+        };
         let combined = routed.add(&shared, context)?;
         observer.observe_routing(eredu_runtime::RoutingObservation {
             path: point.path(),
@@ -199,6 +230,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> SharedRoutedG
             .forward_grouped_tensor_parallel(
                 &mut self.experts,
                 RoutedExpertRequest {
+                    unit_observer: None,
                     bank: eredu_runtime::RoutedBankId::new(0),
                     layer: self.layer,
                     input,
@@ -208,10 +240,18 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> SharedRoutedG
                 B::parallel_size(parallel),
                 context,
             )
-            .map_err(Error::backend)?;
-        let shared = self.shared_expert.forward_feed_forward(input, context)?;
-        let shared_gate = B::sigmoid(self.shared_expert_gate.forward(input, context)?, context)?;
-        let shared = shared.multiply(&shared_gate, context)?;
+            .map_err(Error::backend_source)?;
+        let shared =
+            self.forward_shared(input, context, &mut ComponentInstrumentation::disabled())?;
+        Self::combine_tensor_parallel(routed, shared, parallel, context)
+    }
+
+    fn combine_tensor_parallel(
+        routed: eredu_runtime::RoutedExpertTensorParallelOutput<B::Tensor>,
+        shared: B::Tensor,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<eredu_runtime::RoutedExpertTensorParallelOutput<B::Tensor>, Error> {
         match routed {
             eredu_runtime::RoutedExpertTensorParallelOutput::Complete(routed) => {
                 let shared = B::sum_parallel(shared, parallel, context)?;
@@ -229,6 +269,100 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> SharedRoutedG
                 ))
             }
         }
+    }
+
+    fn forward_tensor_parallel_observed_with_provider<P, O>(
+        &mut self,
+        points: eredu_runtime::RoutedObservationPoints,
+        input: &B::Tensor,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+        provider: &mut P,
+        observer: &mut O,
+    ) -> Result<B::Tensor, Error>
+    where
+        P: TensorParallelRoutedExpertProvider<B>,
+        P::Error: std::fmt::Display,
+        O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
+    {
+        let point = points
+            .bank(eredu_runtime::RoutedBankId::new(0))
+            .ok_or_else(|| Error::backend("missing feed-forward routing observation"))?;
+        let routes = eredu_runtime::select_routes_with_observer(
+            &mut self.router,
+            input,
+            context,
+            point.path(),
+            observer,
+        )?;
+        let routed = eredu_runtime::with_routed_unit_observer(
+            observer,
+            point.path(),
+            RoutedExpertRequest {
+                unit_observer: None,
+                bank: eredu_runtime::RoutedBankId::new(0),
+                layer: self.layer,
+                input,
+                routes: &routes,
+                pass: pass(input),
+            },
+            |request| {
+                eredu_runtime::with_resident_unit_coordinates(
+                    self.resident_unit_coordinates.as_ref(),
+                    request,
+                    |request| {
+                        provider.forward_grouped_tensor_parallel(
+                            &mut self.experts,
+                            request,
+                            B::parallel_size(parallel),
+                            context,
+                        )
+                    },
+                )
+            },
+        )
+        .map_err(eredu_runtime::ObservedExpertProviderError::into_neural_error)?;
+        let shared = {
+            let path = format!("{}.shared_expert", point.path());
+            let mut borrowed = eredu_runtime::BorrowedActivationObserver(observer);
+            self.forward_shared(
+                input,
+                context,
+                &mut ComponentInstrumentation::new(&path, &mut borrowed),
+            )?
+        };
+        let combined = eredu_runtime::reduce_routed_expert_tensor_parallel::<B>(
+            Self::combine_tensor_parallel(routed, shared, parallel, context)?,
+            parallel,
+            context,
+        )?;
+        eredu_runtime::observe_and_intervene(
+            observer,
+            &format!("{}.output", point.path()),
+            &combined,
+        )
+    }
+
+    fn forward_shared(
+        &mut self,
+        input: &B::Tensor,
+        context: &<B::Tensor as Tensor>::Context,
+        instrumentation: &mut ComponentInstrumentation<'_, B::Tensor>,
+    ) -> Result<B::Tensor, Error> {
+        let shared =
+            self.shared_expert
+                .forward_feed_forward_observed(input, context, instrumentation)?;
+        let shared = instrumentation.apply("feed_forward.write", shared)?;
+        instrumentation.observe("gate.input", input)?;
+        let gate = instrumentation.project::<B>(
+            "gate.projection_input",
+            &mut self.shared_expert_gate,
+            input,
+            None,
+            context,
+        )?;
+        let gate = instrumentation.apply("gate", B::sigmoid(gate, context)?)?;
+        instrumentation.apply("feed_forward.output", shared.multiply(&gate, context)?)
     }
 }
 
@@ -294,10 +428,12 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> FeedForward<B
         config: &HybridConfig,
         layer: usize,
         prefix: &str,
+        routed_spec: Option<GroupedGatedProductSpec>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
         if config.is_moe() {
-            SharedRoutedGatedProduct::new(config, layer, prefix, context).map(Self::Routed)
+            SharedRoutedGatedProduct::new(config, layer, prefix, routed_spec, context)
+                .map(Self::Routed)
         } else {
             new_mlp(
                 config,
@@ -434,26 +570,45 @@ impl<B: NeuralBackend> ReplicatedBlock<B> {
     where
         S: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
     {
-        let normalized = self.input_norm.forward(hidden, context)?;
-        let mixed = match &mut self.mixer {
-            TokenMixer::Linear(linear) => linear.forward(&normalized, state, context)?,
-            TokenMixer::Attention(attention) => attention.forward(
-                AttentionInput {
-                    hidden: &normalized,
-                    mask,
-                    cache: Some(&mut *state),
-                    allow_sliding_prefill: true,
-                    rotary_position: None,
-                },
-                context,
-            )?,
-        };
-        let hidden = hidden.add(&mixed, context)?;
-        let normalized = self.post_attention_norm.forward(&hidden, context)?;
-        let feed_forward = self
-            .feed_forward
-            .forward_feed_forward(&normalized, context)?;
-        hidden.add(&feed_forward, context)
+        self.forward_instrumented(
+            hidden,
+            mask,
+            state,
+            context,
+            &mut ComponentInstrumentation::disabled(),
+        )
+    }
+
+    pub(crate) fn forward_instrumented<S>(
+        &mut self,
+        hidden: &B::Tensor,
+        mask: Option<&B::Tensor>,
+        state: &mut S,
+        context: &<B::Tensor as Tensor>::Context,
+        instrumentation: &mut ComponentInstrumentation<'_, B::Tensor>,
+    ) -> Result<B::Tensor, Error>
+    where
+        S: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
+    {
+        let hidden = forward_mixer::<B, S>(
+            &mut self.mixer,
+            &mut self.input_norm,
+            hidden,
+            mask,
+            state,
+            context,
+            instrumentation,
+        )?;
+        let normalized = instrumentation.apply(
+            "feed_forward.input",
+            self.post_attention_norm.forward(&hidden, context)?,
+        )?;
+        let feed_forward = self.feed_forward.forward_feed_forward_observed(
+            &normalized,
+            context,
+            instrumentation,
+        )?;
+        finish_feed_forward::<B>(&hidden, feed_forward, context, instrumentation)
     }
 }
 
@@ -462,6 +617,15 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> Block<B> {
     pub fn new(
         config: &HybridConfig,
         layer: usize,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Self, Error> {
+        Self::new_with_routed_spec(config, layer, None, context)
+    }
+
+    pub(crate) fn new_with_routed_spec(
+        config: &HybridConfig,
+        layer: usize,
+        routed_spec: Option<GroupedGatedProductSpec>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
         let policy = config
@@ -474,6 +638,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> Block<B> {
             layer,
             &format!("model.layers.{layer}"),
             policy,
+            routed_spec,
             context,
         )
     }
@@ -495,6 +660,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> Block<B> {
             config.num_hidden_layers as usize + depth,
             &format!("mtp.layers.{depth}"),
             HybridLayerPolicy::SelfAttention(eredu_core::attention::AttentionPolicy::Full),
+            None,
             context,
         )
     }
@@ -504,6 +670,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> Block<B> {
         layer: usize,
         root: &str,
         policy: HybridLayerPolicy,
+        routed_spec: Option<GroupedGatedProductSpec>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
         let mixer = match policy {
@@ -530,7 +697,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> Block<B> {
         };
         Ok(Self {
             mixer,
-            feed_forward: FeedForward::new(config, layer, root, context)?,
+            feed_forward: FeedForward::new(config, layer, root, routed_spec, context)?,
             input_norm: norm("input_layernorm")?,
             post_attention_norm: norm("post_attention_layernorm")?,
         })
@@ -564,26 +731,14 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> Block<B> {
         P: RoutedExpertProvider<B>,
         P::Error: std::fmt::Display,
     {
-        let normalized = self.input_norm.forward(hidden, context)?;
-        let mixed = match &mut self.mixer {
-            TokenMixer::Linear(linear) => linear.forward(&normalized, state, context)?,
-            TokenMixer::Attention(attention) => attention.forward(
-                AttentionInput {
-                    hidden: &normalized,
-                    mask,
-                    cache: Some(&mut *state),
-                    allow_sliding_prefill: true,
-                    rotary_position: None,
-                },
-                context,
-            )?,
-        };
-        let hidden = hidden.add(&mixed, context)?;
-        let normalized = self.post_attention_norm.forward(&hidden, context)?;
-        let feed_forward =
-            self.feed_forward
-                .forward_with_provider(&normalized, context, provider)?;
-        hidden.add(&feed_forward, context)
+        self.forward_instrumented_with_feed_forward(
+            hidden,
+            mask,
+            state,
+            context,
+            &mut ComponentInstrumentation::disabled(),
+            |ff, input, context, _| ff.forward_with_provider(input, context, provider),
+        )
     }
 
     /// Executes one block while exposing the complete routed/shared contribution.
@@ -603,30 +758,95 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> Block<B> {
         P::Error: std::fmt::Display,
         O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
     {
-        let normalized = self.input_norm.forward(hidden, context)?;
-        let mixed = match &mut self.mixer {
-            TokenMixer::Linear(linear) => linear.forward(&normalized, state, context)?,
-            TokenMixer::Attention(attention) => attention.forward(
-                AttentionInput {
-                    hidden: &normalized,
-                    mask,
-                    cache: Some(&mut *state),
-                    allow_sliding_prefill: true,
-                    rotary_position: None,
+        self.forward_instrumented_with_feed_forward(
+            hidden,
+            mask,
+            state,
+            context,
+            &mut ComponentInstrumentation::disabled(),
+            |ff, input, context, _| {
+                ff.forward_observed_with_provider(point, input, context, provider, observer)
+            },
+        )
+    }
+
+    /// Component and routed observations use the same architecture-owned boundaries.
+    pub(crate) fn forward_components_with_provider<S, P, O>(
+        &mut self,
+        path: &str,
+        point: eredu_runtime::RoutedObservationPoints,
+        hidden: &B::Tensor,
+        mask: Option<&B::Tensor>,
+        state: &mut S,
+        context: &<B::Tensor as Tensor>::Context,
+        provider: &mut P,
+        observer: &mut O,
+    ) -> Result<B::Tensor, Error>
+    where
+        S: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
+        P: RoutedExpertProvider<B>,
+        P::Error: std::fmt::Display,
+        O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
+    {
+        let mut borrowed = eredu_runtime::BorrowedActivationObserver(observer);
+        let mut instrumentation = ComponentInstrumentation::new(path, &mut borrowed);
+        self.forward_instrumented_with_feed_forward(
+            hidden,
+            mask,
+            state,
+            context,
+            &mut instrumentation,
+            |ff, input, context, instrumentation| match ff {
+                FeedForward::Dense(mlp) => {
+                    mlp.forward_feed_forward_observed(input, context, instrumentation)
+                }
+                FeedForward::Routed(moe) => match instrumentation.observer() {
+                    Some(observer) => moe
+                        .forward_observed_with_provider(point, input, context, provider, observer),
+                    None => moe.forward_with_provider(input, context, provider),
                 },
-                context,
-            )?,
-        };
-        let hidden = hidden.add(&mixed, context)?;
-        let normalized = self.post_attention_norm.forward(&hidden, context)?;
-        let feed_forward = self.feed_forward.forward_observed_with_provider(
-            point,
+            },
+        )
+    }
+
+    fn forward_instrumented_with_feed_forward<S, F>(
+        &mut self,
+        hidden: &B::Tensor,
+        mask: Option<&B::Tensor>,
+        state: &mut S,
+        context: &<B::Tensor as Tensor>::Context,
+        instrumentation: &mut ComponentInstrumentation<'_, B::Tensor>,
+        feed_forward: F,
+    ) -> Result<B::Tensor, Error>
+    where
+        S: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
+        F: FnOnce(
+            &mut FeedForward<B>,
+            &B::Tensor,
+            &<B::Tensor as Tensor>::Context,
+            &mut ComponentInstrumentation<'_, B::Tensor>,
+        ) -> Result<B::Tensor, Error>,
+    {
+        let hidden = forward_mixer::<B, S>(
+            &mut self.mixer,
+            &mut self.input_norm,
+            hidden,
+            mask,
+            state,
+            context,
+            instrumentation,
+        )?;
+        let normalized = instrumentation.apply(
+            "feed_forward.input",
+            self.post_attention_norm.forward(&hidden, context)?,
+        )?;
+        let output = feed_forward(
+            &mut self.feed_forward,
             &normalized,
             context,
-            provider,
-            observer,
+            instrumentation,
         )?;
-        hidden.add(&feed_forward, context)
+        finish_feed_forward::<B>(&hidden, output, context, instrumentation)
     }
 
     /// Executes local projections and one row reduction per parallel output.
@@ -644,40 +864,160 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> Block<B> {
         P: eredu_runtime::TensorParallelRoutedExpertProvider<B>,
         P::Error: std::fmt::Display,
     {
+        self.forward_parallel_instrumented(
+            hidden,
+            mask,
+            state,
+            parallel,
+            context,
+            provider,
+            &mut ComponentInstrumentation::disabled(),
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn forward_components_parallel_with_provider<S, P, O>(
+        &mut self,
+        path: &str,
+        points: eredu_runtime::RoutedObservationPoints,
+        hidden: &B::Tensor,
+        mask: Option<&B::Tensor>,
+        state: &mut S,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+        provider: &mut P,
+        observer: &mut O,
+    ) -> Result<B::Tensor, Error>
+    where
+        S: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
+        P: TensorParallelRoutedExpertProvider<B>,
+        P::Error: std::fmt::Display,
+        O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
+    {
+        let mut borrowed = eredu_runtime::BorrowedActivationObserver(observer);
+        self.forward_parallel_instrumented(
+            hidden,
+            mask,
+            state,
+            parallel,
+            context,
+            provider,
+            &mut ComponentInstrumentation::new(path, &mut borrowed),
+            Some(points),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn forward_parallel_instrumented<S, P>(
+        &mut self,
+        hidden: &B::Tensor,
+        mask: Option<&B::Tensor>,
+        state: &mut S,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+        provider: &mut P,
+        instrumentation: &mut ComponentInstrumentation<'_, B::Tensor>,
+        points: Option<eredu_runtime::RoutedObservationPoints>,
+    ) -> Result<B::Tensor, Error>
+    where
+        S: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
+        P: TensorParallelRoutedExpertProvider<B>,
+        P::Error: std::fmt::Display,
+    {
         let normalized = self.input_norm.forward(hidden, context)?;
-        let mixed = match &mut self.mixer {
+        let (mixed, boundary) = match &mut self.mixer {
             TokenMixer::Linear(linear) => {
-                linear.forward_parallel(&normalized, state, parallel, context)?
+                let normalized = instrumentation.apply("mixer.input", normalized)?;
+                (
+                    linear.forward_parallel_instrumented(
+                        &normalized,
+                        state,
+                        parallel,
+                        context,
+                        instrumentation,
+                    )?,
+                    "mixer",
+                )
             }
-            TokenMixer::Attention(attention) => attention.forward_parallel(
-                AttentionInput {
-                    hidden: &normalized,
-                    mask,
-                    cache: Some(&mut *state),
-                    allow_sliding_prefill: true,
-                    rotary_position: None,
-                },
+            TokenMixer::Attention(attention) => {
+                let normalized = instrumentation.apply("attention.input", normalized)?;
+                (
+                    attention.forward_instrumented(
+                        AttentionInput {
+                            hidden: &normalized,
+                            mask,
+                            cache: Some(&mut *state),
+                            allow_sliding_prefill: true,
+                            rotary_position: None,
+                        },
+                        Some(parallel),
+                        context,
+                        instrumentation,
+                    )?,
+                    "attention",
+                )
+            }
+        };
+        let mixed = instrumentation.apply(
+            if boundary == "attention" {
+                "attention.write"
+            } else {
+                "mixer.write"
+            },
+            mixed,
+        )?;
+        let mixed = instrumentation.apply(
+            if boundary == "attention" {
+                "attention.output"
+            } else {
+                "mixer.output"
+            },
+            mixed,
+        )?;
+        let hidden = instrumentation.apply(
+            if boundary == "attention" {
+                "attention.residual"
+            } else {
+                "mixer.residual"
+            },
+            hidden.add(&mixed, context)?,
+        )?;
+        let normalized = instrumentation.apply(
+            "feed_forward.input",
+            self.post_attention_norm.forward(&hidden, context)?,
+        )?;
+        let feed_forward = match &mut self.feed_forward {
+            FeedForward::Dense(mlp) => mlp.forward_feed_forward_parallel_observed(
+                &normalized,
                 parallel,
                 context,
+                instrumentation,
             )?,
-        };
-        let hidden = hidden.add(&mixed, context)?;
-        let normalized = self.post_attention_norm.forward(&hidden, context)?;
-        let feed_forward = match &mut self.feed_forward {
-            FeedForward::Dense(mlp) => {
-                mlp.forward_feed_forward_parallel(&normalized, parallel, context)?
-            }
             FeedForward::Routed(moe) => {
-                let output = moe.forward_tensor_parallel_with_provider(
-                    &normalized,
-                    parallel,
-                    context,
-                    provider,
-                )?;
-                eredu_runtime::reduce_routed_expert_tensor_parallel::<B>(output, parallel, context)?
+                if let Some(observer) = instrumentation.observer() {
+                    moe.forward_tensor_parallel_observed_with_provider(
+                        points.expect("observed routed block declares its routing points"),
+                        &normalized,
+                        parallel,
+                        context,
+                        provider,
+                        observer,
+                    )?
+                } else {
+                    let output = moe.forward_tensor_parallel_with_provider(
+                        &normalized,
+                        parallel,
+                        context,
+                        provider,
+                    )?;
+                    eredu_runtime::reduce_routed_expert_tensor_parallel::<B>(
+                        output, parallel, context,
+                    )?
+                }
             }
         };
-        hidden.add(&feed_forward, context)
+        finish_feed_forward::<B>(&hidden, feed_forward, context, instrumentation)
     }
 }
 
@@ -842,4 +1182,65 @@ impl HybridConfig {
             self.norm_topk_prob,
         )
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn forward_mixer<B: NeuralBackend, S>(
+    mixer: &mut TokenMixer<B>,
+    norm: &mut B::Normalization,
+    hidden: &B::Tensor,
+    mask: Option<&B::Tensor>,
+    state: &mut S,
+    context: &<B::Tensor as Tensor>::Context,
+    instrumentation: &mut ComponentInstrumentation<'_, B::Tensor>,
+) -> Result<B::Tensor, Error>
+where
+    S: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
+{
+    let normalized = norm.forward(hidden, context)?;
+    let (mixed, boundary) = match mixer {
+        TokenMixer::Linear(linear) => {
+            let normalized = instrumentation.apply("mixer.input", normalized)?;
+            (
+                linear.forward_instrumented(&normalized, state, context, instrumentation)?,
+                "mixer",
+            )
+        }
+        TokenMixer::Attention(attention) => {
+            let normalized = instrumentation.apply("attention.input", normalized)?;
+            (
+                attention.forward_instrumented(
+                    AttentionInput {
+                        hidden: &normalized,
+                        mask,
+                        cache: Some(state),
+                        allow_sliding_prefill: true,
+                        rotary_position: None,
+                    },
+                    None,
+                    context,
+                    instrumentation,
+                )?,
+                "attention",
+            )
+        }
+    };
+    let (write, output, residual) = if boundary == "attention" {
+        ("attention.write", "attention.output", "attention.residual")
+    } else {
+        ("mixer.write", "mixer.output", "mixer.residual")
+    };
+    let mixed = instrumentation.apply(write, mixed)?;
+    let mixed = instrumentation.apply(output, mixed)?;
+    instrumentation.apply(residual, hidden.add(&mixed, context)?)
+}
+fn finish_feed_forward<B: NeuralBackend>(
+    hidden: &B::Tensor,
+    output: B::Tensor,
+    context: &<B::Tensor as Tensor>::Context,
+    instrumentation: &mut ComponentInstrumentation<'_, B::Tensor>,
+) -> Result<B::Tensor, Error> {
+    let output = instrumentation.apply("feed_forward.write", output)?;
+    let output = instrumentation.apply("feed_forward.output", output)?;
+    instrumentation.apply("feed_forward.residual", hidden.add(&output, context)?)
 }

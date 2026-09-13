@@ -248,11 +248,20 @@ canonical boundary, then reconcile the UI with `session.token_ids()` and its new
 handles with `release_snapshot`; restoration does not replenish any budget.
 
 Current native snapshots cover external Gemma 4 and Muse Glimmer/DFlash with
-supported isolated target state and known semantic costs. Embedded prediction
-snapshots await complete prediction-cache isolation/size contracts. Captures cover
-raw target/draft logits; other layer paths need explicit speculative attribution.
-These are capability limitations, not reasons to switch to a separate generation
-implementation. See [execution control](execution-control.md#controlled-speculative-generation)
+supported isolated target state and known semantic costs, plus complete sequential
+V3 and V4 sequential/DSpark embedded state across resident/host/disk weights. V4
+acceptance covers exact sampler captures, both pooling completion boundaries,
+repeated restore and isolated siblings; internal V4 component hooks and distributed
+snapshot support remain separate coverage gaps. For internal V3 components,
+use `prepare_speculative_activations` and `ControlledSpeculativeOptions.activations`
+from run creation; delivered records retain phase, depth and physical sequence
+geometry. `readmit_activation_interventions` changes prospective edits at a drained
+canonical boundary, and restore reinstates the saved plan without refunding budgets.
+Prediction parameter queries and coordinated overlays use the ordinary loaded
+parameter APIs; activate an overlay before admitting captures and creating the
+controller. See the [component guide](component-validation.md#effective-prediction-parameters-and-coordinated-overlays)
+for exact-prefix trials and current native evidence. Other incomplete state profiles
+and distributed internal collection remain capability gaps. See [execution control](execution-control.md#controlled-speculative-generation)
 for the complete boundary and exception list.
 
 ### Speculative forks and prospective interventions

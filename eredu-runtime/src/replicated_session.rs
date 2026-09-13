@@ -9,27 +9,29 @@ use std::{
 };
 
 use eredu_core::cache::{
-    validate_prompt_cache_model_identity, PromptCacheDescriptor, PromptCacheError,
-    PromptCacheManifest, PromptCacheModelIdentity, PromptCacheOptions, PromptCacheTopology,
+    PromptCacheDescriptor, PromptCacheError, PromptCacheManifest, PromptCacheModelIdentity,
+    PromptCacheOptions, PromptCacheTopology, validate_prompt_cache_model_identity,
 };
 use eredu_core::{DistributedCommitEpoch, DistributedCommitOutcome, DistributedCommitPhase};
 use eredu_nn::{NeuralBackend, Tensor};
 
 mod control;
+mod prediction;
 pub use control::{ReplicatedTextControlState, ReplicatedTextSnapshotMechanisms};
 
 use crate::{
-    observe_model_logits, partitioned_replicated_text_materialization_tasks,
-    plan_local_replicated_text_materialization_tasks, replicated_text_materialization_tasks,
     ActivationObserver, ArchitecturePartition, CommunicationManifest, ExecutionResidency,
     ExpertPass, LayerWeightResidency, LayeredArchitecture, LayerwisePolicy, LayerwiseRuntime,
     LayerwiseRuntimeError, ParameterGroupOwner, PartitionState, PreparedInputCacheIdentity,
     ReplicatedTextArchitecture, ReplicatedTextMaterializationTask, ReplicatedTextOutputCompanion,
-    ReplicatedTextOutputSelection, ReplicatedTextParameterOwner, ReplicatedTextParameterPresence,
-    RoutedExpertProvider, RoutedLayeredArchitecture, RuntimeState,
-    SelectedReplicatedTextRealization, SelectedStateRealization, StateError, SubmissionBackend,
-    WeightLoweringKind,
+    ReplicatedTextOutputSelection, ReplicatedTextParameterPresence, RoutedExpertProvider,
+    RoutedLayeredArchitecture, RuntimeState, SelectedReplicatedTextRealization,
+    SelectedStateRealization, StateError, SubmissionBackend, WeightLoweringKind,
+    observe_model_logits, partitioned_replicated_text_materialization_tasks,
+    plan_local_replicated_text_materialization_tasks, replicated_text_materialization_tasks,
 };
+
+use crate::parameter_operations::LayeredParameterOwner;
 
 /// Backend mechanisms used by the generic replicated-text constructor.
 ///
@@ -46,6 +48,15 @@ where
     Self::ResidentPolicy: LayerwisePolicy<B, A::Unit, Error = Self::PolicyError>,
     Self::BoundedPolicy: LayerwisePolicy<B, A::Unit, Error = Self::PolicyError>,
 {
+    /// Exact slot facts retained at selected materialization preparation.
+    /// Empty means that this mechanism does not expose prepared slot metadata.
+    fn prepared_parameter_slots(&self) -> &[crate::parameter_operations::PreparedParameterSlot] {
+        &[]
+    }
+    /// Architecture parameter metadata retained before ordinary/bank ownership separation.
+    fn parameter_declarations(&self) -> &[eredu_nn::ParameterMetadata] {
+        &[]
+    }
     /// Concrete mutable-state realization paired with the architecture.
     type State: RuntimeState<B>;
     /// Shared failure type for resident and bounded runtime policies.
@@ -355,6 +366,53 @@ where
     A::Error: std::fmt::Display,
     P::Error: std::fmt::Display,
 {
+    fn with_parameter_slots(
+        &mut self,
+        location: &crate::parameter_operations::PreparedParameterLocation,
+        operation: &mut crate::parameter_operations::ParameterSlotOperation<
+            '_,
+            B::Tensor,
+            R::Error,
+        >,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<bool, crate::LayerwiseAcquireError<A::Error, R::Error>> {
+        match &mut self.kind {
+            ReplicatedTextRuntimeKind::Resident(runtime) => {
+                runtime.with_parameter_slots(location, operation, context)
+            }
+            ReplicatedTextRuntimeKind::Bounded(runtime) => {
+                runtime.with_parameter_slots(location, operation, context)
+            }
+        }
+    }
+
+    fn publish_parameter_replacements(
+        &mut self,
+        values: &BTreeMap<String, B::Tensor>,
+        active: bool,
+    ) -> Result<bool, R::Error> {
+        match &mut self.kind {
+            ReplicatedTextRuntimeKind::Resident(runtime) => {
+                runtime.publish_parameter_replacements(values, active)
+            }
+            ReplicatedTextRuntimeKind::Bounded(runtime) => {
+                runtime.publish_parameter_replacements(values, active)
+            }
+        }
+    }
+
+    fn visit_loaded_parameters(
+        &mut self,
+        visitor: &mut dyn eredu_nn::ParameterSlotVisitor<B::Tensor>,
+    ) -> bool {
+        match &mut self.kind {
+            ReplicatedTextRuntimeKind::Resident(runtime) => {
+                runtime.visit_loaded_parameters(visitor)
+            }
+            ReplicatedTextRuntimeKind::Bounded(runtime) => runtime.visit_loaded_parameters(visitor),
+        }
+    }
+
     fn forward_with_observer<'a, O>(
         &mut self,
         input: A::Input<'a>,
@@ -467,6 +525,43 @@ where
 
     /// Concrete execution runtime paired before the shared session lifecycle begins.
     type Runtime;
+
+    /// Exact hook coverage of the retained executor, including specialized unit calls.
+    fn observation_hooks(_runtime: &Self::Runtime) -> crate::inspection::ObservationHookSupport {
+        Default::default()
+    }
+
+    /// Visits actual loaded slots without reopening or rematerializing a source.
+    /// False means unavailable and must be returned before visiting any slot.
+    fn visit_loaded_parameters(
+        _runtime: &mut Self::Runtime,
+        _visitor: &mut dyn eredu_nn::ParameterSlotVisitor<B::Tensor>,
+    ) -> bool {
+        false
+    }
+
+    /// Performs parameter work inside one selected residency owner.
+    fn with_parameter_slots(
+        _runtime: &mut Self::Runtime,
+        _location: &crate::parameter_operations::PreparedParameterLocation,
+        _operation: &mut crate::parameter_operations::ParameterSlotOperation<
+            '_,
+            B::Tensor,
+            R::Error,
+        >,
+        _context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<bool, crate::LayerwiseAcquireError<A::Error, R::Error>> {
+        Ok(false)
+    }
+
+    /// Atomically publishes completed replacements in the selected ownership mechanism.
+    fn publish_parameter_replacements(
+        _runtime: &mut Self::Runtime,
+        _values: &BTreeMap<String, B::Tensor>,
+        _active: bool,
+    ) -> Result<bool, R::Error> {
+        Ok(false)
+    }
 
     /// Returns bounded residency state for the shared session report.
     fn bounded_policy(runtime: &Self::Runtime) -> Option<&P>;
@@ -619,6 +714,34 @@ where
 {
     type Runtime = ReplicatedTextRuntime<A, B, S, R, P>;
 
+    fn visit_loaded_parameters(
+        runtime: &mut Self::Runtime,
+        visitor: &mut dyn eredu_nn::ParameterSlotVisitor<B::Tensor>,
+    ) -> bool {
+        runtime.visit_loaded_parameters(visitor)
+    }
+
+    fn with_parameter_slots(
+        runtime: &mut Self::Runtime,
+        location: &crate::parameter_operations::PreparedParameterLocation,
+        operation: &mut crate::parameter_operations::ParameterSlotOperation<
+            '_,
+            B::Tensor,
+            R::Error,
+        >,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<bool, crate::LayerwiseAcquireError<A::Error, R::Error>> {
+        runtime.with_parameter_slots(location, operation, context)
+    }
+
+    fn publish_parameter_replacements(
+        runtime: &mut Self::Runtime,
+        values: &BTreeMap<String, B::Tensor>,
+        active: bool,
+    ) -> Result<bool, R::Error> {
+        runtime.publish_parameter_replacements(values, active)
+    }
+
     fn bounded_policy(runtime: &Self::Runtime) -> Option<&P> {
         runtime.bounded_policy()
     }
@@ -725,6 +848,34 @@ where
     P::Error: std::fmt::Display,
 {
     type Runtime = ReplicatedTextRuntime<A, B, S, R, P>;
+
+    fn visit_loaded_parameters(
+        runtime: &mut Self::Runtime,
+        visitor: &mut dyn eredu_nn::ParameterSlotVisitor<B::Tensor>,
+    ) -> bool {
+        runtime.visit_loaded_parameters(visitor)
+    }
+
+    fn with_parameter_slots(
+        runtime: &mut Self::Runtime,
+        location: &crate::parameter_operations::PreparedParameterLocation,
+        operation: &mut crate::parameter_operations::ParameterSlotOperation<
+            '_,
+            B::Tensor,
+            R::Error,
+        >,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<bool, crate::LayerwiseAcquireError<A::Error, R::Error>> {
+        runtime.with_parameter_slots(location, operation, context)
+    }
+
+    fn publish_parameter_replacements(
+        runtime: &mut Self::Runtime,
+        values: &BTreeMap<String, B::Tensor>,
+        active: bool,
+    ) -> Result<bool, R::Error> {
+        runtime.publish_parameter_replacements(values, active)
+    }
 
     fn bounded_policy(runtime: &Self::Runtime) -> Option<&P> {
         runtime.bounded_policy()
@@ -852,6 +1003,7 @@ where
     state: M::State,
     mechanisms: M,
     materialization_report: Option<crate::WeightMaterializationReport>,
+    partition_parameters: Option<std::sync::Arc<crate::ArchitectureParameterDescription>>,
     prompt_cache_identity: Option<PromptCacheModelIdentity>,
     committed_prompt_input_identity: Option<PreparedInputCacheIdentity>,
     next_commit_epoch: DistributedCommitEpoch,
@@ -879,6 +1031,7 @@ pub enum SessionStateRealization {
 /// checkpoint, rollback, reset, observation, publication, and reporting lifecycle.
 pub struct PreparedPartitionedSessionRuntime<R, S> {
     selected: SelectedReplicatedTextRealization,
+    parameters: std::sync::Arc<crate::ArchitectureParameterDescription>,
     runtime: R,
     state: S,
     selected_state: SessionStateRealization,
@@ -887,6 +1040,15 @@ pub struct PreparedPartitionedSessionRuntime<R, S> {
 }
 
 impl<R, S> PreparedPartitionedSessionRuntime<R, S> {
+    /// Complete selected parameter topology checked against the architecture and
+    /// local materialization tasks, before the native runtime factory executes.
+    /// This includes parameters owned by other ranks and no native handles.
+    pub fn parameter_description(
+        &self,
+    ) -> &std::sync::Arc<crate::ArchitectureParameterDescription> {
+        &self.parameters
+    }
+
     /// Returns the architecture-derived prompt-cache identity retained by this
     /// exact partition, when the rank owns mutable prompt state.
     pub const fn prompt_cache_identity(&self) -> Option<&PromptCacheModelIdentity> {
@@ -979,16 +1141,19 @@ impl<A, G, W, S, P> PreparedPartitionedRuntimeComponents<A, G, W, S, P> {
 
 /// Failure from the reusable rank-local preparation lifecycle.
 #[derive(Debug, thiserror::Error)]
-pub enum PartitionedRuntimeConstructionError {
+pub enum PartitionedRuntimeConstructionError<
+    A = std::convert::Infallible,
+    M = std::convert::Infallible,
+> {
     /// Architecture, selection, task, or partition authority disagreed.
     #[error("partitioned runtime contract mismatch: {0}")]
     Contract(String),
     /// Architecture unit construction failed.
     #[error("partitioned runtime architecture construction failed: {0}")]
-    Architecture(String),
+    Architecture(#[source] A),
     /// The concrete mechanism rejected materialization, state, or policy work.
     #[error("partitioned runtime mechanism failed: {0}")]
-    Mechanism(String),
+    Mechanism(#[source] M),
 }
 
 /// Runs the reusable cold-path lifecycle for one exact partition.
@@ -1013,7 +1178,7 @@ pub fn prepare_default_partitioned_runtime<A, B, M, G, W, P>(
     context: &<<B as NeuralBackend>::Tensor as Tensor>::Context,
 ) -> Result<
     PreparedPartitionedRuntimeComponents<A, G, W, M::State, P>,
-    PartitionedRuntimeConstructionError,
+    PartitionedRuntimeConstructionError<A::Error, M::Error>,
 >
 where
     B: SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context>,
@@ -1050,9 +1215,7 @@ where
         .map(|address| {
             architecture
                 .build_unit(address.group(), address.index(), context)
-                .map_err(|error| {
-                    PartitionedRuntimeConstructionError::Architecture(error.to_string())
-                })
+                .map_err(|error| PartitionedRuntimeConstructionError::Architecture(error))
         })
         .collect::<Result<Vec<_>, _>>()?;
     let mut source_units = source_architecture
@@ -1063,9 +1226,7 @@ where
                 .map(|address| {
                     source
                         .build_unit(address.group(), address.index(), context)
-                        .map_err(|error| {
-                            PartitionedRuntimeConstructionError::Architecture(error.to_string())
-                        })
+                        .map_err(|error| PartitionedRuntimeConstructionError::Architecture(error))
                 })
                 .collect::<Result<Vec<_>, _>>()
         })
@@ -1103,10 +1264,10 @@ where
             addressable_parameters,
             context,
         )
-        .map_err(|error| PartitionedRuntimeConstructionError::Mechanism(error.to_string()))?;
+        .map_err(|error| PartitionedRuntimeConstructionError::Mechanism(error))?;
     let state = mechanisms
         .realize_state(&selected_state, context)
-        .map_err(|error| PartitionedRuntimeConstructionError::Mechanism(error.to_string()))?;
+        .map_err(|error| PartitionedRuntimeConstructionError::Mechanism(error))?;
     if state.optional_layout() != Some(selected_state.layout()) {
         return Err(PartitionedRuntimeConstructionError::Contract(
             "realized partition state differs from selected local geometry".into(),
@@ -1116,18 +1277,14 @@ where
         LayerWeightResidency::FullyResident => (
             mechanisms
                 .resident_policy(&mut architecture, units, selected, context)
-                .map_err(|error| {
-                    PartitionedRuntimeConstructionError::Mechanism(error.to_string())
-                })?,
+                .map_err(|error| PartitionedRuntimeConstructionError::Mechanism(error))?,
             None,
         ),
         LayerWeightResidency::LayerwiseHost(_) | LayerWeightResidency::DenseDiskStream(_) => {
             drop(units);
             let policy = mechanisms
                 .bounded_policy(&mut architecture, selected, context)
-                .map_err(|error| {
-                    PartitionedRuntimeConstructionError::Mechanism(error.to_string())
-                })?;
+                .map_err(|error| PartitionedRuntimeConstructionError::Mechanism(error))?;
             (policy.clone(), Some(policy))
         }
     };
@@ -1149,7 +1306,7 @@ pub enum PartitionedSessionPreparationError<E> {
     Contract(String),
     /// The rank-local runtime factory rejected the exact handoff.
     #[error("partitioned session runtime factory failed: {0}")]
-    Factory(E),
+    Factory(#[source] E),
 }
 
 /// Consumes exact architecture authority into a rank-local runtime and state.
@@ -1254,20 +1411,18 @@ where
                 .iter()
                 .find(|group| group.members().iter().any(|member| member.target() == name))
         });
-        return Err(PartitionedSessionPreparationError::Contract(
-            format!(
-                "precomputed local materialization tasks differ from consumed partition authority: expected {:?}, derived {:?}, first missing current group {parameter_group:?}, admitted group {partition_group:?}",
-                expected_tasks
-                    .expect("task proof was checked as present")
-                    .iter()
-                    .map(ReplicatedTextMaterializationTask::name)
-                    .collect::<Vec<_>>(),
-                tasks
-                    .iter()
-                    .map(ReplicatedTextMaterializationTask::name)
-                    .collect::<Vec<_>>()
-            ),
-        ));
+        return Err(PartitionedSessionPreparationError::Contract(format!(
+            "precomputed local materialization tasks differ from consumed partition authority: expected {:?}, derived {:?}, first missing current group {parameter_group:?}, admitted group {partition_group:?}",
+            expected_tasks
+                .expect("task proof was checked as present")
+                .iter()
+                .map(ReplicatedTextMaterializationTask::name)
+                .collect::<Vec<_>>(),
+            tasks
+                .iter()
+                .map(ReplicatedTextMaterializationTask::name)
+                .collect::<Vec<_>>()
+        )));
     }
     let partition_state = partition.state().cloned();
     let (selected_state, prompt_cache_identity) = match partition_state.as_ref() {
@@ -1316,6 +1471,7 @@ where
     }
     Ok(PreparedPartitionedSessionRuntime {
         selected,
+        parameters: std::sync::Arc::new(parameters),
         runtime,
         state,
         selected_state,
@@ -1356,7 +1512,7 @@ pub struct DistributedSessionCheckpoint<C> {
 }
 
 /// Cold-path failure from replicated-text construction or session control.
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug)]
 pub enum ReplicatedTextSessionError<A, P, M>
 where
     A: std::fmt::Display,
@@ -1364,37 +1520,99 @@ where
     M: std::fmt::Display,
 {
     /// The prepared architecture disagreed with its selected realization.
-    #[error("replicated text contract mismatch: {0}")]
     Contract(String),
+    /// Portable distributed execution or agreement failed.
+    Partition(crate::PartitionExecutionError),
     /// Architecture construction or execution failed.
-    #[error("replicated text architecture failed: {0}")]
     Architecture(A),
     /// Bounded residency failed.
-    #[error("replicated text residency failed: {0}")]
     Policy(P),
     /// A native mechanism failed.
-    #[error("replicated text mechanism failed: {0}")]
     Mechanism(M),
+    /// Shared admission failed before the driver received mutable model state.
+    /// This proves state preservation only; native completion/recovery is separate.
+    BeforeStateMutation(Box<ReplicatedTextSessionError<A, P, M>>),
     /// Mutable-state access failed.
-    #[error(transparent)]
-    State(#[from] StateError),
+    State(StateError),
     /// Prompt-cache identity or manifest validation failed.
-    #[error(transparent)]
-    PromptCache(#[from] PromptCacheError),
+    PromptCache(PromptCacheError),
     /// The globally fixed final decision was an abort.
-    #[error("distributed transaction epoch {epoch:?} was aborted")]
     CommitAborted {
         /// Durable transaction identity.
         epoch: DistributedCommitEpoch,
     },
     /// This rank may have contributed to a final decision it could not observe.
-    #[error("distributed transaction epoch {epoch:?} is indeterminate at {phase:?}")]
     CommitIndeterminate {
         /// Durable transaction identity.
         epoch: DistributedCommitEpoch,
         /// Exact final-decision cut which was not observed.
         phase: DistributedCommitPhase,
     },
+}
+
+impl<A: std::fmt::Display, P: std::fmt::Display, M: std::fmt::Display> std::fmt::Display
+    for ReplicatedTextSessionError<A, P, M>
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Contract(error) => write!(f, "replicated text contract mismatch: {error}"),
+            Self::Partition(error) => std::fmt::Display::fmt(error, f),
+            Self::Architecture(error) => write!(f, "replicated text architecture failed: {error}"),
+            Self::Policy(error) => write!(f, "replicated text residency failed: {error}"),
+            Self::Mechanism(error) => write!(f, "replicated text mechanism failed: {error}"),
+            Self::BeforeStateMutation(error) => write!(
+                f,
+                "replicated text admission rejected before state mutation: {error}"
+            ),
+            Self::State(error) => std::fmt::Display::fmt(error, f),
+            Self::PromptCache(error) => std::fmt::Display::fmt(error, f),
+            Self::CommitAborted { epoch } => {
+                write!(f, "distributed transaction epoch {epoch:?} was aborted")
+            }
+            Self::CommitIndeterminate { epoch, phase } => write!(
+                f,
+                "distributed transaction epoch {epoch:?} is indeterminate at {phase:?}"
+            ),
+        }
+    }
+}
+
+impl<A, P, M> std::error::Error for ReplicatedTextSessionError<A, P, M>
+where
+    A: std::error::Error + 'static,
+    P: std::error::Error + 'static,
+    M: std::error::Error + 'static,
+{
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Partition(error) => Some(error),
+            Self::Architecture(error) => Some(error),
+            Self::Policy(error) => Some(error),
+            Self::Mechanism(error) => Some(error),
+            Self::BeforeStateMutation(error) => Some(error.as_ref()),
+            Self::State(error) => Some(error),
+            Self::PromptCache(error) => Some(error),
+            Self::Contract(_) | Self::CommitAborted { .. } | Self::CommitIndeterminate { .. } => {
+                None
+            }
+        }
+    }
+}
+
+impl<A: std::fmt::Display, P: std::fmt::Display, M: std::fmt::Display> From<StateError>
+    for ReplicatedTextSessionError<A, P, M>
+{
+    fn from(error: StateError) -> Self {
+        Self::State(error)
+    }
+}
+
+impl<A: std::fmt::Display, P: std::fmt::Display, M: std::fmt::Display> From<PromptCacheError>
+    for ReplicatedTextSessionError<A, P, M>
+{
+    fn from(error: PromptCacheError) -> Self {
+        Self::PromptCache(error)
+    }
 }
 
 /// Immutable session and residency report produced by neutral orchestration.
@@ -1627,14 +1845,7 @@ where
                 actual.name() == expected.name()
                     && actual.role() == expected.role()
                     && actual.logical_shape() == expected.logical_shape()
-                    && (actual.owner() == expected.owner()
-                        || matches!(
-                            (actual.owner(), expected.owner()),
-                            (
-                                ParameterGroupOwner::StaticAnyOf(actual_roles),
-                                ParameterGroupOwner::StaticRole(expected_role)
-                            ) if actual_roles.iter().any(|role| role == expected_role)
-                        ))
+                    && actual.owner().refines_storage_owner(expected.owner())
             });
         if !agrees {
             return Err(format!(
@@ -1644,15 +1855,33 @@ where
                 task.executable(),
                 actual
                     .iter()
-                    .map(|companion| (companion.name(), companion.role(), companion.logical_shape(), companion.owner()))
+                    .map(|companion| (
+                        companion.name(),
+                        companion.role(),
+                        companion.logical_shape(),
+                        companion.owner()
+                    ))
                     .collect::<Vec<_>>(),
                 expected
                     .iter()
-                    .map(|companion| (companion.name(), companion.role(), companion.logical_shape(), companion.owner()))
+                    .map(|companion| (
+                        companion.name(),
+                        companion.role(),
+                        companion.logical_shape(),
+                        companion.owner()
+                    ))
                     .collect::<Vec<_>>(),
-                selected.requirements().parameters().iter().filter_map(|parameter| {
-                    parameter.linear_companion().filter(|(_, primary)| *primary == task.name()).map(|(role, primary)| (parameter.name(), role, primary))
-                }).collect::<Vec<_>>(),
+                selected
+                    .requirements()
+                    .parameters()
+                    .iter()
+                    .filter_map(|parameter| {
+                        parameter
+                            .linear_companion()
+                            .filter(|(_, primary)| *primary == task.name())
+                            .map(|(role, primary)| (parameter.name(), role, primary))
+                    })
+                    .collect::<Vec<_>>(),
             ));
         }
     }
@@ -1834,6 +2063,7 @@ where
         state,
         mechanisms,
         materialization_report,
+        partition_parameters: None,
         prompt_cache_identity: Some(prompt_cache_identity),
         committed_prompt_input_identity: None,
         next_commit_epoch: DistributedCommitEpoch::FIRST,
@@ -1872,6 +2102,7 @@ where
 {
     let PreparedPartitionedSessionRuntime {
         selected,
+        parameters,
         runtime,
         state,
         selected_state,
@@ -1929,6 +2160,7 @@ where
         state,
         mechanisms,
         materialization_report,
+        partition_parameters: Some(parameters),
         prompt_cache_identity,
         committed_prompt_input_identity: None,
         next_commit_epoch: DistributedCommitEpoch::FIRST,
@@ -1978,9 +2210,89 @@ where
         self.materialization_report.as_ref()
     }
 
+    /// Adds completed native observations for separately prepared auxiliary
+    /// modules. This changes telemetry only; selected requirements and resource
+    /// authority remain with the construction driver.
+    pub fn record_auxiliary_materialization(&mut self, report: crate::WeightMaterializationReport) {
+        self.materialization_report
+            .get_or_insert_with(Default::default)
+            .merge(report);
+    }
+
+    /// Exact materialization contracts for parameters actually selected at construction.
+    pub fn parameter_materialization_tasks(&self) -> &[ReplicatedTextMaterializationTask] {
+        self.selected.materialization_tasks()
+    }
+
+    /// Complete global parameter topology retained by partition construction.
+    /// Clones share immutable declarations; no residency unit or native tensor
+    /// is acquired. Ordinary construction returns `None`.
+    pub fn partition_parameter_description(
+        &self,
+    ) -> Option<&std::sync::Arc<crate::ArchitectureParameterDescription>> {
+        self.partition_parameters.as_ref()
+    }
+
+    /// Architecture and executor hook facts retained with partition construction.
+    pub fn partition_observation_hooks(&self) -> Option<crate::inspection::ObservationHookSupport> {
+        self.partition_parameters
+            .as_ref()
+            .map(|_| D::observation_hooks(&self.execution))
+    }
+
+    /// Describes prepared physical slots without acquiring their residency units.
+    pub fn parameter_declarations(&self) -> &[eredu_nn::ParameterMetadata] {
+        self.mechanisms.parameter_declarations()
+    }
+
+    /// Exact prepared source slots.
+    pub fn prepared_parameter_slots(
+        &self,
+    ) -> &[crate::parameter_operations::PreparedParameterSlot] {
+        self.mechanisms.prepared_parameter_slots()
+    }
+
     /// Borrows the statically paired unit-execution strategy for generic telemetry.
     pub const fn execution_strategy(&self) -> &D {
         &self.driver
+    }
+
+    /// Traverses loaded parameter slots at a caller-established quiescent boundary.
+    /// The visitor must prepare fallible work before publishing replacement handles.
+    pub fn visit_loaded_parameters(
+        &mut self,
+        visitor: &mut dyn eredu_nn::ParameterSlotVisitor<B::Tensor>,
+    ) -> bool {
+        D::visit_loaded_parameters(&mut self.execution, visitor)
+    }
+
+    /// Performs bounded work while the selected static or unit owner is retained.
+    pub fn with_parameter_slots(
+        &mut self,
+        location: &crate::parameter_operations::PreparedParameterLocation,
+        operation: &mut crate::parameter_operations::ParameterSlotOperation<
+            '_,
+            B::Tensor,
+            M::PolicyError,
+        >,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<bool, crate::LayerwiseAcquireError<A::Error, M::PolicyError>> {
+        D::with_parameter_slots(&mut self.execution, location, operation, context)
+    }
+
+    /// Publishes completed replacements after resetting incompatible mutable state.
+    pub fn publish_parameter_replacements(
+        &mut self,
+        values: &BTreeMap<String, B::Tensor>,
+        active: bool,
+    ) -> Result<bool, M::PolicyError> {
+        D::publish_parameter_replacements(&mut self.execution, values, active)
+    }
+
+    /// Invalidates native snapshots after a completed parameter publication.
+    /// Call only after resetting incompatible mutable state and publishing all slots.
+    pub fn invalidate_parameter_snapshots(&mut self) {
+        self.control_identity = std::sync::Arc::new(());
     }
 
     /// Runs one direct forward and returns the complete architecture output.
@@ -2008,15 +2320,17 @@ where
         A: ReplicatedTextArchitecture<B, M::State>,
         O: ActivationObserver<B::Tensor, A::Error> + ?Sized,
     {
-        let pass = tokens
-            .shape()
-            .last()
-            .copied()
-            .filter(|length| *length > 1)
-            .map_or(ExpertPass::Decode, |_| ExpertPass::Prefill);
-        let (output, checkpoint, forward_context) =
-            self.execute_with_observer(tokens, mask, pass, context, observer)?;
-        self.publish(output, checkpoint, forward_context, context)
+        self.with_observation_transaction(observer, |session, observer| {
+            let pass = tokens
+                .shape()
+                .last()
+                .copied()
+                .filter(|length| *length > 1)
+                .map_or(ExpertPass::Decode, |_| ExpertPass::Prefill);
+            let (output, checkpoint, forward_context) =
+                session.execute_with_observer(tokens, mask, pass, context, observer)?;
+            session.publish(output, checkpoint, forward_context, context, observer)
+        })
     }
 
     /// Runs an ordinary transaction and retains every sequence logit row for
@@ -2030,7 +2344,13 @@ where
     ) -> Result<B::Tensor, ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>> {
         let (output, checkpoint, forward_context) =
             self.execute_input_with_observer(input, pass, context, &mut crate::NoopObserver)?;
-        self.publish(output, checkpoint, forward_context, context)
+        self.publish(
+            output,
+            checkpoint,
+            forward_context,
+            context,
+            &mut crate::NoopObserver,
+        )
     }
 
     /// Runs prompt processing and selects the architecture-declared text output.
@@ -2092,12 +2412,43 @@ where
         (B::Tensor, B::Tensor),
         ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>,
     > {
-        let (output, checkpoint, forward_context) = self.execute_input_before_publication(
-            input,
-            ExpertPass::Prefill,
-            context,
-            &mut crate::NoopObserver,
-        )?;
+        self.prefill_input_prediction_target_observed(input, context, &mut crate::NoopObserver)
+    }
+
+    /// Runs target prefill with internal hooks and the ordinary observation
+    /// transaction, retaining the exact target capture from that same forward.
+    pub fn prefill_input_prediction_target_observed<'a, O>(
+        &mut self,
+        input: A::Input<'a>,
+        context: &<<B as NeuralBackend>::Tensor as Tensor>::Context,
+        observer: &mut O,
+    ) -> Result<
+        (B::Tensor, B::Tensor),
+        ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>,
+    >
+    where
+        O: ActivationObserver<B::Tensor, A::Error> + ?Sized,
+    {
+        self.with_observation_transaction(observer, |session, observer| {
+            session.prediction_target_input_inner(input, ExpertPass::Prefill, context, observer)
+        })
+    }
+
+    fn prediction_target_input_inner<'a, O>(
+        &mut self,
+        input: A::Input<'a>,
+        pass: ExpertPass,
+        context: &<<B as NeuralBackend>::Tensor as Tensor>::Context,
+        observer: &mut O,
+    ) -> Result<
+        (B::Tensor, B::Tensor),
+        ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>,
+    >
+    where
+        O: ActivationObserver<B::Tensor, A::Error> + ?Sized,
+    {
+        let (output, checkpoint, forward_context) =
+            self.execute_input_before_publication(input, pass, context, observer)?;
         let capture = D::prediction_target_capture(&mut self.execution, &forward_context, context)
             .map_err(widen_infallible);
         let local_success = matches!(&capture, Ok(Some(_)));
@@ -2109,7 +2460,7 @@ where
         ) {
             Ok(agreed) => agreed,
             Err(error) => {
-                return self.rollback_failure(checkpoint, widen_infallible(error), context)
+                return self.rollback_failure(checkpoint, widen_infallible(error), context);
             }
         };
         let capture = match capture {
@@ -2121,7 +2472,7 @@ where
                         "another rank could not prepare the prediction target capture".into(),
                     ),
                     context,
-                )
+                );
             }
             Ok(None) => {
                 return self.rollback_failure(
@@ -2130,7 +2481,7 @@ where
                         "prediction target pass did not retain its declared hidden capture".into(),
                     ),
                     context,
-                )
+                );
             }
             Err(error) => return self.rollback_failure(checkpoint, error, context),
         };
@@ -2144,7 +2495,7 @@ where
         ) {
             Ok(agreed) => agreed,
             Err(error) => {
-                return self.rollback_failure(checkpoint, widen_infallible(error), context)
+                return self.rollback_failure(checkpoint, widen_infallible(error), context);
             }
         };
         let capture = match capture_publication {
@@ -2156,15 +2507,15 @@ where
                         "another rank failed to publish the prediction target capture".into(),
                     ),
                     context,
-                )
+                );
             }
             Err(error) => {
-                return self.rollback_failure(checkpoint, widen_infallible(error), context)
+                return self.rollback_failure(checkpoint, widen_infallible(error), context);
             }
         };
         let (output, checkpoint, forward_context) =
             self.publish_observed_output_transaction(output, checkpoint, forward_context, context)?;
-        self.publish(output, checkpoint, forward_context, context)
+        self.publish(output, checkpoint, forward_context, context, observer)
             .map(|output| (output, capture))
     }
 
@@ -2199,28 +2550,40 @@ where
         O: ActivationObserver<B::Tensor, A::Error> + ?Sized,
         F: FnOnce(&A::ForwardContext) -> Result<C, A::Error>,
     {
-        if D::PARTITIONED_SESSION {
-            return Err(ReplicatedTextSessionError::Contract(
+        self.with_observation_transaction(observer, |session, observer| {
+            if D::PARTITIONED_SESSION {
+                return Err(ReplicatedTextSessionError::Contract(
                 "partitioned prediction capture requires a selected bundle publication contract"
                     .into(),
             ));
-        }
-        let (output, checkpoint, forward_context) =
-            self.execute_input_before_publication(input, ExpertPass::Prefill, context, observer)?;
-        let captured = match capture(&forward_context) {
-            Ok(captured) => captured,
-            Err(error) => {
-                return self.rollback_failure(
-                    checkpoint,
-                    ReplicatedTextSessionError::Architecture(error),
-                    context,
-                )
             }
-        };
-        let (output, checkpoint, forward_context) =
-            self.publish_observed_output_transaction(output, checkpoint, forward_context, context)?;
-        self.publish(output, checkpoint, forward_context, context)
-            .map(|output| (output, captured))
+            let (output, checkpoint, forward_context) = session.execute_input_before_publication(
+                input,
+                ExpertPass::Prefill,
+                context,
+                observer,
+            )?;
+            let captured = match capture(&forward_context) {
+                Ok(captured) => captured,
+                Err(error) => {
+                    return session.rollback_failure(
+                        checkpoint,
+                        ReplicatedTextSessionError::Architecture(error),
+                        context,
+                    );
+                }
+            };
+            let (output, checkpoint, forward_context) = session
+                .publish_observed_output_transaction(
+                    output,
+                    checkpoint,
+                    forward_context,
+                    context,
+                )?;
+            session
+                .publish(output, checkpoint, forward_context, context, observer)
+                .map(|output| (output, captured))
+        })
     }
 
     /// Runs composite prompt processing and commits its cache-relevant input identity only after
@@ -2250,9 +2613,7 @@ where
     where
         O: ActivationObserver<B::Tensor, A::Error> + ?Sized,
     {
-        let output = self.prefill_input_with_observer(input, context, observer)?;
-        self.committed_prompt_input_identity = Some(identity);
-        Ok(output)
+        self.prefill_input_result_transaction(Ok(input), Some(identity), context, observer, false)
     }
 
     /// Runs observed prompt processing from an architecture-prepared input.
@@ -2265,23 +2626,71 @@ where
     where
         O: ActivationObserver<B::Tensor, A::Error> + ?Sized,
     {
-        let (output, checkpoint, forward_context) =
-            self.execute_input_with_observer(input, ExpertPass::Prefill, context, observer)?;
-        let sequence_index = self.output_selection.sequence_index();
-        let output = match self
-            .mechanisms
-            .index_text_output(output, sequence_index, context)
-        {
-            Ok(output) => output,
-            Err(error) => {
-                return self.rollback_failure(
-                    checkpoint,
-                    ReplicatedTextSessionError::Mechanism(error),
+        self.prefill_input_result_transaction(Ok(input), None, context, observer, false)
+    }
+
+    /// Agrees local input preparation before observation admission or model work.
+    ///
+    /// Partitioned execution requires selected bounded all-rank phase agreement,
+    /// even when this rank's input succeeded and its observer is absent.
+    /// Callers retain local preparation failures in `input` instead of returning
+    /// early. Every rank must enter the same step, including ranks without an
+    /// observer. Failed preparation consumes the transaction epoch but preserves
+    /// installed state and the previously committed prompt identity. Local native
+    /// work remains subject to the backend's ordinary completion/recovery owner.
+    pub fn prefill_input_result_with_observer<'a, O>(
+        &mut self,
+        input: Result<A::Input<'a>, A::Error>,
+        identity: Option<PreparedInputCacheIdentity>,
+        context: &<<B as NeuralBackend>::Tensor as Tensor>::Context,
+        observer: &mut O,
+    ) -> Result<B::Tensor, ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>>
+    where
+        O: ActivationObserver<B::Tensor, A::Error> + ?Sized,
+    {
+        self.prefill_input_result_transaction(input, identity, context, observer, true)
+    }
+
+    fn prefill_input_result_transaction<'a, O>(
+        &mut self,
+        input: Result<A::Input<'a>, A::Error>,
+        identity: Option<PreparedInputCacheIdentity>,
+        context: &<B::Tensor as Tensor>::Context,
+        observer: &mut O,
+        require_input_agreement: bool,
+    ) -> Result<B::Tensor, ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>>
+    where
+        O: ActivationObserver<B::Tensor, A::Error> + ?Sized,
+    {
+        let output = self.with_observation_transaction(observer, |session, observer| {
+            session.require_input_result_agreement(require_input_agreement)?;
+            let (output, checkpoint, forward_context) = session
+                .execute_input_result_with_observer(
+                    input,
+                    ExpertPass::Prefill,
                     context,
-                )
-            }
-        };
-        self.publish(output, checkpoint, forward_context, context)
+                    observer,
+                )?;
+            let sequence_index = session.output_selection.sequence_index();
+            let output = match session
+                .mechanisms
+                .index_text_output(output, sequence_index, context)
+            {
+                Ok(output) => output,
+                Err(error) => {
+                    return session.rollback_failure(
+                        checkpoint,
+                        ReplicatedTextSessionError::Mechanism(error),
+                        context,
+                    );
+                }
+            };
+            session.publish(output, checkpoint, forward_context, context, observer)
+        })?;
+        if let Some(identity) = identity {
+            self.committed_prompt_input_identity = Some(identity);
+        }
+        Ok(output)
     }
 
     /// Runs one decode step from an architecture-prepared input.
@@ -2305,28 +2714,40 @@ where
         O: ActivationObserver<B::Tensor, A::Error> + ?Sized,
         F: FnOnce(&A::ForwardContext) -> Result<C, A::Error>,
     {
-        if D::PARTITIONED_SESSION {
-            return Err(ReplicatedTextSessionError::Contract(
+        self.with_observation_transaction(observer, |session, observer| {
+            if D::PARTITIONED_SESSION {
+                return Err(ReplicatedTextSessionError::Contract(
                 "partitioned prediction capture requires a selected bundle publication contract"
                     .into(),
             ));
-        }
-        let (output, checkpoint, forward_context) =
-            self.execute_input_before_publication(input, ExpertPass::Decode, context, observer)?;
-        let captured = match capture(&forward_context) {
-            Ok(captured) => captured,
-            Err(error) => {
-                return self.rollback_failure(
-                    checkpoint,
-                    ReplicatedTextSessionError::Architecture(error),
-                    context,
-                )
             }
-        };
-        let (output, checkpoint, forward_context) =
-            self.publish_observed_output_transaction(output, checkpoint, forward_context, context)?;
-        self.publish(output, checkpoint, forward_context, context)
-            .map(|output| (output, captured))
+            let (output, checkpoint, forward_context) = session.execute_input_before_publication(
+                input,
+                ExpertPass::Decode,
+                context,
+                observer,
+            )?;
+            let captured = match capture(&forward_context) {
+                Ok(captured) => captured,
+                Err(error) => {
+                    return session.rollback_failure(
+                        checkpoint,
+                        ReplicatedTextSessionError::Architecture(error),
+                        context,
+                    );
+                }
+            };
+            let (output, checkpoint, forward_context) = session
+                .publish_observed_output_transaction(
+                    output,
+                    checkpoint,
+                    forward_context,
+                    context,
+                )?;
+            session
+                .publish(output, checkpoint, forward_context, context, observer)
+                .map(|output| (output, captured))
+        })
     }
 
     /// Runs one observed decode step from an architecture-prepared input.
@@ -2339,23 +2760,53 @@ where
     where
         O: ActivationObserver<B::Tensor, A::Error> + ?Sized,
     {
-        let (output, checkpoint, forward_context) =
-            self.execute_input_with_observer(input, ExpertPass::Decode, context, observer)?;
-        let sequence_index = self.output_selection.sequence_index();
-        let output = match self
-            .mechanisms
-            .index_text_output(output, sequence_index, context)
-        {
-            Ok(output) => output,
-            Err(error) => {
-                return self.rollback_failure(
-                    checkpoint,
-                    ReplicatedTextSessionError::Mechanism(error),
-                    context,
-                )
-            }
-        };
-        self.publish(output, checkpoint, forward_context, context)
+        self.decode_input_result_transaction(Ok(input), context, observer, false)
+    }
+
+    /// Runs decode after agreeing each rank's local input preparation result.
+    /// See [`Self::prefill_input_result_with_observer`] for failure ownership.
+    pub fn decode_input_result_with_observer<'a, O>(
+        &mut self,
+        input: Result<A::Input<'a>, A::Error>,
+        context: &<<B as NeuralBackend>::Tensor as Tensor>::Context,
+        observer: &mut O,
+    ) -> Result<B::Tensor, ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>>
+    where
+        O: ActivationObserver<B::Tensor, A::Error> + ?Sized,
+    {
+        self.decode_input_result_transaction(input, context, observer, true)
+    }
+
+    fn decode_input_result_transaction<'a, O>(
+        &mut self,
+        input: Result<A::Input<'a>, A::Error>,
+        context: &<B::Tensor as Tensor>::Context,
+        observer: &mut O,
+        require_input_agreement: bool,
+    ) -> Result<B::Tensor, ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>>
+    where
+        O: ActivationObserver<B::Tensor, A::Error> + ?Sized,
+    {
+        self.with_observation_transaction(observer, |session, observer| {
+            session.require_input_result_agreement(require_input_agreement)?;
+            let (output, checkpoint, forward_context) = session
+                .execute_input_result_with_observer(input, ExpertPass::Decode, context, observer)?;
+            let sequence_index = session.output_selection.sequence_index();
+            let output = match session
+                .mechanisms
+                .index_text_output(output, sequence_index, context)
+            {
+                Ok(output) => output,
+                Err(error) => {
+                    return session.rollback_failure(
+                        checkpoint,
+                        ReplicatedTextSessionError::Mechanism(error),
+                        context,
+                    );
+                }
+            };
+            session.publish(output, checkpoint, forward_context, context, observer)
+        })
     }
 
     /// Runs one decode step and selects the architecture-declared text output.
@@ -2395,80 +2846,26 @@ where
         (B::Tensor, B::Tensor),
         ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>,
     > {
-        let (output, checkpoint, forward_context) = self.execute_input_before_publication(
-            input,
-            ExpertPass::Decode,
-            context,
-            &mut crate::NoopObserver,
-        )?;
-        let capture = D::prediction_target_capture(&mut self.execution, &forward_context, context)
-            .map_err(widen_infallible);
-        let local_success = matches!(&capture, Ok(Some(_)));
-        let agreed = match D::agree_distributed_phase(
-            &mut self.execution,
-            crate::DistributedExecutionPhase::PredictionTargetCapture,
-            local_success,
-            context,
-        ) {
-            Ok(agreed) => agreed,
-            Err(error) => {
-                return self.rollback_failure(checkpoint, widen_infallible(error), context)
-            }
-        };
-        let capture = match capture {
-            Ok(Some(capture)) if agreed => capture,
-            Ok(Some(_)) => {
-                return self.rollback_failure(
-                    checkpoint,
-                    ReplicatedTextSessionError::Contract(
-                        "another rank could not prepare the prediction target capture".into(),
-                    ),
-                    context,
-                )
-            }
-            Ok(None) => {
-                return self.rollback_failure(
-                    checkpoint,
-                    ReplicatedTextSessionError::Contract(
-                        "prediction target pass did not retain its declared hidden capture".into(),
-                    ),
-                    context,
-                )
-            }
-            Err(error) => return self.rollback_failure(checkpoint, error, context),
-        };
-        let capture_publication =
-            D::publish_prediction_target_capture(&mut self.execution, capture, context);
-        let capture_publication_agreed = match D::agree_distributed_phase(
-            &mut self.execution,
-            crate::DistributedExecutionPhase::PredictionTargetCapturePublication,
-            capture_publication.is_ok(),
-            context,
-        ) {
-            Ok(agreed) => agreed,
-            Err(error) => {
-                return self.rollback_failure(checkpoint, widen_infallible(error), context)
-            }
-        };
-        let capture = match capture_publication {
-            Ok(capture) if capture_publication_agreed => capture,
-            Ok(_) => {
-                return self.rollback_failure(
-                    checkpoint,
-                    ReplicatedTextSessionError::Contract(
-                        "another rank failed to publish the prediction target capture".into(),
-                    ),
-                    context,
-                )
-            }
-            Err(error) => {
-                return self.rollback_failure(checkpoint, widen_infallible(error), context)
-            }
-        };
-        let (output, checkpoint, forward_context) =
-            self.publish_observed_output_transaction(output, checkpoint, forward_context, context)?;
-        self.publish(output, checkpoint, forward_context, context)
-            .map(|output| (output, capture))
+        self.decode_input_prediction_target_observed(input, context, &mut crate::NoopObserver)
+    }
+
+    /// Runs target verification/replay with internal hooks through the same
+    /// observation, capture, publication and rollback transaction as prefill.
+    pub fn decode_input_prediction_target_observed<'a, O>(
+        &mut self,
+        input: A::Input<'a>,
+        context: &<<B as NeuralBackend>::Tensor as Tensor>::Context,
+        observer: &mut O,
+    ) -> Result<
+        (B::Tensor, B::Tensor),
+        ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>,
+    >
+    where
+        O: ActivationObserver<B::Tensor, A::Error> + ?Sized,
+    {
+        self.with_observation_transaction(observer, |session, observer| {
+            session.prediction_target_input_inner(input, ExpertPass::Decode, context, observer)
+        })
     }
 
     /// Runs one observed decode step and selects the declared text output.
@@ -2482,23 +2879,30 @@ where
         A: ReplicatedTextArchitecture<B, M::State>,
         O: ActivationObserver<B::Tensor, A::Error> + ?Sized,
     {
-        let (output, checkpoint, forward_context) =
-            self.execute_with_observer(tokens, None, ExpertPass::Decode, context, observer)?;
-        let sequence_index = self.output_selection.sequence_index();
-        let output = match self
-            .mechanisms
-            .index_text_output(output, sequence_index, context)
-        {
-            Ok(output) => output,
-            Err(error) => {
-                return self.rollback_failure(
-                    checkpoint,
-                    ReplicatedTextSessionError::Mechanism(error),
-                    context,
-                )
-            }
-        };
-        self.publish(output, checkpoint, forward_context, context)
+        self.with_observation_transaction(observer, |session, observer| {
+            let (output, checkpoint, forward_context) = session.execute_with_observer(
+                tokens,
+                None,
+                ExpertPass::Decode,
+                context,
+                observer,
+            )?;
+            let sequence_index = session.output_selection.sequence_index();
+            let output = match session
+                .mechanisms
+                .index_text_output(output, sequence_index, context)
+            {
+                Ok(output) => output,
+                Err(error) => {
+                    return session.rollback_failure(
+                        checkpoint,
+                        ReplicatedTextSessionError::Mechanism(error),
+                        context,
+                    );
+                }
+            };
+            session.publish(output, checkpoint, forward_context, context, observer)
+        })
     }
 
     /// Snapshots successful state-restoration evidence for one execution call.
@@ -2632,10 +3036,7 @@ where
         O: PredictionTargetOperation<A, B, M::State>,
     {
         self.ensure_commit_resolved()?;
-        let checkpoint = self
-            .mechanisms
-            .checkpoint_state(&self.state, context)
-            .map_err(ReplicatedTextSessionError::Mechanism)?;
+        let checkpoint = self.checkpoint_observed_state(context)?;
         let execution = D::apply_prediction_target_operation(
             &mut self.execution,
             &mut self.state,
@@ -3193,6 +3594,154 @@ where
         })
     }
 
+    fn with_observation_transaction<O, V>(
+        &mut self,
+        observer: &mut O,
+        operation: impl FnOnce(
+            &mut Self,
+            &mut O,
+        ) -> Result<
+            V,
+            ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>,
+        >,
+    ) -> Result<V, ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>>
+    where
+        O: ActivationObserver<B::Tensor, A::Error> + ?Sized,
+    {
+        let guard =
+            crate::inspection::ObservationTransactionGuard::new(observer, self.next_commit_epoch);
+        let result = operation(self, guard.observer);
+        guard.finish(result.is_ok());
+        result
+    }
+
+    fn require_input_result_agreement(
+        &mut self,
+        required: bool,
+    ) -> Result<(), ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>> {
+        if required && D::PARTITIONED_SESSION && !D::DISTRIBUTED_PHASE_AGREEMENT {
+            self.begin_commit_epoch()?;
+            return self.abort_without_rollback(ReplicatedTextSessionError::BeforeStateMutation(
+                Box::new(ReplicatedTextSessionError::Contract(
+                    "fallible partitioned input requires bounded all-rank preparation agreement"
+                        .into(),
+                )),
+            ));
+        }
+        Ok(())
+    }
+
+    fn checkpoint_observed_state(
+        &mut self,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<M::StateCheckpoint, ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>>
+    {
+        let checkpoint = self.mechanisms.checkpoint_state(&self.state, context);
+        let checkpoint_agreed = match D::agree_distributed_phase(
+            &mut self.execution,
+            crate::DistributedExecutionPhase::StateCheckpoint,
+            checkpoint.is_ok(),
+            context,
+        ) {
+            Ok(agreed) => agreed,
+            Err(error) => return self.abort_without_rollback(widen_infallible(error)),
+        };
+        let checkpoint = match checkpoint {
+            Ok(checkpoint) if checkpoint_agreed => checkpoint,
+            Ok(_) => {
+                return self.abort_without_rollback(ReplicatedTextSessionError::Contract(
+                    "another rank failed to capture its distributed state checkpoint".into(),
+                ));
+            }
+            Err(error) => {
+                return self.abort_without_rollback(ReplicatedTextSessionError::Mechanism(error));
+            }
+        };
+        Ok(checkpoint)
+    }
+
+    fn prepare_observation_transaction<O>(
+        &mut self,
+        observer: &mut O,
+        epoch: DistributedCommitEpoch,
+        pass: ExpertPass,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<(), ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>>
+    where
+        O: ActivationObserver<B::Tensor, A::Error> + ?Sized,
+    {
+        use crate::DistributedExecutionPhase as Phase;
+        let result = (|| {
+            let active = observer.transactional();
+            // All ranks execute the first vote, even if their observer is absent.
+            // A mixed configuration must fail before a callback enters a collective.
+            let absent = D::agree_distributed_phase(
+                &mut self.execution,
+                Phase::ObservationParticipation,
+                !active,
+                context,
+            )
+            .map_err(widen_infallible)?;
+            if absent {
+                return Ok(());
+            }
+            let present = D::agree_distributed_phase(
+                &mut self.execution,
+                Phase::ObservationParticipationRequired,
+                active,
+                context,
+            )
+            .map_err(widen_infallible)?;
+            if !present || !active || (D::PARTITIONED_SESSION && !D::DISTRIBUTED_PHASE_AGREEMENT) {
+                return Err(ReplicatedTextSessionError::Contract(
+                    "transactional observation requires agreeing participation on every rank"
+                        .into(),
+                ));
+            }
+            for (phase, local) in [
+                (Phase::ObservationPreparation, true),
+                (Phase::ObservationCoordination, false),
+            ] {
+                let prepared = if local && !self.selected.exact_completion_available() {
+                    Err(ReplicatedTextSessionError::Contract(
+                        "transactional observation requires exact completion support".into(),
+                    ))
+                } else if local {
+                    observer
+                        .prepare_transaction(epoch, pass)
+                        .map_err(ReplicatedTextSessionError::Architecture)
+                } else {
+                    observer
+                        .coordinate_transaction(epoch)
+                        .map_err(ReplicatedTextSessionError::Architecture)
+                };
+                let agreed = D::agree_distributed_phase(
+                    &mut self.execution,
+                    phase,
+                    prepared.is_ok(),
+                    context,
+                )
+                .map_err(widen_infallible);
+                match (prepared, agreed) {
+                    (Err(error), _) | (_, Err(error)) => return Err(error),
+                    (Ok(()), Ok(true)) => (),
+                    (Ok(()), Ok(false)) => {
+                        return Err(ReplicatedTextSessionError::Contract(format!(
+                            "another rank rejected observation at {phase:?}"
+                        )));
+                    }
+                }
+            }
+            Ok(())
+        })();
+        match result {
+            Ok(()) => Ok(()),
+            Err(error) => self.abort_without_rollback(
+                ReplicatedTextSessionError::BeforeStateMutation(Box::new(error)),
+            ),
+        }
+    }
+
     fn execute_with_observer<O>(
         &mut self,
         tokens: &B::Tensor,
@@ -3230,6 +3779,24 @@ where
         self.publish_observed_output_transaction(output, checkpoint, forward_context, context)
     }
 
+    fn execute_input_result_with_observer<'a, O>(
+        &mut self,
+        input: Result<A::Input<'a>, A::Error>,
+        pass: ExpertPass,
+        context: &<B::Tensor as Tensor>::Context,
+        observer: &mut O,
+    ) -> Result<
+        (B::Tensor, M::StateCheckpoint, A::ForwardContext),
+        ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>,
+    >
+    where
+        O: ActivationObserver<B::Tensor, A::Error> + ?Sized,
+    {
+        let (output, checkpoint, forward_context) =
+            self.execute_input_result_before_publication(input, pass, context, observer)?;
+        self.publish_observed_output_transaction(output, checkpoint, forward_context, context)
+    }
+
     fn execute_input_before_publication<'a, O>(
         &mut self,
         input: A::Input<'a>,
@@ -3243,28 +3810,47 @@ where
     where
         O: ActivationObserver<B::Tensor, A::Error> + ?Sized,
     {
-        self.begin_commit_epoch()?;
-        let checkpoint = self.mechanisms.checkpoint_state(&self.state, context);
-        let checkpoint_agreed = match D::agree_distributed_phase(
+        self.execute_input_result_before_publication(Ok(input), pass, context, observer)
+    }
+
+    fn execute_input_result_before_publication<'a, O>(
+        &mut self,
+        input: Result<A::Input<'a>, A::Error>,
+        pass: ExpertPass,
+        context: &<B::Tensor as Tensor>::Context,
+        observer: &mut O,
+    ) -> Result<
+        (B::Tensor, M::StateCheckpoint, A::ForwardContext),
+        ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>,
+    >
+    where
+        O: ActivationObserver<B::Tensor, A::Error> + ?Sized,
+    {
+        let epoch = self.begin_commit_epoch()?;
+        let agreement = D::agree_distributed_phase(
             &mut self.execution,
-            crate::DistributedExecutionPhase::StateCheckpoint,
-            checkpoint.is_ok(),
+            crate::DistributedExecutionPhase::InputPreparation,
+            input.is_ok(),
             context,
-        ) {
-            Ok(agreed) => agreed,
-            Err(error) => return self.abort_without_rollback(widen_infallible(error)),
-        };
-        let checkpoint = match checkpoint {
-            Ok(checkpoint) if checkpoint_agreed => checkpoint,
-            Ok(_) => {
-                return self.abort_without_rollback(ReplicatedTextSessionError::Contract(
-                    "another rank failed to capture its distributed state checkpoint".into(),
-                ));
+        )
+        .map_err(widen_infallible);
+        let input = match (input, agreement) {
+            (Ok(input), Ok(true)) => input,
+            (input, agreement) => {
+                let error = match (input, agreement) {
+                    (Err(error), _) => ReplicatedTextSessionError::Architecture(error),
+                    (_, Err(error)) => error,
+                    _ => ReplicatedTextSessionError::Contract(
+                        "another rank rejected input preparation".into(),
+                    ),
+                };
+                return self.abort_without_rollback(
+                    ReplicatedTextSessionError::BeforeStateMutation(Box::new(error)),
+                );
             }
-            Err(error) => {
-                return self.abort_without_rollback(ReplicatedTextSessionError::Mechanism(error));
-            }
         };
+        self.prepare_observation_transaction(observer, epoch, pass, context)?;
+        let checkpoint = self.checkpoint_observed_state(context)?;
         let execution = self
             .driver
             .forward_with_observer(
@@ -3296,11 +3882,13 @@ where
             Ok(_) => {
                 return self.rollback_failure(
                     checkpoint,
-                    ReplicatedTextSessionError::Contract(
-                        "another rank failed during distributed execution".into(),
+                    ReplicatedTextSessionError::Partition(
+                        crate::PartitionExecutionError::RemotePhaseFailure(
+                            crate::DistributedExecutionPhase::Execution,
+                        ),
                     ),
                     context,
-                )
+                );
             }
             Err(error) => return self.rollback_failure(checkpoint, error, context),
         };
@@ -3313,7 +3901,7 @@ where
         ) {
             Ok(agreed) => agreed,
             Err(error) => {
-                return self.rollback_failure(checkpoint, widen_infallible(error), context)
+                return self.rollback_failure(checkpoint, widen_infallible(error), context);
             }
         };
         let output = match observation {
@@ -3325,10 +3913,10 @@ where
                         "another rank failed during distributed output observation".into(),
                     ),
                     context,
-                )
+                );
             }
             Err(error) => {
-                return self.rollback_failure(checkpoint, widen_infallible(error), context)
+                return self.rollback_failure(checkpoint, widen_infallible(error), context);
             }
         };
         Ok((output, checkpoint, forward_context))
@@ -3353,10 +3941,10 @@ where
         );
         let output = match (publication, publication_agreement) {
             (Err(error), _) => {
-                return self.rollback_failure(checkpoint, widen_infallible(error), context)
+                return self.rollback_failure(checkpoint, widen_infallible(error), context);
             }
             (Ok(_), Err(error)) => {
-                return self.rollback_failure(checkpoint, widen_infallible(error), context)
+                return self.rollback_failure(checkpoint, widen_infallible(error), context);
             }
             (Ok(output), Ok(true)) => output,
             (Ok(_), Ok(false)) => {
@@ -3366,22 +3954,21 @@ where
                         "another rank failed during distributed output publication".into(),
                     ),
                     context,
-                )
+                );
             }
         };
         Ok((output, checkpoint, forward_context))
     }
 
-    fn publish(
+    fn publish<O: ActivationObserver<B::Tensor, A::Error> + ?Sized>(
         &mut self,
         output: B::Tensor,
         checkpoint: M::StateCheckpoint,
         _forward_context: A::ForwardContext,
         context: &<<B as NeuralBackend>::Tensor as Tensor>::Context,
+        observer: &mut O,
     ) -> Result<B::Tensor, ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>> {
-        let completion = self
-            .selected
-            .exact_completion()
+        let completion = (self.selected.exact_completion() || observer.transactional())
             .then(|| self.mechanisms.complete(&output, &self.state, context))
             .transpose();
         let completion_agreed = match D::agree_distributed_phase(
@@ -3392,7 +3979,7 @@ where
         ) {
             Ok(agreed) => agreed,
             Err(error) => {
-                return self.rollback_failure(checkpoint, widen_infallible(error), context)
+                return self.rollback_failure(checkpoint, widen_infallible(error), context);
             }
         };
         match completion {
@@ -3404,21 +3991,53 @@ where
                         "another rank failed during distributed mechanism completion".into(),
                     ),
                     context,
-                )
+                );
             }
             Err(error) => {
                 return self.rollback_failure(
                     checkpoint,
                     ReplicatedTextSessionError::Mechanism(error),
                     context,
-                )
+                );
             }
         }
+        self.commit_observation_transaction(checkpoint, context, observer)?;
+        Ok(output)
+    }
+
+    fn commit_observation_transaction<O: ActivationObserver<B::Tensor, A::Error> + ?Sized>(
+        &mut self,
+        checkpoint: M::StateCheckpoint,
+        context: &<B::Tensor as Tensor>::Context,
+        observer: &mut O,
+    ) -> Result<(), ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>> {
         let epoch = self.active_commit_epoch.ok_or_else(|| {
             ReplicatedTextSessionError::Contract(
                 "distributed transaction lost its active commit epoch".into(),
             )
         })?;
+        if observer.transactional() {
+            let delivered = observer
+                .complete_transaction(epoch)
+                .map_err(ReplicatedTextSessionError::Architecture);
+            let agreed = D::agree_distributed_phase(
+                &mut self.execution,
+                crate::DistributedExecutionPhase::ObservationDelivery,
+                delivered.is_ok(),
+                context,
+            )
+            .map_err(widen_infallible);
+            let delivery = match (delivered, agreed) {
+                (Err(error), _) | (_, Err(error)) => Err(error),
+                (Ok(()), Ok(true)) => Ok(()),
+                (Ok(()), Ok(false)) => Err(ReplicatedTextSessionError::Contract(
+                    "another rank rejected completed observation delivery".into(),
+                )),
+            };
+            if let Err(error) = delivery {
+                return self.rollback_failure(checkpoint, error, context);
+            }
+        }
         match D::commit_after_completion(&mut self.execution, epoch, context) {
             DistributedCommitOutcome::Committed(committed) if committed == epoch => {
                 self.last_commit_outcome = Some(DistributedCommitOutcome::Committed(epoch));
@@ -3455,7 +4074,7 @@ where
                 );
             }
         }
-        Ok(output)
+        Ok(())
     }
 
     fn rollback_failure<T>(
@@ -3464,6 +4083,15 @@ where
         error: ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>,
         context: &<<B as NeuralBackend>::Tensor as Tensor>::Context,
     ) -> Result<T, ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>> {
+        self.restore_failed_work(checkpoint, context)?;
+        Err(error)
+    }
+
+    fn restore_failed_work(
+        &mut self,
+        checkpoint: M::StateCheckpoint,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<(), ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>> {
         let restored = self
             .mechanisms
             .restore_state(&mut self.state, checkpoint, context)
@@ -3472,7 +4100,7 @@ where
             self.last_commit_outcome = Some(DistributedCommitOutcome::Aborted(epoch));
         }
         record_successful_restoration(&mut self.successful_state_restorations, restored)?;
-        Err(error)
+        Ok(())
     }
 
     fn begin_commit_epoch(
@@ -3956,26 +4584,11 @@ where
         let (shape, owner) = actual
             .get(parameter.name())
             .expect("equal parameter-name sets contain every requirement");
-        let owner_matches = match (owner, parameter.owner()) {
-            (
-                ParameterGroupOwner::StaticRole(actual),
-                ReplicatedTextParameterOwner::StaticRole(expected),
-            ) => actual == expected,
-            (
-                ParameterGroupOwner::StaticAnyOf(actual),
-                ReplicatedTextParameterOwner::StaticRole(expected),
-            ) => actual.iter().any(|role| role == expected),
-            (
-                ParameterGroupOwner::ExecutionUnit {
-                    group, global_unit, ..
-                },
-                ReplicatedTextParameterOwner::ExecutionUnit {
-                    group: expected_group,
-                    unit: expected_unit,
-                },
-            ) => group.as_str() == expected_group && global_unit == expected_unit,
-            _ => false,
-        };
+        let expected_owner = parameter
+            .owner()
+            .parameter_group_owner()
+            .map_err(|error| error.to_string())?;
+        let owner_matches = owner.refines_storage_owner(&expected_owner);
         let mut expected_shape = parameter.logical_shape().to_vec();
         let realization = selected_formats
             .then(|| {
@@ -4118,7 +4731,7 @@ where
                 _ => {
                     return Err(format!(
                         "constructed companion {name:?} has incomplete derived metadata"
-                    ))
+                    ));
                 }
             }
             .map_err(|error| error.to_string())?;
@@ -4266,11 +4879,17 @@ where
 {
     match error {
         ReplicatedTextSessionError::Contract(error) => ReplicatedTextSessionError::Contract(error),
+        ReplicatedTextSessionError::Partition(error) => {
+            ReplicatedTextSessionError::Partition(error)
+        }
         ReplicatedTextSessionError::Architecture(error) => {
             ReplicatedTextSessionError::Architecture(error)
         }
         ReplicatedTextSessionError::Policy(error) => ReplicatedTextSessionError::Policy(error),
         ReplicatedTextSessionError::Mechanism(error) => match error {},
+        ReplicatedTextSessionError::BeforeStateMutation(error) => {
+            ReplicatedTextSessionError::BeforeStateMutation(Box::new(widen_infallible(*error)))
+        }
         ReplicatedTextSessionError::State(error) => ReplicatedTextSessionError::State(error),
         ReplicatedTextSessionError::PromptCache(error) => {
             ReplicatedTextSessionError::PromptCache(error)

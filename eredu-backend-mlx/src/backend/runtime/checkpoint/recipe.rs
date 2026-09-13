@@ -255,7 +255,7 @@ pub fn recipe_dtype_from_mlx(value: Dtype) -> RecipeDtype {
     }
 }
 
-fn mlx_dtype(value: &RecipeDtype) -> Result<Dtype, WeightRecipeError> {
+pub(crate) fn mlx_dtype(value: &RecipeDtype) -> Result<Dtype, WeightRecipeError> {
     match value {
         RecipeDtype::Bool => Ok(Dtype::Bool),
         RecipeDtype::U8

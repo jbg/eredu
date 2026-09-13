@@ -122,6 +122,7 @@ impl eredu_architectures::PreparationMechanismProvider for MlxPreparationMechani
         eredu_core::ObservationMechanisms {
             activation_tensors: true,
             routing_tensors: true,
+            routed_unit_tensors: true,
             floating_to_f32: true,
         }
     }

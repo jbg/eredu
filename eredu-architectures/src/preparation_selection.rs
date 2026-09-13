@@ -424,8 +424,14 @@ where
             select_embedded_prediction_realization(inspection, extension, request, mechanisms)
         })
         .transpose()?;
-    let projected_inspection =
-        projection.map(|(target, _)| inspection.clone().map_architecture_plan(|_complete| target));
+    let projected_inspection = projection.map(|(target, _)| {
+        let target = if prediction_extension.is_some() {
+            target
+        } else {
+            target.without_prediction_extension()
+        };
+        inspection.clone().map_architecture_plan(|_complete| target)
+    });
     let execution_inspection = projected_inspection.as_ref().unwrap_or(inspection);
 
     let processor = select_processor(execution_inspection, &policy, mechanisms)?;
@@ -1145,6 +1151,9 @@ pub(crate) mod tests {
             .map(|constraint| {
                 let dtype = match constraint.dtype {
                     eredu_checkpoint::schema::StoredDtypeConstraint::Exact(
+                        eredu_checkpoint::StoredDtype::I32,
+                    ) => Dtype::I32,
+                    eredu_checkpoint::schema::StoredDtypeConstraint::Exact(
                         eredu_checkpoint::StoredDtype::U8,
                     ) => Dtype::U8,
                     eredu_checkpoint::schema::StoredDtypeConstraint::Exact(
@@ -1439,6 +1448,9 @@ pub(crate) mod tests {
             assert!(!sources.graph().source_identity().is_resolved());
             let discovery = sources.prepare_discovery(Default::default(), Default::default());
             assert!(!discovery.identity_is_resolved());
+            assert_eq!(discovery.execution_identity(), sources.execution_identity());
+            assert!(discovery.component_partition_layouts(0).unwrap().is_none());
+            let discovery = discovery.bind_partition_parameters(None).unwrap();
             let captured = discovery.capture().unwrap();
             assert!(sources.graph().source_identity().is_resolved());
             assert_eq!(
@@ -1607,93 +1619,260 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn v4_quantization_preserves_integer_and_nonprojection_parameters() {
+        use eredu_core::QuantizationRequest;
+        let base = serde_json::json!({
+            "model_type":"deepseek_v4", "hidden_size":64, "moe_intermediate_size":64,
+            "num_hidden_layers":2, "num_attention_heads":2, "num_key_value_heads":1,
+            "head_dim":32, "qk_rope_head_dim":16, "q_lora_rank":64, "o_lora_rank":32,
+            "o_groups":2, "vocab_size":64, "rms_norm_eps":0.000001,
+            "max_position_embeddings":128, "sliding_window":8,
+            "compress_ratios":[0,4,0], "index_n_heads":2, "index_head_dim":32,
+            "index_topk":2, "hc_mult":2, "hc_sinkhorn_iters":2,
+            "n_routed_experts":4, "n_shared_experts":1, "num_experts_per_tok":1,
+            "num_hash_layers":1, "norm_topk_prob":true, "routed_scaling_factor":1.0,
+            "num_nextn_predict_layers":1
+        });
+        for dspark in [false, true] {
+            let mut config = base.clone();
+            if dspark {
+                config["dspark_block_size"] = 2.into();
+                config["dspark_noise_token_id"] = 0.into();
+                config["dspark_target_layer_ids"] = serde_json::json!([0, 1]);
+                config["dspark_markov_rank"] = 32.into();
+            }
+            let (_root, inspection) = inspected_config(config);
+            for request in [NormalizedLoadRequest::default(), parallel_request()] {
+                let mechanisms = BoundedIndependentAdapter::with_transforms();
+                let mut quantized =
+                    NormalizedLoadRequest::with_quantization(QuantizationRequest::Affine {
+                        group_size: 32,
+                        bits: 4,
+                    });
+                if let Some(parallel) = request.parallel_execution() {
+                    quantized = quantized.with_parallel_execution(parallel).unwrap();
+                }
+                let selected = select_preparation(&inspection, &quantized, &mechanisms).unwrap();
+                let requirements = selected.text_realization().requirements();
+                let parameters = requirements
+                    .parameters()
+                    .iter()
+                    .chain(requirements.auxiliary_parameters())
+                    .map(|parameter| (parameter.name(), parameter))
+                    .collect::<std::collections::BTreeMap<_, _>>();
+                let mut preserved = vec![
+                    "layers.0.ffn.gate.tid2eid",
+                    "layers.1.attn.compressor.ape",
+                    "layers.1.attn.indexer.compressor.ape",
+                    "hc_head_fn",
+                    "layers.0.hc_attn_fn",
+                    "layers.0.hc_ffn_fn",
+                    "mtp.0.hc_attn_fn",
+                    "mtp.0.hc_ffn_fn",
+                    "mtp.0.hc_head_fn",
+                ];
+                if dspark {
+                    preserved.push("mtp.0.markov_head.markov_w1.weight");
+                }
+                for name in preserved {
+                    let parameter = parameters[name];
+                    for quantization in [
+                        QuantizationRequest::Affine {
+                            group_size: 32,
+                            bits: 4,
+                        },
+                        QuantizationRequest::MxFp4,
+                    ] {
+                        assert!(
+                            parameter.transform_target(quantization).unwrap().is_none(),
+                            "{name}"
+                        );
+                    }
+                    assert_eq!(
+                        parameter.native_executable(),
+                        eredu_checkpoint::LinearFormat::Dense
+                    );
+                }
+                for name in [
+                    "layers.0.attn.wo_a.weight",
+                    "layers.0.attn.wo_b.weight",
+                    "layers.1.attn.compressor.wkv.weight",
+                    "head.weight",
+                    if dspark {
+                        "mtp.0.main_proj.weight"
+                    } else {
+                        "mtp.0.e_proj.weight"
+                    },
+                ] {
+                    for quantization in [
+                        QuantizationRequest::Affine {
+                            group_size: 32,
+                            bits: 4,
+                        },
+                        QuantizationRequest::MxFp4,
+                    ] {
+                        assert!(
+                            parameters[name]
+                                .transform_target(quantization)
+                                .unwrap()
+                                .is_some(),
+                            "{name}"
+                        );
+                    }
+                }
+                for name in ["layers.0.ffn.gate.tid2eid"] {
+                    assert_eq!(
+                        parameters[name].source_encoding(),
+                        Some(&eredu_checkpoint::SourceTensorEncoding::Safetensors(
+                            eredu_checkpoint::StoredDtype::I32
+                        ))
+                    );
+                }
+                mechanisms.assert_cold_only();
+            }
+        }
+    }
+
+    #[test]
     fn independent_adapter_exercises_all_four_drafting_modes_and_prepared_roles() {
         use std::collections::BTreeSet;
 
-        for (drafting, expects_extension) in [
-            (DraftingLoadRequest::ArchitectureDefault, true),
-            (DraftingLoadRequest::Disabled, false),
-            (DraftingLoadRequest::embedded(1).unwrap(), true),
-            (DraftingLoadRequest::ExternalTarget, false),
+        let v4 = serde_json::json!({
+            "model_type":"deepseek_v4", "hidden_size":16, "moe_intermediate_size":8,
+            "num_hidden_layers":2, "num_attention_heads":2, "num_key_value_heads":1,
+            "head_dim":8, "qk_rope_head_dim":4, "q_lora_rank":8, "o_lora_rank":8,
+            "o_groups":2, "vocab_size":32, "rms_norm_eps":0.000001,
+            "max_position_embeddings":128, "sliding_window":8,
+            "compress_ratios":[0,4,0], "index_n_heads":2, "index_head_dim":4,
+            "index_topk":2, "hc_mult":2, "hc_sinkhorn_iters":2,
+            "n_routed_experts":4, "n_shared_experts":1, "num_experts_per_tok":1,
+            "num_hash_layers":1, "norm_topk_prob":true, "routed_scaling_factor":1.0,
+            "num_nextn_predict_layers":1
+        });
+        let mut dspark = v4.clone();
+        dspark["dspark_block_size"] = 2.into();
+        dspark["dspark_noise_token_id"] = 0.into();
+        dspark["dspark_target_layer_ids"] = serde_json::json!([0, 1]);
+        dspark["dspark_markov_rank"] = 4.into();
+        for (config, roles) in [
+            (prediction_config(), vec!["embedding".to_owned()]),
+            (v4, vec!["embedding".to_owned(), "output".to_owned()]),
+            (dspark, vec!["embedding".to_owned(), "output".to_owned()]),
         ] {
-            let (_root, inspection) = inspected_config(prediction_config());
-            let request = NormalizedLoadRequest::default().with_drafting(drafting);
-            let mechanisms = BoundedIndependentAdapter::default();
-            let selected = select_preparation(&inspection, &request, &mechanisms).unwrap();
-            assert_eq!(selected.prediction_extension().is_some(), expects_extension);
-            assert_eq!(
-                selected.prediction_realization().is_some(),
-                expects_extension
-            );
-            assert_eq!(
-                mechanisms.counters.speculative_queries.get(),
-                usize::from(expects_extension)
-            );
-
-            let plan = eredu_core::plan_model_preparation(
-                inspection,
-                request.preparation_policy().unwrap(),
-                selected.session_capabilities(),
-            )
-            .unwrap();
-            let sources = crate::prepared_sources::prepare_model_sources(plan, selected).unwrap();
-            assert_eq!(sources.format(), ArtifactFormat::SafeTensors);
-            assert_eq!(
-                sources.execution_identity(),
-                sources
-                    .selected()
-                    .text_realization()
-                    .requirements()
-                    .architecture_identity()
-            );
-            assert_ne!(sources.source_identity().unwrap().digest(), [0; 32]);
-            assert!(sources.companions().next().is_none());
-            assert_eq!(sources.prediction_extension().is_some(), expects_extension);
-            let primary = sources
-                .primary()
-                .source_keys()
-                .into_iter()
-                .collect::<BTreeSet<_>>();
-            let complete = sources
-                .complete()
-                .source_keys()
-                .into_iter()
-                .collect::<BTreeSet<_>>();
-            let target = sources
-                .target()
-                .source_keys()
-                .into_iter()
-                .collect::<BTreeSet<_>>();
-            assert_eq!(primary, complete);
-            assert!(target.is_subset(&complete));
-            if let Some(extension) = sources.extension() {
-                let extension = extension.source_keys().into_iter().collect::<BTreeSet<_>>();
-                assert!(!extension.is_empty());
-                assert!(target.is_disjoint(&extension));
+            for (drafting, expects_extension) in [
+                (DraftingLoadRequest::ArchitectureDefault, true),
+                (DraftingLoadRequest::Disabled, false),
+                (DraftingLoadRequest::embedded(1).unwrap(), true),
+                (DraftingLoadRequest::ExternalTarget, false),
+            ] {
+                let (_root, inspection) = inspected_config(config.clone());
+                let request = NormalizedLoadRequest::default().with_drafting(drafting);
+                let mechanisms = BoundedIndependentAdapter::default();
+                let selected = select_preparation(&inspection, &request, &mechanisms).unwrap();
+                assert_eq!(selected.prediction_extension().is_some(), expects_extension);
                 assert_eq!(
-                    target.union(&extension).cloned().collect::<BTreeSet<_>>(),
-                    complete
+                    selected
+                        .text_realization()
+                        .requirements()
+                        .replicated_static_roles(),
+                    if expects_extension {
+                        roles.clone()
+                    } else {
+                        vec![]
+                    },
                 );
-            } else {
-                assert_eq!(target, complete);
-            }
-            assert_eq!(
-                sources
+                assert_eq!(
+                    selected.prediction_realization().is_some(),
+                    expects_extension
+                );
+                assert_eq!(
+                    mechanisms.counters.speculative_queries.get(),
+                    usize::from(expects_extension)
+                );
+
+                let plan = eredu_core::plan_model_preparation(
+                    inspection,
+                    request.preparation_policy().unwrap(),
+                    selected.session_capabilities(),
+                )
+                .unwrap();
+                let sources =
+                    crate::prepared_sources::prepare_model_sources(plan, selected).unwrap();
+                assert_eq!(sources.format(), ArtifactFormat::SafeTensors);
+                assert_eq!(
+                    sources.execution_identity(),
+                    sources
+                        .selected()
+                        .text_realization()
+                        .requirements()
+                        .architecture_identity()
+                );
+                assert_ne!(sources.source_identity().unwrap().digest(), [0; 32]);
+                assert!(sources.companions().next().is_none());
+                assert_eq!(sources.prediction_extension().is_some(), expects_extension);
+                let primary = sources
                     .primary()
-                    .source_diagnostics()
-                    .unwrap()
-                    .physical_reads,
-                0
-            );
-            assert_eq!(
-                sources
+                    .source_keys()
+                    .into_iter()
+                    .collect::<BTreeSet<_>>();
+                let complete = sources
+                    .complete()
+                    .source_keys()
+                    .into_iter()
+                    .collect::<BTreeSet<_>>();
+                let target = sources
                     .target()
-                    .source_diagnostics()
-                    .unwrap()
-                    .physical_reads,
-                0
-            );
-            mechanisms.assert_cold_only();
+                    .source_keys()
+                    .into_iter()
+                    .collect::<BTreeSet<_>>();
+                assert_eq!(primary, complete);
+                assert!(target.is_subset(&complete));
+                if let Some(extension) = sources.extension() {
+                    let extension = extension.source_keys().into_iter().collect::<BTreeSet<_>>();
+                    assert!(!extension.is_empty());
+                    assert!(target.is_disjoint(&extension));
+                    assert_eq!(
+                        target.union(&extension).cloned().collect::<BTreeSet<_>>(),
+                        complete
+                    );
+                } else {
+                    assert_eq!(target, complete);
+                }
+                assert_eq!(
+                    sources
+                        .primary()
+                        .source_diagnostics()
+                        .unwrap()
+                        .physical_reads,
+                    0
+                );
+                assert_eq!(
+                    sources
+                        .target()
+                        .source_diagnostics()
+                        .unwrap()
+                        .physical_reads,
+                    0
+                );
+                // Source preparation must retain the same requirements that the
+                // typed construction driver will revalidate, including disabled
+                // auxiliary roles on a prediction-bearing artifact.
+                let (selected, inspection, graph) = sources.into_parts();
+                let execution = inspection.map_architecture_plan(|_| graph.architecture().clone());
+                let expected =
+                    crate::replicated_text::replicated_text_execution_class(&execution).unwrap();
+                let expected = match expected {
+                    crate::replicated_text::ReplicatedTextExecutionClass::Replicated(text) => text,
+                    crate::replicated_text::ReplicatedTextExecutionClass::Routed(routed) => {
+                        routed.text().clone()
+                    }
+                    crate::replicated_text::ReplicatedTextExecutionClass::Composite(composite) => {
+                        composite.execution().clone()
+                    }
+                };
+                assert_eq!(selected.text_realization().requirements(), &expected);
+                mechanisms.assert_cold_only();
+            }
         }
     }
 

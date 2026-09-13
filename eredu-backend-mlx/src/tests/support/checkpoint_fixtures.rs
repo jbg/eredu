@@ -69,7 +69,10 @@ text_checkpoint_template!(
 #[derive(eredu_nn::Parameterized)]
 #[parameterized(tensor = "crate::MlxTensor")]
 pub(crate) struct QwenHybridCheckpointTemplate {
-    pub static_modules: eredu_architectures::decoder::StaticModules<MlxNeuralBackend>,
+    pub static_modules: <hybrid::LayeredModel<MlxNeuralBackend> as LayeredArchitecture<
+        MlxNeuralBackend,
+        MlxHybridState,
+    >>::StaticModules,
     pub units: Vec<hybrid::Unit<MlxNeuralBackend>>,
 }
 
@@ -90,7 +93,7 @@ impl QwenHybridCheckpointTemplate {
             })
             .collect::<Result<Vec<_>, _>>()?;
         Ok(Self {
-            static_modules: architecture.into_static_modules(),
+            static_modules: architecture.into_extended_static_modules(),
             units,
         })
     }

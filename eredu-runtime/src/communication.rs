@@ -8,11 +8,15 @@
 use std::{collections::BTreeSet, ops::Range};
 
 use eredu_core::{
-    checkpoint::TensorDtype, consensus::ConsensusTransport, CollectiveGroupDescriptor,
-    CollectiveGroupId, CompletionCancellationMode, ParallelAxis, ParallelRankTopology,
-    ParallelTopology,
+    CollectiveGroupDescriptor, CollectiveGroupId, CompletionCancellationMode, ParallelAxis,
+    ParallelRankTopology, ParallelTopology, checkpoint::TensorDtype, consensus::ConsensusTransport,
 };
 use serde::{Deserialize, Serialize};
+
+mod session_identity;
+pub use session_identity::{
+    AgreedCommunicationSession, CommunicationSessionIdentity, establish_communication_session,
+};
 
 /// Exact rank-local send and receive element counts for a variable exchange.
 ///
@@ -1239,6 +1243,7 @@ pub struct TopologyCommunicationPlan {
     pipeline_groups: Option<CommunicationGroupRequirements>,
     expert_groups: Option<CommunicationGroupRequirements>,
     data_groups: Option<CommunicationGroupRequirements>,
+    pipeline_stage_groups: Option<CommunicationGroupRequirements>,
     pipeline_routes: Option<CommunicationOperationRequirement>,
     completion: Option<CommunicationCompletionPolicy>,
 }
@@ -1252,6 +1257,7 @@ impl TopologyCommunicationPlan {
             pipeline_groups: None,
             expert_groups: None,
             data_groups: None,
+            pipeline_stage_groups: None,
             pipeline_routes: None,
             completion: None,
         }
@@ -1336,6 +1342,16 @@ impl TopologyCommunicationPlan {
         self
     }
 
+    /// Requests all tensor and expert ranks at each fixed pipeline/data coordinate.
+    /// These groups follow the axis groups, preserving existing opaque axis IDs.
+    pub fn with_pipeline_stage_groups(
+        mut self,
+        requirements: CommunicationGroupRequirements,
+    ) -> Self {
+        self.pipeline_stage_groups = Some(requirements);
+        self
+    }
+
     /// Requests directed routes between adjacent pipeline coordinates.
     pub fn with_pipeline_routes(
         mut self,
@@ -1409,6 +1425,28 @@ pub fn project_communication_manifest(
         next_group_id = next_group_id
             .checked_add(axis_groups.len())
             .ok_or(CommunicationManifestError::DescriptorCountOverflow)?;
+    }
+
+    if let Some(requirements) = &plan.pipeline_stage_groups {
+        let width = topology
+            .tensor()
+            .checked_mul(topology.expert())
+            .ok_or(CommunicationManifestError::DescriptorCountOverflow)?;
+        let stage = rank.global_rank() / width;
+        let start = stage * width;
+        let numeric = next_group_id
+            .checked_add(stage)
+            .ok_or(CommunicationManifestError::DescriptorCountOverflow)?;
+        groups.push(CommunicationGroupDescriptor::new(
+            CollectiveGroupId::new(
+                u32::try_from(numeric)
+                    .map_err(|_| CommunicationManifestError::DescriptorCountOverflow)?,
+            ),
+            groups.len(),
+            (start..start + width).collect(),
+            Some(rank.global_rank() - start),
+            requirements.clone(),
+        )?);
     }
 
     let mut routes = Vec::new();
@@ -1564,14 +1602,35 @@ pub fn validate_compatible_communication_manifests(
 pub fn validate_communication_manifest_consensus<T: ConsensusTransport>(
     transport: &T,
     local: &CommunicationManifest,
-) -> Result<Vec<CommunicationManifest>, CommunicationManifestConsensusError> {
+) -> Result<Vec<CommunicationManifest>, CommunicationManifestConsensusError<T::Error>> {
+    let encoded = serde_json::to_vec(local)
+        .map_err(|error| CommunicationManifestConsensusError::Encoding(error.to_string()))?;
+    let manifests = gather_communication_payloads(transport, &encoded, false)?
+        .into_iter()
+        .enumerate()
+        .map(|(rank, bytes)| {
+            serde_json::from_slice(&bytes).map_err(|error| {
+                CommunicationManifestConsensusError::InvalidEncoding {
+                    rank,
+                    message: error.to_string(),
+                }
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    validate_compatible_communication_manifests(&manifests)?;
+    Ok(manifests)
+}
+
+fn gather_communication_payloads<T: ConsensusTransport>(
+    transport: &T,
+    encoded: &[u8],
+    bounded: bool,
+) -> Result<Vec<Vec<u8>>, CommunicationManifestConsensusError<T::Error>> {
     let participants = transport.participant_count();
     if participants == 0 {
         return Err(CommunicationManifestConsensusError::EmptyTopology);
     }
 
-    let encoded = serde_json::to_vec(local)
-        .map_err(|error| CommunicationManifestConsensusError::Encoding(error.to_string()))?;
     let encoded_len = u64::try_from(encoded.len()).map_err(|_| {
         CommunicationManifestConsensusError::MetadataOverflow("encoded manifest length")
     })?;
@@ -1591,6 +1650,22 @@ pub fn validate_communication_manifest_consensus<T: ConsensusTransport>(
             })
         })
         .collect::<Result<Vec<_>, _>>()?;
+    if bounded {
+        const PER_RANK: usize = 16 * 1024 * 1024;
+        const TOTAL: usize = 128 * 1024 * 1024;
+        let largest = lengths.iter().copied().max().unwrap_or(0);
+        if largest > PER_RANK
+            || words_for_bytes(largest)
+                .checked_mul(4)
+                .and_then(|padded| padded.checked_mul(participants))
+                .is_none_or(|n| n > TOTAL)
+        {
+            return Err(CommunicationManifestConsensusError::MetadataLimit {
+                per_rank: PER_RANK,
+                total: TOTAL,
+            });
+        }
+    }
     let payload_words = lengths
         .iter()
         .copied()
@@ -1601,7 +1676,7 @@ pub fn validate_communication_manifest_consensus<T: ConsensusTransport>(
     let gathered_payloads =
         gather_manifest_words(transport, &local_words, participants, "manifest payloads")?;
 
-    let mut manifests = Vec::with_capacity(participants);
+    let mut payloads = Vec::with_capacity(participants);
     for (rank, &length) in lengths.iter().enumerate() {
         let available = payload_words.checked_mul(4).ok_or(
             CommunicationManifestConsensusError::MetadataOverflow("manifest payload bytes"),
@@ -1624,16 +1699,10 @@ pub fn validate_communication_manifest_consensus<T: ConsensusTransport>(
             bytes.extend_from_slice(&word.to_le_bytes());
         }
         bytes.truncate(length);
-        manifests.push(serde_json::from_slice(&bytes).map_err(|error| {
-            CommunicationManifestConsensusError::InvalidEncoding {
-                rank,
-                message: error.to_string(),
-            }
-        })?);
+        payloads.push(bytes);
     }
 
-    validate_compatible_communication_manifests(&manifests)?;
-    Ok(manifests)
+    Ok(payloads)
 }
 
 fn words_for_bytes(bytes: usize) -> usize {
@@ -1656,13 +1725,13 @@ fn gather_manifest_words<T: ConsensusTransport>(
     local: &[u32],
     participants: usize,
     stage: &'static str,
-) -> Result<Vec<u32>, CommunicationManifestConsensusError> {
+) -> Result<Vec<u32>, CommunicationManifestConsensusError<T::Error>> {
     let expected = local.len().checked_mul(participants).ok_or(
         CommunicationManifestConsensusError::MetadataOverflow("gathered manifest word count"),
     )?;
     let gathered = transport
         .all_gather_words(local)
-        .map_err(|error| CommunicationManifestConsensusError::Transport(error.to_string()))?;
+        .map_err(CommunicationManifestConsensusError::Transport)?;
     if gathered.len() != expected {
         return Err(CommunicationManifestConsensusError::MalformedGather {
             stage,
@@ -1988,7 +2057,7 @@ impl CommunicationCapabilities {
             _ => {
                 return Err(CommunicationCapabilityError::InsufficientLimits {
                     operation: requirement.operation(),
-                })
+                });
             }
         }
         if requirement.exact_completion() && !capability.exact_completion() {
@@ -2184,7 +2253,7 @@ pub enum CommunicationManifestError {
 /// Failure while exchanging or validating complete rank-local manifests.
 #[derive(Debug, Clone, Eq, PartialEq, thiserror::Error)]
 #[non_exhaustive]
-pub enum CommunicationManifestConsensusError {
+pub enum CommunicationManifestConsensusError<E = std::convert::Infallible> {
     /// A consensus topology cannot be empty.
     #[error("communication manifest consensus topology has no participants")]
     EmptyTopology,
@@ -2194,9 +2263,27 @@ pub enum CommunicationManifestConsensusError {
     /// The local manifest could not be encoded.
     #[error("communication manifest encoding failed: {0}")]
     Encoding(String),
+    /// Agreed frame sizes exceed the fixed session-setup admission bounds.
+    #[error(
+        "communication session metadata exceeds {per_rank} bytes per rank or {total} gathered bytes"
+    )]
+    MetadataLimit {
+        /// Maximum serialized bytes in one proposal.
+        per_rank: usize,
+        /// Maximum padded rank-major serialized payload.
+        total: usize,
+    },
+    /// Session metadata could not establish a fresh common setup identity.
+    #[error("communication session proposal at rank {rank} is invalid: {reason}")]
+    InvalidSessionProposal {
+        /// First invalid proposal in world-rank order.
+        rank: usize,
+        /// Version or nonce validation failure.
+        reason: &'static str,
+    },
     /// The control-plane collective failed.
     #[error("communication manifest consensus transport failed: {0}")]
-    Transport(String),
+    Transport(#[source] E),
     /// An equal-word gather returned a malformed rank-major frame.
     #[error(
         "communication manifest {stage} gather returned {actual} words; expected {expected} for {participants} ranks"
@@ -2422,6 +2509,49 @@ mod tests {
             .with_data_groups(group_requirements(CommunicationOperation::AllGatherEven))
             .with_pipeline_routes(route_requirement())
             .unwrap()
+    }
+
+    #[test]
+    fn pipeline_stage_groups_join_tensor_expert_replicas_and_preserve_axis_authority() {
+        let requirements = CommunicationGroupRequirements::new([
+            CommunicationOperationRequirement::failure_agreement(true),
+        ])
+        .unwrap();
+        for (tensor, pipeline, expert, data) in [(1, 2, 2, 1), (2, 2, 2, 1), (3, 3, 2, 2)] {
+            let topology = ParallelTopology::new(tensor, pipeline, expert, data).unwrap();
+            let original = projection_plan();
+            let baseline = project_all_communication_manifests(topology, &original).unwrap();
+            let plan = original.with_pipeline_stage_groups(requirements.clone());
+            let manifests = project_all_communication_manifests(topology, &plan).unwrap();
+            for (rank, (manifest, before)) in manifests.iter().zip(&baseline).enumerate() {
+                assert_eq!(&manifest.groups()[..before.groups().len()], before.groups());
+                let group = manifest.groups().last().unwrap();
+                let owner = topology.coordinates(rank).unwrap();
+                let expected = (0..topology.world_size())
+                    .filter(|other| {
+                        let other = topology.coordinates(*other).unwrap();
+                        other.pipeline() == owner.pipeline() && other.data() == owner.data()
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(group.members(), expected);
+                assert_eq!(
+                    group.local_index(),
+                    expected.iter().position(|member| *member == rank)
+                );
+                assert_eq!(group.requirements(), &requirements);
+                assert_eq!(
+                    plan.tensor_group_id(
+                        topology,
+                        ParallelRankTopology::new(topology, rank).unwrap()
+                    )
+                    .unwrap(),
+                    manifest
+                        .groups()
+                        .first()
+                        .map(CommunicationGroupDescriptor::id)
+                );
+            }
+        }
     }
 
     fn publication_requirements() -> CommunicationGroupRequirements {
@@ -3175,12 +3305,14 @@ mod tests {
             CommunicationTopologyCapabilities::RingWithWorldWaves,
         )
         .unwrap();
-        assert!(prepared
-            .manifest()
-            .routes()
-            .iter()
-            .enumerate()
-            .all(|(order, _)| prepared.route_world_wave(order) == Some(true)));
+        assert!(
+            prepared
+                .manifest()
+                .routes()
+                .iter()
+                .enumerate()
+                .all(|(order, _)| prepared.route_world_wave(order) == Some(true))
+        );
 
         let calls = std::cell::Cell::new(0usize);
         let routes = prepared

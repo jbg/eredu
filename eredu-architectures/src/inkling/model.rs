@@ -5,8 +5,8 @@ use std::sync::Arc;
 use eredu_core::cache::PromptCacheTopology;
 use eredu_nn::{
     AuxiliaryConvolutionState, EmbeddingLookupPolicy, EmbeddingOperator, EmbeddingSpec, Error,
-    GroupedNeuralBackend, Index, LinearOperator, LinearSpec, NormalizationConstructionSpec,
-    NormalizationOperator, ParameterSpec, Parameterized, Tensor,
+    GroupedNeuralBackend, Index, LinearSpec, NormalizationConstructionSpec, NormalizationOperator,
+    ParameterSpec, Parameterized, Tensor,
 };
 use eredu_runtime::{
     ArchitectureParameterDescription, ExecutionGraph, ExecutionUnitLayout, ExpertPass,
@@ -242,6 +242,23 @@ impl<T> PreparedInput<T> {
     }
 }
 
+fn prepared_semantic_tokens<T: Tensor>(
+    input: PreparedCompositeInput<'_, T, InklingInputPartPlan>,
+    context: &T::Context,
+) -> Result<Vec<T>, Error> {
+    crate::composite_execution::prepared_token_parts(input, context, |plan| match plan {
+        InklingInputPartPlan::TextTokens { .. } => None,
+        InklingInputPartPlan::Projected {
+            placeholder_token_id,
+            positions,
+            ..
+        } => Some((*placeholder_token_id, *positions)),
+        InklingInputPartPlan::Media { ingress, .. } => {
+            Some((ingress.placeholder_token_id, ingress.placeholder_count))
+        }
+    })
+}
+
 /// Materializes placeholders, retained media extents, and ordered segments from
 /// an architecture admission.
 pub fn prepare_input<T: Tensor>(
@@ -256,7 +273,7 @@ pub fn prepare_input<T: Tensor>(
         ));
     }
 
-    let mut tokens = Vec::with_capacity(prepared.len());
+    let tokens = prepared_semantic_tokens(input, context)?;
     let mut modalities = Vec::with_capacity(prepared.len());
     let mut projected = Vec::with_capacity(prepared.len());
     let mut images = Vec::new();
@@ -265,30 +282,16 @@ pub fn prepare_input<T: Tensor>(
     for (part, plan) in prepared.parts().iter().zip(admitted.parts()) {
         match plan {
             InklingInputPartPlan::TextTokens { .. } => {
-                let eredu_runtime::PreparedInputPayload::TokenIds(value) = part.payload() else {
-                    return Err(Error::backend(
-                        "Inkling admitted text part lost its token payload",
-                    ));
-                };
-                tokens.push(value.clone());
                 modalities.push(eredu_core::InputModality::Text);
                 projected.push(None);
             }
-            InklingInputPartPlan::Projected {
-                modality,
-                placeholder_token_id,
-                positions,
-            } => {
+            InklingInputPartPlan::Projected { modality, .. } => {
                 let eredu_runtime::PreparedInputPayload::Embeddings(value) = part.payload() else {
                     return Err(Error::backend(
                         "Inkling admitted projected part lost its embedding payload",
                     ));
                 };
-                let count = i32::try_from(*positions)
-                    .map_err(|_| Error::backend("Inkling projected span exceeds I32"))?;
-                let token = i32::try_from(*placeholder_token_id)
-                    .map_err(|_| Error::backend("Inkling placeholder ID exceeds I32"))?;
-                tokens.push(T::full_i32(token, &[1, count], context)?);
+
                 modalities.push(*modality);
                 projected.push(Some(value.clone()));
             }
@@ -302,9 +305,7 @@ pub fn prepare_input<T: Tensor>(
                 };
                 let count = i32::try_from(ingress.placeholder_count)
                     .map_err(|_| Error::backend("Inkling media span exceeds I32"))?;
-                let token = i32::try_from(ingress.placeholder_token_id)
-                    .map_err(|_| Error::backend("Inkling placeholder ID exceeds I32"))?;
-                tokens.push(T::full_i32(token, &[1, count], context)?);
+
                 modalities.push(*modality);
                 projected.push(None);
                 match modality {
@@ -371,6 +372,13 @@ where
         crate::media_plan::admit_inkling_input(config, input, inspector)
     }
 
+    fn prepared_prediction_token_ids(
+        input: PreparedCompositeInput<'_, B::Tensor, Self::InputPartPlan>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Error> {
+        B::Tensor::concatenate(&prepared_semantic_tokens(input, context)?, 1, context)
+    }
+
     fn should_execute_prepared_group(
         &self,
         group: usize,
@@ -421,28 +429,20 @@ where
         input: PreparedCompositeInput<'_, B::Tensor, Self::InputPartPlan>,
         tensor_partitions: usize,
     ) -> Result<Option<Vec<crate::composite_execution::CompositeTensorCollective>>, String> {
-        if tensor_partitions <= 1 {
-            return Ok(None);
-        }
-        input
-            .admitted()
-            .parts()
-            .iter()
-            .filter_map(|part| match part {
-                InklingInputPartPlan::TextTokens { positions } => Some(*positions),
-                InklingInputPartPlan::Projected { .. } | InklingInputPartPlan::Media { .. } => None,
-            })
-            .map(|positions| {
-                i32::try_from(positions)
-                    .map(
-                        |positions| crate::composite_execution::CompositeTensorCollective::Sum {
-                            shape: vec![1, positions, self.args.text_config.hidden_size],
-                        },
-                    )
-                    .map_err(|_| "Inkling text ingress positions exceed i32".to_owned())
-            })
-            .collect::<Result<Vec<_>, _>>()
-            .map(Some)
+        crate::composite_execution::segmented_token_ingress_collectives(
+            input
+                .admitted()
+                .parts()
+                .iter()
+                .filter_map(|part| match part {
+                    InklingInputPartPlan::TextTokens { positions } => Some(*positions),
+                    InklingInputPartPlan::Projected { .. } | InklingInputPartPlan::Media { .. } => {
+                        None
+                    }
+                }),
+            self.args.text_config.hidden_size,
+            tensor_partitions,
+        )
     }
 
     fn routed_tensor_output_width(&self) -> Result<Option<usize>, Self::Error> {
@@ -537,6 +537,13 @@ where
     S: LayerRuntimeState<B>,
     S::LayerState: AuxiliaryConvolutionState<B::Tensor>,
 {
+    fn routed_unit_observations(&self) -> bool {
+        true
+    }
+    fn routed_sparse_observations(&self) -> bool {
+        true
+    }
+
     fn forward_unit_with_provider<P>(
         &mut self,
         group: usize,
@@ -566,6 +573,60 @@ where
         }
         Ok(output)
     }
+
+    fn forward_unit_observed_with_provider<P, O>(
+        &mut self,
+        group: usize,
+        index: usize,
+        unit: &mut Self::Unit,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &mut Self::ForwardContext,
+        pass: ExpertPass,
+        provider: &mut P,
+        context: &<B::Tensor as Tensor>::Context,
+        observer: &mut O,
+    ) -> Result<B::Tensor, Self::Error>
+    where
+        P: eredu_runtime::RoutedExpertProvider<B>,
+        P::Error: std::fmt::Display,
+        O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
+    {
+        let output = match (group, unit) {
+            (2, Unit::Text(unit)) => {
+                let path = format!("model.layers.{index}");
+                let mut observer = eredu_runtime::BorrowedActivationObserver(observer);
+                let observed_embedding = if index == 0 {
+                    Some(
+                        crate::decoder::ComponentInstrumentation::new("readout", &mut observer)
+                            .apply("embedding", hidden.clone())?,
+                    )
+                } else {
+                    None
+                };
+                let hidden = observed_embedding.as_ref().unwrap_or(hidden);
+                unit.forward_with_provider_instrumented(
+                    hidden,
+                    Some(
+                        state
+                            .layer(self.local_state_ordinal(index)?)
+                            .map_err(Error::backend)?,
+                    ),
+                    pass,
+                    provider,
+                    context,
+                    &mut crate::decoder::ComponentInstrumentation::new(&path, &mut observer),
+                )
+            }
+            (_, unit) => <Self as LayeredArchitecture<B, S>>::forward_unit(
+                self, group, index, unit, hidden, state, forward, context,
+            ),
+        }?;
+        if group == 2 && index + 1 == self.args.text_config.num_hidden_layers as usize {
+            forward.capture_target_hidden(output.clone());
+        }
+        Ok(output)
+    }
 }
 
 impl<B, S> ParallelRoutedLayeredArchitecture<B, S> for LayeredModel<B>
@@ -574,6 +635,13 @@ where
     S: LayerRuntimeState<B>,
     S::LayerState: AuxiliaryConvolutionState<B::Tensor>,
 {
+    fn parallel_routed_unit_observations(&self) -> bool {
+        true
+    }
+    fn parallel_routed_sparse_observations(&self) -> bool {
+        true
+    }
+
     fn forward_unit_parallel_with_provider<P>(
         &mut self,
         group: usize,
@@ -595,6 +663,62 @@ where
             (2, Unit::Text(unit)) => self.forward_text_unit_parallel_with_provider(
                 index, unit, hidden, state, pass, provider, parallel, context,
             ),
+            (_, unit) => <Self as ParallelLayeredArchitecture<B, S>>::forward_unit_parallel(
+                self, group, index, unit, hidden, state, forward, parallel, context,
+            ),
+        }?;
+        if group == 2 && index + 1 == self.args.text_config.num_hidden_layers as usize {
+            forward.capture_target_hidden(output.clone());
+        }
+        Ok(output)
+    }
+
+    fn forward_unit_parallel_observed_with_provider<P, O>(
+        &mut self,
+        group: usize,
+        index: usize,
+        unit: &mut Self::Unit,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &mut Self::ForwardContext,
+        pass: ExpertPass,
+        provider: &mut P,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+        observer: &mut O,
+    ) -> Result<B::Tensor, Self::Error>
+    where
+        P: eredu_runtime::TensorParallelRoutedExpertProvider<B>,
+        P::Error: std::fmt::Display,
+        O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
+    {
+        let output = match (group, unit) {
+            (2, Unit::Text(unit)) => {
+                let path = format!("model.layers.{index}");
+                let mut observer = eredu_runtime::BorrowedActivationObserver(observer);
+                let observed_embedding = if index == 0 {
+                    Some(
+                        crate::decoder::ComponentInstrumentation::new("readout", &mut observer)
+                            .apply("embedding", hidden.clone())?,
+                    )
+                } else {
+                    None
+                };
+                let hidden = observed_embedding.as_ref().unwrap_or(hidden);
+                unit.forward_parallel_with_provider_instrumented(
+                    hidden,
+                    Some(
+                        state
+                            .layer(self.local_state_ordinal(index)?)
+                            .map_err(Error::backend)?,
+                    ),
+                    pass,
+                    provider,
+                    parallel,
+                    context,
+                    &mut crate::decoder::ComponentInstrumentation::new(&path, &mut observer),
+                )
+            }
             (_, unit) => <Self as ParallelLayeredArchitecture<B, S>>::forward_unit_parallel(
                 self, group, index, unit, hidden, state, forward, parallel, context,
             ),
@@ -1395,19 +1519,12 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
         hidden: &B::Tensor,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
-        let hidden = self.final_mtp_parallel_hidden(hidden, context)?;
-        let logits = self.static_modules.output.forward(&hidden, context)?;
-        let vocabulary = self
-            .args
-            .text_config
-            .unpadded_vocab_size
-            .unwrap_or(self.args.text_config.vocab_size);
-        if vocabulary == self.args.text_config.vocab_size {
-            return Ok(logits);
-        }
-        let mut indexes = vec![Index::Full; logits.shape().len()];
-        *indexes.last_mut().expect("logits have vocabulary axis") = Index::Range(0, vocabulary);
-        logits.index(&indexes, context)
+        self.project_mtp_logits_instrumented(
+            hidden,
+            None,
+            context,
+            &mut crate::decoder::ComponentInstrumentation::disabled(),
+        )
     }
 
     /// Applies the rank-local output projection to one MTP hidden state.
@@ -1417,19 +1534,85 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
         parallel: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
-        if self.parallel_geometry.is_none() {
+        self.project_mtp_logits_instrumented(
+            hidden,
+            Some(parallel),
+            context,
+            &mut crate::decoder::ComponentInstrumentation::disabled(),
+        )
+    }
+
+    /// Observes the actual muP-scaled MTP vocabulary input and effective scores.
+    pub fn project_mtp_logits_instrumented(
+        &mut self,
+        hidden: &B::Tensor,
+        parallel: Option<&B::ParallelContext>,
+        context: &<B::Tensor as Tensor>::Context,
+        instrumentation: &mut crate::decoder::ComponentInstrumentation<'_, B::Tensor>,
+    ) -> Result<B::Tensor, Error> {
+        if parallel.is_some() && self.parallel_geometry.is_none() {
             return Err(Error::backend(
                 "Inkling model was not built with local geometry",
             ));
         }
         let hidden = self.final_mtp_parallel_hidden(hidden, context)?;
-        let logits = B::vocabulary_parallel_project(
-            &mut self.static_modules.output,
-            &hidden,
-            parallel,
+        instrumentation.observe("scaled", &hidden)?;
+        let logits = match parallel {
+            Some(parallel) => instrumentation.project_vocabulary::<B>(
+                "projection_input",
+                &mut self.static_modules.output,
+                &hidden,
+                parallel,
+                context,
+            )?,
+            None => instrumentation.project::<B>(
+                "projection_input",
+                &mut self.static_modules.output,
+                &hidden,
+                None,
+                context,
+            )?,
+        };
+        instrumentation.apply("linear", self.trim_logits(logits, context)?)
+    }
+
+    fn target_logits_instrumented(
+        &mut self,
+        hidden: &B::Tensor,
+        parallel: Option<&B::ParallelContext>,
+        context: &<B::Tensor as Tensor>::Context,
+        instrumentation: &mut crate::decoder::ComponentInstrumentation<'_, B::Tensor>,
+    ) -> Result<B::Tensor, Error> {
+        if parallel.is_some() && self.parallel_geometry.is_none() {
+            return Err(Error::backend(
+                "Inkling model was not built with local geometry",
+            ));
+        }
+        let hidden = instrumentation.apply("residual", hidden.clone())?;
+        let normalized = self.static_modules.final_norm.forward(&hidden, context)?;
+        let normalized = instrumentation.apply("normalized", normalized)?;
+        let scaled = normalized.multiply_scalar(
+            self.args.text_config.logits_mup_width_multiplier.recip(),
             context,
         )?;
-        self.trim_logits(logits, context)
+        instrumentation.observe("scaled", &scaled)?;
+        let logits = match parallel {
+            Some(parallel) => instrumentation.project_vocabulary::<B>(
+                "projection_input",
+                &mut self.static_modules.output,
+                &scaled,
+                parallel,
+                context,
+            )?,
+            None => instrumentation.project::<B>(
+                "projection_input",
+                &mut self.static_modules.output,
+                &scaled,
+                None,
+                context,
+            )?,
+        };
+        instrumentation.apply("linear", self.trim_logits(logits, context)?)
     }
 
     /// Applies final target normalization and the rank-local output projection.
@@ -1439,23 +1622,12 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
         parallel: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
-        if self.parallel_geometry.is_none() {
-            return Err(Error::backend(
-                "Inkling model was not built with local geometry",
-            ));
-        }
-        let hidden = self.static_modules.final_norm.forward(hidden, context)?;
-        let hidden = hidden.multiply_scalar(
-            self.args.text_config.logits_mup_width_multiplier.recip(),
+        self.target_logits_instrumented(
+            hidden,
+            Some(parallel),
             context,
-        )?;
-        let logits = B::vocabulary_parallel_project(
-            &mut self.static_modules.output,
-            &hidden,
-            parallel,
-            context,
-        )?;
-        self.trim_logits(logits, context)
+            &mut crate::decoder::ComponentInstrumentation::disabled(),
+        )
     }
 
     /// Executes one text unit while delegating routed and shared banks to runtime residency.
@@ -1668,6 +1840,10 @@ where
     S: LayerRuntimeState<B>,
     S::LayerState: AuxiliaryConvolutionState<B::Tensor>,
 {
+    fn observation_hooks(&self) -> eredu_runtime::inspection::ObservationHookSupport {
+        eredu_runtime::inspection::ObservationHookSupport::internal(true, true, true)
+    }
+
     type Input<'a> = ModelInput<'a, B::Tensor>;
     type StaticModules = StaticModules<B>;
     type Unit = Unit<B>;
@@ -2040,13 +2216,12 @@ where
         _forward: &Self::ForwardContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error> {
-        let hidden = self.static_modules.final_norm.forward(hidden, context)?;
-        let hidden = hidden.multiply_scalar(
-            self.args.text_config.logits_mup_width_multiplier.recip(),
+        self.target_logits_instrumented(
+            hidden,
+            None,
             context,
-        )?;
-        let logits = self.static_modules.output.forward(&hidden, context)?;
-        self.trim_logits(logits, context)
+            &mut crate::decoder::ComponentInstrumentation::disabled(),
+        )
     }
 
     fn retained_context_values<'a>(
@@ -2073,6 +2248,55 @@ where
         }
         values.into_iter()
     }
+
+    fn forward_unit_observed<O>(
+        &mut self,
+        group: usize,
+        index: usize,
+        unit: &mut Self::Unit,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &mut Self::ForwardContext,
+        context: &<B::Tensor as Tensor>::Context,
+        observer: &mut O,
+    ) -> Result<B::Tensor, Self::Error>
+    where
+        O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
+    {
+        <Self as RoutedLayeredArchitecture<B, S>>::forward_unit_observed_with_provider(
+            self,
+            group,
+            index,
+            unit,
+            hidden,
+            state,
+            forward,
+            ExpertPass::Prefill,
+            &mut eredu_runtime::ResidentExpertProvider,
+            context,
+            observer,
+        )
+    }
+
+    fn finish_forward_observed<O>(
+        &mut self,
+        hidden: &B::Tensor,
+        _state: &mut S,
+        _forward: &Self::ForwardContext,
+        context: &<B::Tensor as Tensor>::Context,
+        observer: &mut O,
+    ) -> Result<B::Tensor, Self::Error>
+    where
+        O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
+    {
+        let mut observer = eredu_runtime::BorrowedActivationObserver(observer);
+        self.target_logits_instrumented(
+            hidden,
+            None,
+            context,
+            &mut crate::decoder::ComponentInstrumentation::new("readout", &mut observer),
+        )
+    }
 }
 
 impl<B, S> ParallelLayeredArchitecture<B, S> for LayeredModel<B>
@@ -2081,6 +2305,10 @@ where
     S: LayerRuntimeState<B>,
     S::LayerState: AuxiliaryConvolutionState<B::Tensor>,
 {
+    fn parallel_observation_hooks(&self) -> eredu_runtime::inspection::ObservationHookSupport {
+        eredu_runtime::inspection::ObservationHookSupport::internal(true, true, true)
+    }
+
     fn begin_forward_parallel<'a>(
         &mut self,
         input: Self::Input<'a>,
@@ -2171,6 +2399,49 @@ where
             ));
         }
         self.project_target_logits_parallel(hidden, parallel, context)
+    }
+
+    fn forward_unit_parallel_observed<O>(
+        &mut self,
+        group: usize,
+        index: usize,
+        unit: &mut Self::Unit,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &mut Self::ForwardContext,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+        observer: &mut O,
+    ) -> Result<B::Tensor, Self::Error>
+    where
+        O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
+    {
+        <Self as ParallelRoutedLayeredArchitecture<B, S>>::forward_unit_parallel_observed_with_provider(
+            self, group, index, unit, hidden, state, forward,
+            ExpertPass::Prefill, &mut eredu_runtime::ResidentExpertProvider,
+            parallel, context, observer,
+        )
+    }
+
+    fn finish_forward_parallel_observed<O>(
+        &mut self,
+        hidden: &B::Tensor,
+        _state: &mut S,
+        _forward: &Self::ForwardContext,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+        observer: &mut O,
+    ) -> Result<B::Tensor, Self::Error>
+    where
+        O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
+    {
+        let mut observer = eredu_runtime::BorrowedActivationObserver(observer);
+        self.target_logits_instrumented(
+            hidden,
+            Some(parallel),
+            context,
+            &mut crate::decoder::ComponentInstrumentation::new("readout", &mut observer),
+        )
     }
 }
 
@@ -2301,6 +2572,13 @@ where
     S: LayerRuntimeState<B>,
     S::LayerState: eredu_nn::AttentionCache<B::Tensor> + AuxiliaryConvolutionState<B::Tensor>,
 {
+    fn partition_observation_hooks(
+        &self,
+        _tensor_parallel: bool,
+    ) -> eredu_runtime::inspection::ObservationHookSupport {
+        eredu_runtime::inspection::ObservationHookSupport::internal(true, true, true)
+    }
+
     type Boundary = eredu_runtime::NoAuxiliaryBoundarySchema;
 
     fn boundary_schema(&self) -> Result<Self::Boundary, Self::Error> {
@@ -2386,6 +2664,34 @@ where
                 auxiliary: eredu_runtime::NoAuxiliaryBoundary,
             })
         }
+    }
+
+    fn finish_partition_observed<O>(
+        &mut self,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &Self::ForwardContext,
+        owns_output: bool,
+        parallel: Option<&B::ParallelContext>,
+        context: &<B::Tensor as Tensor>::Context,
+        observer: &mut O,
+    ) -> Result<LayeredPartitionOutput<B::Tensor>, Self::Error>
+    where
+        O: eredu_runtime::ActivationObserver<B::Tensor, Error> + ?Sized,
+    {
+        if !owns_output {
+            return self.finish_partition(hidden, state, forward, false, parallel, context);
+        }
+        let output = match parallel {
+            Some(parallel) => self.finish_forward_parallel_observed(
+                hidden, state, forward, parallel, context, observer,
+            )?,
+            None => self.finish_forward_observed(hidden, state, forward, context, observer)?,
+        };
+        Ok(LayeredPartitionOutput::Final {
+            output,
+            retained: Some(hidden.clone()),
+        })
     }
 }
 

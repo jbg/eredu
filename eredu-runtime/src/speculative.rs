@@ -43,22 +43,32 @@ where
         component_timings_collected: bool,
         context: E::Context<'a>,
     ) -> Result<Self, SpeculativeDriverError<E::Error>> {
-        let completion_wait = options
-            .completion_wait()
-            .map_err(SpeculativeDriverError::Generation)?;
-        if !E::Completion::supports_cancellation(completion_wait.cancellation()) {
-            return Err(SpeculativeDriverError::UnsupportedCompletionCancellation {
-                cancellation: completion_wait.cancellation(),
-            });
-        }
+        let prepared = (|| {
+            let completion_wait = options
+                .completion_wait()
+                .map_err(SpeculativeDriverError::Generation)?;
+            if !E::Completion::supports_cancellation(completion_wait.cancellation()) {
+                return Err(SpeculativeDriverError::UnsupportedCompletionCancellation {
+                    cancellation: completion_wait.cancellation(),
+                });
+            }
+            SpeculativeRequestTable::new(options, topology)
+                .map_err(SpeculativeDriverError::Generation)
+        })();
+        let stage = eredu_core::run_preparation::TextPreparationStage::Request;
+        let requests = eredu_core::run_preparation::finish_preparation(
+            stage,
+            prepared,
+            |status| executor.agree_text_preparation(stage, status, context),
+            SpeculativeDriverError::Preparation,
+        )?;
         executor.set_telemetry_enabled(component_timings_collected);
         Ok(Self {
             executor,
             context,
             optimistic_execution_available,
             component_timings_collected,
-            requests: SpeculativeRequestTable::new(options, topology)
-                .map_err(SpeculativeDriverError::Generation)?,
+            requests,
         })
     }
 
@@ -108,7 +118,7 @@ where
         &mut self,
         id: eredu_core::generation::SpeculativeRequestId,
     ) -> Result<(), SpeculativeDriverError<E::Error>> {
-        self.requests.cancel(id)
+        self.requests.signal_cancellation(id)
     }
 
     /// Whether all registered lanes are terminal.

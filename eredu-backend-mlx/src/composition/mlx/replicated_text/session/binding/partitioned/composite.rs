@@ -14,6 +14,15 @@ where
     A::AdmissionConfig: 'static,
     A::Error: std::fmt::Display,
 {
+    fn prediction_residency(
+        &mut self,
+    ) -> Result<
+        crate::composition::mlx::replicated_text::prediction::parameters::PredictionResidency,
+        Error,
+    > {
+        Ok(Default::default())
+    }
+
     fn finish<D>(
         self,
         completed: CompletedComposite<A, D>,
@@ -66,6 +75,18 @@ where
             MlxEmbeddedPredictionMaterializer,
         > + 'static,
 {
+    fn prediction_residency(
+        &mut self,
+    ) -> Result<
+        crate::composition::mlx::replicated_text::prediction::parameters::PredictionResidency,
+        Error,
+    > {
+        crate::composition::mlx::replicated_text::prediction::parameters::residency::<
+            PreparedCompositeArchitecture<A>,
+            P,
+        >(&mut self.prediction.extension)
+    }
+
     fn finish<D>(
         self,
         completed: CompletedComposite<A, D>,
@@ -185,7 +206,7 @@ pub(crate) fn bind_prepared_partitioned_composite<A, G, W, F>(
     distributed: crate::backend::distributed::MlxDistributedSession,
     stream: &Stream,
     weights_stream: &Stream,
-    finalizer: F,
+    mut finalizer: F,
 ) -> Result<Box<dyn ErasedReplicatedTextExecutable>, Error>
 where
     A: CompositeArchitecture<MlxNeuralBackend, MlxHybridState, Error = eredu_nn::Error>
@@ -208,10 +229,43 @@ where
         text.into_parts();
     let admission = prepared.prepared().architecture().admission_config();
     let processor = prepared.prepared().selected().base().processor().clone();
+    let addressable_parameters = prepared
+        .partition_banks()
+        .map(|banks| {
+            banks
+                .addressable_logical_targets()
+                .into_iter()
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let (mut provider, parameter_banks) = if let Some(selection) = prepared.partition_banks() {
+        let (provider, retained) = eredu_architectures::prepared_execution::construct_partition_bank_providers::<MlxNeuralBackend, _, _, _, _, Error>(
+            selection,
+            |selection, options| {
+                let (bytes, pool) = selected_addressable_partition_bank(
+                    &selection.addressable_members(), Arc::clone(&store), options,
+                    prepared.layout(), weights_stream, stream,
+                )?;
+                selection.banks().iter().filter(|(_, bank)| !bank.addressable_members().is_empty()).map(|(id, _)| {
+                    let bank = pool.scoped(id.value() as usize)?;
+                    let bytes = bytes.iter().filter(|(key, _)| key.bank() == id.value() as usize)
+                        .map(|(key, bytes)| (*key, *bytes)).collect();
+                    Ok((*id, eredu_architectures::prepared_execution::PartitionBankMechanisms::new(
+                        bytes, bank.clone(), crate::backend::runtime::residency::parameter_bank::MlxIndexedMovement, bank,
+                    )))
+                }).collect::<Result<std::collections::BTreeMap<_, _>, Error>>()
+            },
+        ).map_err(super::super::routed::construction_error)?;
+        (Some(provider), retained)
+    } else {
+        (None, std::collections::BTreeMap::new())
+    };
     let mut mechanisms: MlxReplicatedTextMechanisms<
         PreparedCompositeArchitecture<A>,
         MlxHybridState,
     > = MlxReplicatedTextMechanisms::new(store, stream, weights_stream);
+    mechanisms.set_prediction_residency(finalizer.prediction_residency()?);
+    mechanisms.set_ignored_checkpoint_sources(prepared.unowned_expert_checkpoint_sources());
     let mut distributed = Some(distributed);
     let mut partition_sampling_group = None;
     let mut partition_communication_authority = None;
@@ -224,21 +278,24 @@ where
         .prepare_session_runtime::<MlxNeuralBackend, _, _, _, _>(
             prompt_topology.clone(),
             stream,
-            |input, physical_layout, executor_plan, selected, context| {
+            |input, source_architecture, physical_layout, executor_plan, selected, context| {
+                let (source_architecture, source_layout) = source_architecture
+                    .map(|(source, layout)| (Some(source), Some(layout)))
+                    .unwrap_or((None, None));
                 let tensor_group = executor_plan.communication_tensor_group();
                 let prepared = eredu_runtime::prepare_default_partitioned_runtime(
                     input,
-                    None,
+                    source_architecture.map(|source| *source),
                     physical_layout,
-                    None,
+                    source_layout,
                     selected,
                     &prompt_topology,
                     eredu_runtime::PartitionedUnitScope::Owned,
-                    &[],
+                    &addressable_parameters,
                     &mut mechanisms,
                     context,
                 )
-                .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+                .map_err(Error::from)?;
                 let (architecture, _partition, manifest, execution_policy, bounded_policy, state) =
                     prepared.into_parts();
                 let distributed = distributed.take().ok_or_else(|| {
@@ -248,12 +305,13 @@ where
                     .into_partition_communication(manifest, tensor_group, session_group)?;
                 partition_communication_authority = Some(communication.authority());
                 partition_sampling_group = Some(sampling);
-                let executor = executor_plan.bind(
+                let executor = executor_plan.bind_with_provider(
                     architecture.into_inner(),
                     execution_policy,
                     parallel,
                     MlxPartitionTensorAllocator,
                     super::super::distributed::expert::MlxExpertRouteTensorMovement::new(stream),
+                    provider.take(),
                 )?;
                 let runtime = eredu_runtime::PartitionedTextRuntime::new(
                     execution_plan,
@@ -266,17 +324,17 @@ where
                     selected_residency.execution_residency(),
                     bounded_policy,
                 )
-                .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+                .map_err(|error| Error::Other(Box::new(error)))?;
                 Ok::<_, Error>((runtime, state))
             },
         )
-        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+        .map_err(Error::from)?;
     let session = eredu_runtime::construct_replicated_text_session_with_runtime(
         binding,
         mechanisms,
         eredu_runtime::PartitionedTextExecution::new(),
     )
-    .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+    .map_err(|error| Error::Other(Box::new(error)))?;
     finalizer.finish(
         CompletedComposite::<A, _, NoSelectedPrediction>::from_session(
             session,
@@ -291,6 +349,7 @@ where
             Some(publication_authority.owner_group_rank()),
             publication_authority.local_public_output(),
             stream,
-        ),
+        )
+        .with_parameter_banks(parameter_banks)?,
     )
 }

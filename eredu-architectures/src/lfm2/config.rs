@@ -160,14 +160,18 @@ struct ModelArgsSource {
     model_type: String,
     vocab_size: i32,
     hidden_size: i32,
-    intermediate_size: i32,
+    #[serde(default)]
+    intermediate_size: Option<i32>,
     num_hidden_layers: i32,
     num_attention_heads: i32,
     num_key_value_heads: i32,
     max_position_embeddings: i32,
     #[serde(default = "default_norm_eps")]
     norm_eps: f32,
-    layer_types: Vec<String>,
+    #[serde(default)]
+    layer_types: Option<Vec<String>>,
+    #[serde(default)]
+    full_attn_idxs: Option<Vec<i32>>,
     #[serde(default = "default_conv_l_cache", rename = "conv_L_cache")]
     conv_l_cache: i32,
     #[serde(default)]
@@ -216,11 +220,51 @@ impl ModelArgsSource {
                 self.num_hidden_layers
             ))
         })?;
-        let operators = self
+        let explicit = self
             .layer_types
-            .iter()
-            .map(|value| OperatorPolicy::parse(value))
-            .collect::<Result<Vec<_>, _>>()?;
+            .as_ref()
+            .map(|types| {
+                types
+                    .iter()
+                    .map(|value| OperatorPolicy::parse(value))
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .transpose()?;
+        let indexed = self
+            .full_attn_idxs
+            .as_ref()
+            .map(|indices| {
+                let mut heads = HashSet::new();
+                for &index in indices {
+                    if index < 0 || index >= self.num_hidden_layers || !heads.insert(index) {
+                        return Err(invalid(format!(
+                            "LFM2 full_attn_idxs contains an invalid or repeated layer {index}"
+                        )));
+                    }
+                }
+                Ok((0..self.num_hidden_layers)
+                    .map(|layer| {
+                        if heads.contains(&layer) {
+                            OperatorPolicy::SelfAttention(AttentionPolicy::Full)
+                        } else {
+                            OperatorPolicy::CausalConvolution
+                        }
+                    })
+                    .collect::<Vec<_>>())
+            })
+            .transpose()?;
+        let operators = match (explicit, indexed) {
+            (Some(explicit), Some(indexed)) if explicit != indexed => {
+                return Err(invalid("LFM2 layer_types conflicts with full_attn_idxs"));
+            }
+            (Some(explicit), _) => explicit,
+            (_, Some(indexed)) => indexed,
+            (None, None) => return Err(invalid("LFM2 requires layer_types or full_attn_idxs")),
+        };
+        let intermediate_size = self
+            .intermediate_size
+            .or(self.block_ff_dim)
+            .ok_or_else(|| invalid("LFM2 requires intermediate_size or block_ff_dim"))?;
         if self.model_type == "lfm2" && self.num_dense_layers != 0 {
             return Err(invalid(format!(
                 "LFM2 dense config conflicts with num_dense_layers={}",
@@ -264,17 +308,17 @@ impl ModelArgsSource {
         let dense_intermediate_size = if self.model_type == "lfm2_moe" {
             if self
                 .block_ff_dim
-                .is_some_and(|value| value != self.intermediate_size)
+                .is_some_and(|value| value != intermediate_size)
             {
                 return Err(invalid(format!(
                     "LFM2 MoE block_ff_dim must equal intermediate_size {}, got {}",
-                    self.intermediate_size,
+                    intermediate_size,
                     self.block_ff_dim.expect("checked above")
                 )));
             }
-            self.intermediate_size
+            intermediate_size
         } else {
-            let mut size = i64::from(self.block_ff_dim.unwrap_or(self.intermediate_size));
+            let mut size = i64::from(self.block_ff_dim.unwrap_or(intermediate_size));
             if self.block_auto_adjust_ff_dim {
                 if self.block_multiple_of <= 0
                     || !self.block_ffn_dim_multiplier.is_finite()

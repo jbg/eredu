@@ -1,5 +1,22 @@
 fn write_lfm2_pipeline_fixture(directory: &Path, moe: bool) {
-    let config = serde_json::json!({
+    write_lfm2_fixture(directory, moe, false);
+}
+
+fn write_lfm2_component_fixture(directory: &Path, moe: bool) {
+    write_lfm2_fixture(directory, moe, true);
+}
+
+fn write_lfm2_fixture(directory: &Path, moe: bool, components: bool) {
+    write_lfm2_fixture_with_component_width(directory, moe, components, 128);
+}
+
+fn write_lfm2_fixture_with_component_width(
+    directory: &Path,
+    moe: bool,
+    components: bool,
+    component_width: i32,
+) {
+    let mut config = serde_json::json!({
         "model_type": if moe { "lfm2_moe" } else { "lfm2" },
         "architectures": [if moe { "Lfm2MoeForCausalLM" } else { "Lfm2ForCausalLM" }],
         "vocab_size": 16,
@@ -22,6 +39,14 @@ fn write_lfm2_pipeline_fixture(directory: &Path, moe: bool) {
         "norm_topk_prob": moe,
         "use_expert_bias": moe
     });
+    if components {
+        config["vocab_size"] = 64.into();
+        config["hidden_size"] = 64.into();
+        config["intermediate_size"] = component_width.into();
+        config["num_attention_heads"] = 2.into();
+        config["num_key_value_heads"] = 2.into();
+        config["moe_intermediate_size"] = if moe { 64 } else { 0 }.into();
+    }
     let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
     let stream = execution.stream();
     let args = eredu_architectures::lfm2::model_args_from_config_value(&config).unwrap();
@@ -29,7 +54,24 @@ fn write_lfm2_pipeline_fixture(directory: &Path, moe: bool) {
         MlxModule::new(checkpoint_fixtures::Lfm2CheckpointTemplate::new(args, stream).unwrap());
     for (name, parameter) in neutral_parameter_refs_mut(&mut model).flatten() {
         let shape = parameter.shape().to_vec();
-        *parameter = if name.ends_with("norm.weight") {
+        *parameter = if components {
+            let seed = name
+                .bytes()
+                .fold(0u32, |s, b| s.wrapping_mul(31).wrapping_add(b.into()));
+            let values = (0..shape.iter().product::<i32>() as usize)
+                .map(|index| {
+                    let delta = ((index * 7 + (seed % 97) as usize) % 41) as f32 - 20.0;
+                    if name.ends_with("norm.weight") {
+                        1.0 + delta * 0.003
+                    } else {
+                        delta * 0.008
+                    }
+                })
+                .collect::<Vec<_>>();
+            Array::from_slice(&values, &shape)
+                .as_dtype(parameter.dtype(), stream)
+                .unwrap()
+        } else if name.ends_with("norm.weight") {
             Array::ones::<f32>(&shape, stream).unwrap()
         } else {
             let ordinal = name.bytes().fold(0u32, |sum, byte| sum + u32::from(byte)) % 17;
@@ -355,23 +397,75 @@ fn kimi_linear_config() -> serde_json::Value {
 }
 
 fn write_kimi_linear_fixture(directory: &Path) {
-    write_kimi_linear_fixture_from_config(directory, kimi_linear_config());
+    write_kimi_linear_fixture_from_config(directory, kimi_linear_config(), false);
+}
+
+fn write_kimi_linear_component_fixture(directory: &Path, quantizable: bool) {
+    let mut config = kimi_linear_config();
+    if quantizable {
+        for (field, value) in [
+            ("hidden_size", 64),
+            ("num_attention_heads", 2),
+            ("head_dim", 32),
+            ("intermediate_size", 128),
+            ("moe_intermediate_size", 128),
+            ("kv_lora_rank", 32),
+            ("q_lora_rank", 32),
+            ("qk_nope_head_dim", 32),
+            ("qk_rope_head_dim", 4),
+            ("v_head_dim", 32),
+        ] {
+            config[field] = serde_json::json!(value);
+        }
+        config["linear_attn_config"]["num_heads"] = serde_json::json!(2);
+        config["linear_attn_config"]["head_dim"] = serde_json::json!(32);
+    }
+    write_kimi_linear_fixture_from_config(directory, config, true);
 }
 
 fn write_kimi_linear_dense_fixture(directory: &Path) {
     let mut config = kimi_linear_config();
     config["first_k_dense_replace"] = config["num_hidden_layers"].clone();
-    write_kimi_linear_fixture_from_config(directory, config);
+    write_kimi_linear_fixture_from_config(directory, config, false);
 }
 
-fn write_kimi_linear_fixture_from_config(directory: &Path, config: serde_json::Value) {
+fn kimi_component_value(name: &str, index: usize) -> f32 {
+    let seed = name
+        .bytes()
+        .fold(0_u32, |a, b| a.wrapping_mul(31).wrapping_add(b.into()));
+    let delta = ((index * 7 + (seed % 97) as usize) % 41) as f32 - 20.0;
+    if name.contains("norm") && name.ends_with("weight") {
+        1.0 + delta * 0.003
+    } else if name.ends_with("A_log") || name.ends_with("ssm_a") {
+        -0.5 + delta * 0.01
+    } else {
+        delta * 0.02
+    }
+}
+
+fn write_kimi_linear_fixture_from_config(
+    directory: &Path,
+    config: serde_json::Value,
+    components: bool,
+) {
     let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
     let stream = execution.stream();
     let args = eredu_architectures::kimi_linear::model_args_from_config_value(&config).unwrap();
     let mut model = MlxModule::new(
         checkpoint_fixtures::KimiLinearCheckpointTemplate::new(args.clone(), stream).unwrap(),
     );
-    initialize_fixture(&mut model, stream);
+    if components {
+        for (name, parameter) in neutral_parameter_refs_mut(&mut model).flatten() {
+            let values = (0..parameter.shape().iter().product::<i32>() as usize)
+                .map(|index| kimi_component_value(&name, index))
+                .collect::<Vec<_>>();
+            *parameter = Array::from_slice(&values, parameter.shape())
+                .as_dtype(parameter.dtype(), stream)
+                .unwrap();
+        }
+    } else {
+        initialize_fixture(&mut model, stream);
+    }
     let mut arrays = Vec::<(String, Array)>::new();
     for (name, value) in neutral_parameter_refs(&model, false).flatten() {
         if name.as_ref() == "model.layers.1.mlp.experts.gate_up_proj" {
@@ -533,6 +627,23 @@ fn write_nemotron_mtp_fixture(directory: &Path) {
     write_nemotron_fixture_with_config(directory, config);
 }
 
+fn write_nemotron_prediction_components_fixture(directory: &Path, routed: bool, quantizable: bool) {
+    let mut config = if quantizable {
+        nemotron_quantizable_config()
+    } else {
+        nemotron_config()
+    };
+    if !routed {
+        config["hybrid_override_pattern"] = "M-**".into();
+    }
+    config["intermediate_size"] = if quantizable { 64 } else { 18 }.into();
+    config["num_key_value_heads"] = 2.into();
+    config["n_groups"] = 2.into();
+    config["num_nextn_predict_layers"] = 1.into();
+    config["mtp_hybrid_override_pattern"] = "*E".into();
+    write_nemotron_fixture_with_values(directory, config, true);
+}
+
 fn write_nemotron_quantizable_fixture(directory: &Path) {
     write_nemotron_fixture_with_config(directory, nemotron_quantizable_config());
 }
@@ -544,13 +655,67 @@ fn write_nemotron_dense_quantizable_fixture(directory: &Path) {
 }
 
 fn write_nemotron_fixture_with_config(directory: &Path, config: serde_json::Value) {
+    write_nemotron_fixture_with_values(directory, config, false);
+}
+
+fn write_nemotron_component_fixture(directory: &Path) {
+    write_nemotron_fixture_with_values(directory, nemotron_config(), true);
+}
+
+// Distinguish every component and vocabulary row; constant fixture head rows
+// create exact greedy ties whose winner depends on floating reduction order.
+fn initialize_nemotron_components(model: &mut impl Parameterized<MlxTensor>, stream: &Stream) {
+    for (name, parameter) in neutral_parameter_refs_mut(model).flatten() {
+        let seed = name.bytes().fold(2166136261u32, |seed, byte| {
+            (seed ^ u32::from(byte)).wrapping_mul(16777619)
+        });
+        let count = parameter.shape().iter().product::<i32>() as usize;
+        let values = (0..count)
+            .map(|index| {
+                let mut bits = seed.wrapping_add((index as u32).wrapping_mul(0x9e3779b9));
+                bits = (bits ^ (bits >> 16)).wrapping_mul(0x85ebca6b);
+                bits = (bits ^ (bits >> 13)).wrapping_mul(0xc2b2ae35);
+                bits ^= bits >> 16;
+                let unit = (bits % 2001) as f32 / 1000.0 - 1.0;
+                if name.ends_with("A_log") {
+                    -0.5 - (unit + 1.0) * 0.25
+                } else if name.contains("norm") && name.ends_with("weight") {
+                    0.95 + unit * 0.05
+                } else if name.as_ref() == "model.embeddings.weight" {
+                    0.02 + (unit + 1.0) * 0.01
+                } else if name.contains("up_proj") {
+                    // The deletion fixture selects unit 1 in each expert. Positive,
+                    // distinct reads keep those ReLU² units active on this prefix.
+                    0.01 + (unit + 1.0) * 0.008
+                } else if name.contains("down_proj") {
+                    0.01 * unit
+                } else {
+                    0.04 * unit
+                }
+            })
+            .collect::<Vec<_>>();
+        *parameter = Array::from_slice(&values, parameter.shape())
+            .as_dtype(parameter.dtype(), stream)
+            .unwrap();
+    }
+}
+
+fn write_nemotron_fixture_with_values(
+    directory: &Path,
+    config: serde_json::Value,
+    components: bool,
+) {
     let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
     let stream = execution.stream();
     let args = eredu_architectures::nemotron_h::model_args_from_config_value(&config).unwrap();
     let mut model = MlxModule::new(
         checkpoint_fixtures::NemotronHCheckpointTemplate::new(args.clone(), stream).unwrap(),
     );
-    initialize_fixture(&mut model, stream);
+    if components {
+        initialize_nemotron_components(&mut model, stream);
+    } else {
+        initialize_fixture(&mut model, stream);
+    }
     let mut arrays = Vec::<(String, Array)>::new();
     for (name, value) in neutral_parameter_refs(&model, false).flatten() {
         let runtime = name.to_string();
@@ -583,6 +748,10 @@ fn write_nemotron_fixture_with_config(directory: &Path, config: serde_json::Valu
 }
 
 fn write_nemotron_h_moe_gguf_fixture(path: &Path) {
+    write_nemotron_h_moe_gguf_fixture_with_values(path, false);
+}
+
+fn write_nemotron_h_moe_gguf_fixture_with_values(path: &Path, components: bool) {
     let mut config = nemotron_config();
     config["hybrid_override_pattern"] = serde_json::json!("MEE*");
     let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
@@ -591,7 +760,11 @@ fn write_nemotron_h_moe_gguf_fixture(path: &Path) {
     let mut model = MlxModule::new(
         checkpoint_fixtures::NemotronHCheckpointTemplate::new(args.clone(), stream).unwrap(),
     );
-    initialize_fixture(&mut model, stream);
+    if components {
+        initialize_nemotron_components(&mut model, stream);
+    } else {
+        initialize_fixture(&mut model, stream);
+    }
     let mut specs = Vec::new();
     for (runtime_name, value) in neutral_parameter_refs(&model, false).flatten() {
         let runtime_name = runtime_name.to_string();

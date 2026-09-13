@@ -27,13 +27,15 @@ where
         + 'static,
     F: super::partitioned::CompositeExecutableFinalizer<A>,
 {
+    let banks = session.execution_strategy().parameter_banks();
     let (text, processor, admission) = facts.into_parts();
     let (identity, capability, model_type, residency) = text.into_parts();
     finalizer.finish(
         CompletedComposite::<A, _, NoSelectedPrediction>::from_session(
             session, admission, processor, identity, capability, model_type, residency, None, None,
             None, true, stream,
-        ),
+        )
+        .with_parameter_banks(banks)?,
     )
 }
 
@@ -64,6 +66,47 @@ where
             MlxEmbeddedPredictionMaterializer,
         > + 'static,
 {
+    fn publish_parameter_replacements(
+        &mut self,
+        values: &BTreeMap<String, MlxTensor>,
+        active: bool,
+    ) {
+        super::super::prediction::parameters::publish::<PreparedCompositeArchitecture<A>, P>(
+            &mut self.extension,
+            values,
+            active,
+        );
+    }
+    fn visit_parameter_slots(
+        &mut self,
+        visitor: &mut dyn eredu_nn::ParameterSlotVisitor<MlxTensor>,
+    ) {
+        super::super::prediction::parameters::visit::<PreparedCompositeArchitecture<A>, P>(
+            &mut self.extension,
+            visitor,
+        );
+    }
+    fn with_parameter_slots(
+        &mut self,
+        module: usize,
+        operation: &mut eredu_runtime::parameter_operations::ParameterSlotOperation<
+            '_,
+            MlxTensor,
+            Error,
+        >,
+    ) -> Result<bool, Error> {
+        super::super::prediction::parameters::with_slots::<PreparedCompositeArchitecture<A>, P>(
+            &mut self.extension,
+            module,
+            operation,
+        )
+    }
+    fn activation_execution(
+        &self,
+    ) -> Option<eredu_architectures::speculative_execution::SpeculativeActivationExecution> {
+        self.extension.activation_execution(&self.selected)
+    }
+
     fn lend(
         model: &mut CompletedComposite<A, D, Self>,
         continuation: &mut dyn super::prepared_speculative::MlxEmbeddedExecutorContinuation,
@@ -139,15 +182,23 @@ impl
                 MlxNeuralBackend,
             >,
     {
-        CompletedComposite::new(prepared, store, self.stream, self.weights_stream)?
-            .with_prediction(
-                SelectedPrediction {
-                    extension,
-                    selected: self.selected,
-                },
-                self.capability,
-            )
-            .map(|model| Box::new(model) as Box<dyn ErasedReplicatedTextExecutable>)
+        let mut prediction = SelectedPrediction {
+            extension,
+            selected: self.selected,
+        };
+        let residency = super::super::prediction::parameters::residency::<
+            PreparedCompositeArchitecture<A>,
+            _,
+        >(&mut prediction.extension)?;
+        CompletedComposite::new_with_residency(
+            prepared,
+            store,
+            self.stream,
+            self.weights_stream,
+            residency,
+        )?
+        .with_prediction(prediction, self.capability)
+        .map(|model| Box::new(model) as Box<dyn ErasedReplicatedTextExecutable>)
     }
 
     fn visit_routed<A>(
@@ -168,14 +219,18 @@ impl
                 MlxNeuralBackend,
             >,
     {
-        let mechanisms = MlxReplicatedTextMechanisms::<
+        let mut mechanisms = MlxReplicatedTextMechanisms::<
             PreparedCompositeArchitecture<A>,
             MlxHybridState,
         >::new(Arc::clone(&store), self.stream, self.weights_stream);
-        let prediction = SelectedPrediction {
+        let mut prediction = SelectedPrediction {
             extension,
             selected: self.selected,
         };
+        mechanisms.set_prediction_residency(super::super::prediction::parameters::residency::<
+            PreparedCompositeArchitecture<A>,
+            _,
+        >(&mut prediction.extension)?);
         #[cfg(test)]
         crate::tests::support::path_instrumentation::constructor();
         eredu_architectures::prepared_execution::construct_selected_routed_composite_session(

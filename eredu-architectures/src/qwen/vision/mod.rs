@@ -15,5 +15,5 @@ pub use config::{
 pub use model::{VisionBlock, VisionInput, VisionOutput, VisionState, VisionStatic, VisionTower};
 pub use parallel::{
     block_parallel_parameter_groups, local_block_geometry, local_merger_widths,
-    static_parallel_parameter_groups,
+    owned_static_parallel_parameter_groups, static_parallel_parameter_groups,
 };
